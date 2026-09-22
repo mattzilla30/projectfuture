@@ -7,6 +7,7 @@ import com.projectfuture.browser.css.FlexContainerProps
 import com.projectfuture.browser.css.FlexDirection
 import com.projectfuture.browser.css.FlexItemProps
 import com.projectfuture.browser.css.FlexWrapMode
+import com.projectfuture.browser.css.GridContainerProps
 import com.projectfuture.browser.css.JustifyContent
 import com.projectfuture.browser.css.lengthValue
 import com.projectfuture.browser.css.parseCssColor
@@ -15,6 +16,8 @@ import com.projectfuture.browser.css.resolveBoxMetrics
 import com.projectfuture.browser.css.resolveFlexContainerProps
 import com.projectfuture.browser.css.resolveFlexItemProps
 import com.projectfuture.browser.css.resolveFlexMainSizes
+import com.projectfuture.browser.css.resolveGridColumnWidths
+import com.projectfuture.browser.css.resolveGridContainerProps
 import com.projectfuture.browser.css.resolvePositionOffsets
 import com.projectfuture.browser.html.ElementNode
 import com.projectfuture.browser.html.HtmlParser
@@ -60,12 +63,16 @@ import com.projectfuture.browser.html.TextNode
  *   reasonable approximations, not spec-exact shrink-to-fit.
  * - `align-content` (multi-line cross-axis distribution) isn't
  *   implemented - wrapped lines always stack from the start.
+ *
+ * Grid support (`display: grid`) is deliberately narrow: see Grid.kt's
+ * class doc. In short, `grid-template-columns` (with `fr`/`repeat()`) plus
+ * row-major auto-placement, not explicit item placement or row tracks.
  */
 private const val LINE_LEADING = 1.25f
 
 private val SKIPPED_TAGS = setOf("script", "style", "head", "title", "meta", "link", "noscript")
 
-private enum class LayoutMode { BLOCK, INLINE, FLEX }
+private enum class LayoutMode { BLOCK, INLINE, FLEX, GRID }
 
 /** The containing block used to resolve absolute/fixed descendants' geometry. */
 data class PositionContext(
@@ -256,6 +263,23 @@ class BlockLayout(
                 val naturalMain = layoutFlexChildren(containerProps, flexItemNodes, childPosContext, metrics.explicitContentHeight)
                 height = forcedHeight ?: (metrics.explicitContentHeight ?: naturalMain)
             }
+            LayoutMode.GRID -> {
+                val gridItemNodes = ArrayList<ElementNode>()
+                for (childNode in node.children) {
+                    if (childNode !is ElementNode || isSkipped(childNode)) continue
+                    val childPosition = childNode.style["position"] ?: "static"
+                    if (childPosition == "absolute" || childPosition == "fixed") {
+                        val bl = BlockLayout(childNode, x, y, width, childPosContext, fixedContext)
+                        bl.layout()
+                        positionedChildren.add(bl)
+                    } else {
+                        gridItemNodes.add(childNode)
+                    }
+                }
+                val gridProps = resolveGridContainerProps(node.style, width, fontSizePx)
+                val naturalHeight = layoutGridChildren(gridProps, gridItemNodes, childPosContext)
+                height = forcedHeight ?: (metrics.explicitContentHeight ?: naturalHeight)
+            }
             LayoutMode.INLINE -> {
                 cursorX = 0f
                 cursorY = 0f
@@ -280,6 +304,7 @@ class BlockLayout(
     private fun layoutMode(): LayoutMode {
         val display = node.style["display"]
         if (display == "flex" || display == "inline-flex") return LayoutMode.FLEX
+        if (display == "grid" || display == "inline-grid") return LayoutMode.GRID
         val elementChildren = node.children.filterIsInstance<ElementNode>().filterNot { isSkipped(it) }
         if (elementChildren.isEmpty()) return LayoutMode.INLINE
         return if (elementChildren.any { it.tag in HtmlParser.BLOCK_ELEMENTS }) LayoutMode.BLOCK else LayoutMode.INLINE
@@ -503,6 +528,50 @@ class BlockLayout(
         return (cursorMainY - y - containerProps.rowGap).coerceAtLeast(0f)
     }
 
+    // ---- Grid ----
+
+    /** Simple row-major auto-placement: fill columns left-to-right, wrap to a new row when full. */
+    private fun layoutGridChildren(
+        props: GridContainerProps,
+        itemNodes: List<ElementNode>,
+        childPosContext: PositionContext
+    ): Float {
+        if (itemNodes.isEmpty()) return 0f
+        val columnWidths = resolveGridColumnWidths(props.columns, width, props.columnGap)
+        val columnX = FloatArray(columnWidths.size)
+        var acc = x
+        for (i in columnWidths.indices) {
+            columnX[i] = acc
+            acc += columnWidths[i] + props.columnGap
+        }
+
+        var rowTop = y
+        var col = 0
+        val rowItems = ArrayList<BlockLayout>()
+        fun flushRow() {
+            if (rowItems.isEmpty()) return
+            val rowHeight = rowItems.maxOf { it.outerHeight }
+            normalChildren.addAll(rowItems)
+            rowTop += rowHeight + props.rowGap
+            rowItems.clear()
+        }
+        for (child in itemNodes) {
+            if (col >= columnWidths.size) {
+                flushRow()
+                col = 0
+            }
+            // No forcedWidth: the column width is just this item's containing
+            // width, so its own margin/border/padding/explicit-width are
+            // honored by the normal box model instead of overflowing the cell.
+            val bl = BlockLayout(child, columnX[col], rowTop, columnWidths[col], childPosContext, fixedContext)
+            bl.layout()
+            rowItems.add(bl)
+            col++
+        }
+        flushRow()
+        return (rowTop - y - props.rowGap).coerceAtLeast(0f)
+    }
+
     /** Unwrapped natural text width, used as a flex-basis fallback for inline-content items. */
     private fun measureNaturalWidth(node: ElementNode): Float {
         if (isSkipped(node)) return 0f
@@ -609,7 +678,7 @@ class BlockLayout(
         if (borderLeft > 0f) cmds.add(DrawRect(borderBoxLeft, borderBoxTop, borderBoxLeft + borderLeft, borderBoxBottom, borderColorLeft, fixed = fixedContext))
         if (borderRight > 0f) cmds.add(DrawRect(borderBoxRight - borderRight, borderBoxTop, borderBoxRight, borderBoxBottom, borderColorRight, fixed = fixedContext))
 
-        if (mode == LayoutMode.BLOCK || mode == LayoutMode.FLEX) {
+        if (mode == LayoutMode.BLOCK || mode == LayoutMode.FLEX || mode == LayoutMode.GRID) {
             for (c in normalChildren) c.paint(cmds)
             for (c in positionedChildren.sortedBy { it.zIndex }) c.paint(cmds)
         } else {
