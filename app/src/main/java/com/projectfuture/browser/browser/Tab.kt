@@ -1,5 +1,7 @@
 package com.projectfuture.browser.browser
 
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.os.Handler
 import android.os.Looper
 import com.projectfuture.browser.css.CssParser
@@ -45,6 +47,7 @@ class Tab(private val onStateChanged: (TabState) -> Unit) {
         private set
     private var viewportWidth: Float = 0f
     private var viewportHeight: Float = 0f
+    private var currentImages: Map<ElementNode, Bitmap> = emptyMap()
 
     fun canGoBack() = historyIndex > 0
     fun canGoForward() = historyIndex in 0 until (history.size - 1)
@@ -92,9 +95,11 @@ class Tab(private val onStateChanged: (TabState) -> Unit) {
                 val authorRules = collectAuthorCss(root, response.url)
                 computeStyles(root, authorRules)
                 val title = extractTitle(root)
+                val images = collectAndDecodeImages(root, response.url)
                 mainHandler.post {
                     currentUrl = response.url
                     currentDoc = root
+                    currentImages = images
                     when (action) {
                         HistoryAction.PUSH -> {
                             while (history.size > historyIndex + 1) history.removeAt(history.size - 1)
@@ -119,8 +124,37 @@ class Tab(private val onStateChanged: (TabState) -> Unit) {
         val doc = currentDoc ?: return
         if (viewportWidth <= 0f || viewportHeight <= 0f) return
         val docLayout = DocumentLayout(doc)
-        displayList = docLayout.layout(viewportWidth, viewportHeight)
+        displayList = docLayout.layout(viewportWidth, viewportHeight, currentImages)
         contentHeight = docLayout.height
+    }
+
+    /**
+     * Fetches and decodes every `<img src>` up front (sequentially, on the
+     * background executor) before layout runs. Image *decoding* itself uses
+     * Android's BitmapFactory - a platform media codec, the same boundary
+     * already drawn for text glyph shaping - rather than a hand-written
+     * JPEG/PNG/WebP decoder, which would each be a substantial project of
+     * their own. Fetching the bytes and wiring decoded bitmaps into layout
+     * is this engine's own code. A broken or unreachable image is simply
+     * skipped, matching how the reference build already treats a failed
+     * stylesheet fetch - no broken-image icon or alt-text fallback yet.
+     */
+    private fun collectAndDecodeImages(root: ElementNode, baseUrl: Url): Map<ElementNode, Bitmap> {
+        val result = HashMap<ElementNode, Bitmap>()
+        root.walkElements { el ->
+            if (el.tag == "img") {
+                val src = el.attr("src")
+                if (!src.isNullOrBlank()) {
+                    try {
+                        val bytes = baseUrl.resolve(src).fetchBytes().body
+                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { result[el] = it }
+                    } catch (_: Exception) {
+                        // Broken/unreachable image: skip it rather than failing the whole page load.
+                    }
+                }
+            }
+        }
+        return result
     }
 
     private fun collectAuthorCss(root: ElementNode, baseUrl: Url): List<CssRule> {

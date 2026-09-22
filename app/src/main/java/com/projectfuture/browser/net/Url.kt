@@ -59,6 +59,19 @@ data class Url(
      * Follows redirects itself, since there is no library to do it for us.
      */
     fun fetch(redirectsLeft: Int = 10): HttpResponse {
+        val raw = fetchRaw(redirectsLeft)
+        val charset = charsetFromContentType(raw.headers["content-type"])
+        return HttpResponse(raw.statusCode, raw.headers, String(raw.body, charset), raw.url)
+    }
+
+    /** Same request as [fetch], but returns the raw body bytes undecoded - for binary resources like images. */
+    fun fetchBytes(redirectsLeft: Int = 10): HttpBytesResponse {
+        val raw = fetchRaw(redirectsLeft)
+        return HttpBytesResponse(raw.statusCode, raw.headers, raw.body, raw.url)
+    }
+
+    /** Shared socket/request/response-header/body-bytes plumbing for [fetch] and [fetchBytes]. Follows redirects itself. */
+    private fun fetchRaw(redirectsLeft: Int): RawHttpResponse {
         if (scheme != "http" && scheme != "https") {
             throw IOException("Unsupported scheme: $scheme")
         }
@@ -110,7 +123,7 @@ data class Url(
                 val location = headers["location"]
                 if (location != null) {
                     val next = resolve(location)
-                    return next.fetch(redirectsLeft - 1)
+                    return next.fetchRaw(redirectsLeft - 1)
                 }
             }
 
@@ -121,10 +134,7 @@ data class Url(
                 if (contentLength != null) readExactly(input, contentLength) else readToEnd(input)
             }
 
-            val charset = charsetFromContentType(headers["content-type"])
-            val body = String(bodyBytes, charset)
-
-            return HttpResponse(statusCode, headers, body, this)
+            return RawHttpResponse(statusCode, headers, bodyBytes, this)
         } finally {
             try { socket.close() } catch (_: IOException) {}
         }
@@ -242,5 +252,20 @@ data class HttpResponse(
     val statusCode: Int,
     val headers: Map<String, String>,
     val body: String,
+    val url: Url
+)
+
+/** Same shape as [HttpResponse] but for binary resources (images) - see [Url.fetchBytes]. */
+data class HttpBytesResponse(
+    val statusCode: Int,
+    val headers: Map<String, String>,
+    val body: ByteArray,
+    val url: Url
+)
+
+private data class RawHttpResponse(
+    val statusCode: Int,
+    val headers: Map<String, String>,
+    val body: ByteArray,
     val url: Url
 )

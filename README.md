@@ -10,38 +10,50 @@ project.
 - **Networking** (`net/Url.kt`) - raw `Socket`/`SSLSocket`, a hand-rolled
   HTTP/1.1 request/response reader (status line, headers, chunked transfer
   encoding, redirects), no `URLConnection`/OkHttp/Cronet.
-- **HTML parsing** (`html/`) - a small tag-soup tokenizer and tree builder
-  with implicit `<html>`/`<head>`/`<body>` insertion, its own DOM (`Node`,
+- **HTML parsing** (`html/`) - a tag-soup tokenizer and tree builder with
+  implicit `<html>`/`<head>`/`<body>` insertion, implied end tags for
+  unclosed `<p>`/`<li>`/`<tr>`/`<td>` etc., its own DOM (`Node`,
   `ElementNode`, `TextNode`), and its own HTML entity decoding.
 - **CSS** (`css/`) - a hand-written parser for tag/class/id/descendant
   selectors and flat declarations, an approximate specificity-based
-  cascade, and property inheritance - no platform CSS engine.
-- **Layout** (`layout/`) - a block/inline box tree with real line-breaking
-  and baseline-aligned text flow, producing an absolute-coordinate
-  `DisplayCommand` list.
+  cascade, property inheritance, and the box model (margin/border/padding/
+  box-sizing) - no platform CSS engine.
+- **Layout** (`layout/`) - block, inline (with real line-breaking,
+  baseline-aligned text, CJK character-level wrapping, and a basic RTL
+  paragraph direction heuristic), flexbox, a bounded CSS Grid, table
+  layout, floats/clear, and CSS positioning (relative/absolute/fixed,
+  z-index) - all producing an absolute-coordinate `DisplayCommand` list.
 - **Rendering** (`view/BrowserView.kt`) - a custom `View` that paints that
-  display list directly with `Canvas`/`Paint` and turns touch input into
-  scrolling and link taps.
+  display list directly with `Canvas`/`Paint`, handles `fixed` content
+  staying pinned through a second unscrolled paint pass, and turns touch
+  input into scrolling and link taps.
 
-The one place this project relies on the platform is glyph shaping and
-rasterization (`android.graphics.Paint`/`Typeface`/`Canvas`) - the same way
-any renderer ultimately hands pixels to a display driver. Parsing, the box
-model, layout, and painting logic are all original to this repo.
+This project relies on the platform for two things, the same way any
+renderer ultimately hands work to lower-level system facilities: glyph
+shaping/rasterization (`android.graphics.Paint`/`Typeface`/`Canvas`) and
+image format decoding (`BitmapFactory`, for JPEG/PNG/WebP/GIF - writing
+decoders for those from scratch would each be a project of their own).
+Networking, parsing, the CSS engine, layout, and painting logic are all
+original to this repo.
 
-## Current scope (v0.1 - "core engine" MVP)
+## Current scope
+
+Roughly following the project's own feature roadmap (Phase 1: engine
+correctness) - see commit history for the detailed limitations of each:
 
 - HTTP and HTTPS (TLS via `SSLSocketFactory`), redirects, chunked bodies
-- Tag-soup HTML parsing, `<link rel=stylesheet>` and `<style>` CSS
-- Minimal CSS: colors, `font-size`/`font-weight`/`font-style`, basic
-  selectors, inline `style="..."`
-- Block + inline layout with word-wrapped, baseline-aligned text
+- Tag-soup HTML parsing with implied end tags and quote-safe tag scanning
+- `<link rel=stylesheet>` and `<style>` CSS, box model, flexbox, grid,
+  tables, floats, positioning, z-index
+- CJK line-breaking, basic RTL paragraph direction, `text-align`
+- `<img>` rendering (via `BitmapFactory`), baseline-aligned inline sizing
 - Clickable links, vertical scrolling, back/forward history, reload
 - Address bar with a plain-text/search fallback
 
-Not yet implemented (deliberately out of scope for this first pass):
-JavaScript execution, the CSS box model (margin/padding/border, flexbox/
-grid), images, forms/POST, cookies, tabs, and full HTML5-spec parsing edge
-cases. These are natural next milestones.
+Not yet implemented: JavaScript execution, web fonts, CSS transitions/
+animations/transforms, `calc()`/custom properties/media queries, SVG,
+`<canvas>`, forms/POST, cookies, and multiple tabs. These are natural
+next milestones - see the project roadmap for the fuller list.
 
 ## Building
 

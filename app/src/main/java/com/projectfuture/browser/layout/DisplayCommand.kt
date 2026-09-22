@@ -1,5 +1,7 @@
 package com.projectfuture.browser.layout
 
+import android.graphics.Bitmap
+
 /**
  * The output of layout: a flat list of absolute paint instructions.
  * Coordinates are in page space for normal content ([fixed] = false) - the
@@ -34,6 +36,18 @@ class DrawRect(
     val right: Float,
     val bottomPx: Float,
     val color: Int,
+    override val fixed: Boolean = false
+) : DisplayCommand() {
+    override val top get() = topPx
+    override val bottom get() = bottomPx
+}
+
+class DrawImage(
+    val left: Float,
+    val topPx: Float,
+    val right: Float,
+    val bottomPx: Float,
+    val bitmap: Bitmap,
     override val fixed: Boolean = false
 ) : DisplayCommand() {
     override val top get() = topPx

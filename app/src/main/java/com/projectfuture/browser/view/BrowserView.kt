@@ -7,7 +7,9 @@ import android.util.AttributeSet
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
+import android.graphics.RectF
 import com.projectfuture.browser.layout.DisplayCommand
+import com.projectfuture.browser.layout.DrawImage
 import com.projectfuture.browser.layout.DrawRect
 import com.projectfuture.browser.layout.DrawText
 import com.projectfuture.browser.layout.FontCache
@@ -35,6 +37,8 @@ class BrowserView @JvmOverloads constructor(
     private var contentHeight = 0f
     private var scrollYPx = 0f
     private val rectPaint = Paint()
+    private val bitmapPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
+    private val imageDestRect = RectF()
 
     private val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
         override fun onDown(e: MotionEvent) = true
@@ -106,6 +110,10 @@ class BrowserView @JvmOverloads constructor(
                 is DrawRect -> {
                     rectPaint.color = cmd.color
                     canvas.drawRect(cmd.left, cmd.top, cmd.right, cmd.bottom, rectPaint)
+                }
+                is DrawImage -> {
+                    imageDestRect.set(cmd.left, cmd.top, cmd.right, cmd.bottom)
+                    canvas.drawBitmap(cmd.bitmap, null, imageDestRect, bitmapPaint)
                 }
                 is DrawText -> {
                     val paint = FontCache.paintFor(cmd.style)

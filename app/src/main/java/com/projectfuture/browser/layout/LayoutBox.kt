@@ -1,5 +1,6 @@
 package com.projectfuture.browser.layout
 
+import android.graphics.Bitmap
 import android.graphics.Color
 import com.projectfuture.browser.css.AlignItems
 import com.projectfuture.browser.css.BoxMetrics
@@ -68,6 +69,13 @@ import com.projectfuture.browser.html.TextNode
  * class doc. In short, `grid-template-columns` (with `fr`/`repeat()`) plus
  * row-major auto-placement, not explicit item placement or row tracks.
  *
+ * `<img>` renders as an inline, baseline-aligned replaced element sized
+ * from CSS width/height (falling back to the decoded bitmap's own pixel
+ * size, aspect-ratio-preserving if only one axis is set). Decoded bitmaps
+ * come from Tab's collectAndDecodeImages via the module-level
+ * [currentImages] map. `data:` URIs and `srcset`/`sizes` aren't handled;
+ * a broken/missing image is just skipped (no alt-text or broken-image icon).
+ *
  * Text direction and line-breaking are approximated, not spec-complete:
  * CJK characters (which don't use spaces) each get their own break
  * opportunity instead of forming one unbreakable token (see
@@ -114,13 +122,25 @@ data class PositionContext(
 /** A floated element's page-coordinate exclusion zone, used to narrow inline text that wraps around it. */
 data class FloatBox(val left: Float, val right: Float, val top: Float, val bottom: Float)
 
+/**
+ * Decoded images for the current document, keyed by their `<img>` element.
+ * Set once per [DocumentLayout.layout] call and read by BlockLayout's
+ * inline flow. A plain module-level var rather than a constructor
+ * parameter threaded through every BlockLayout (there are many
+ * constructor call sites across block/flex/grid/table/float layout) is
+ * safe here because layout always runs as one synchronous pass on a
+ * single thread - there's no concurrent or reentrant layout to race with.
+ */
+private var currentImages: Map<ElementNode, Bitmap> = emptyMap()
+
 class DocumentLayout(private val root: ElementNode) {
     var width = 0f
         private set
     var height = 0f
         private set
 
-    fun layout(availableWidth: Float, availableHeight: Float): List<DisplayCommand> {
+    fun layout(availableWidth: Float, availableHeight: Float, images: Map<ElementNode, Bitmap> = emptyMap()): List<DisplayCommand> {
+        currentImages = images
         width = availableWidth
         val initialContext = PositionContext(0f, 0f, availableWidth, availableHeight)
         val child = BlockLayout(root, 0f, 0f, availableWidth, initialContext, inheritedFixed = false)
@@ -181,11 +201,13 @@ class BlockLayout(
 
     private var cursorX = 0f
     private var cursorY = 0f
-    private val lineBuffer = ArrayList<WordFragment>()
+    private val lineBuffer = ArrayList<LineFragment>()
     private var rtlContext = false
     private var textAlign = "left"
 
-    private class WordFragment(val text: String, val style: TextStyle, val trailingSpace: Boolean)
+    private sealed class LineFragment(val trailingSpace: Boolean)
+    private class TextFragment(val text: String, val style: TextStyle, trailingSpace: Boolean) : LineFragment(trailingSpace)
+    private class ImageFragment(val bitmap: Bitmap, val imgWidth: Float, val imgHeight: Float) : LineFragment(false)
 
     fun layout() {
         val currentColor = parseCssColor(node.style["color"]) ?: Color.BLACK
@@ -781,7 +803,10 @@ class BlockLayout(
                     flushLine()
                     return
                 }
-                if (n.tag == "img") return
+                if (n.tag == "img") {
+                    currentImages[n]?.let { addImage(it, n) }
+                    return
+                }
                 val linkHref = if (n.tag == "a") n.attr("href") else currentLinkHref
                 for (child in n.children) recurse(child, linkHref)
             }
@@ -868,47 +893,83 @@ class BlockLayout(
     }
 
     private fun addWord(word: String, style: TextStyle, trailingSpace: Boolean = true) {
+        addFragment(TextFragment(word, style, trailingSpace), FontCache.paintFor(style).measureText(word))
+    }
+
+    /**
+     * `<img>` sizing: explicit CSS width/height win; if only one axis is
+     * set, the other scales to preserve aspect ratio; with neither set, the
+     * decoded bitmap's own pixel dimensions are used as CSS px directly
+     * (no DPI-aware intrinsic sizing, e.g. no `srcset`/`sizes` support).
+     * The image is baseline-aligned, i.e. its bottom edge sits on the
+     * text baseline - the common default for an inline image.
+     */
+    private fun addImage(bitmap: Bitmap, node: ElementNode) {
+        val fontSizePx = parsePx(node.style["font-size"]) ?: 16f
+        val cssWidth = node.style["width"]?.let { lengthValue(it, width, fontSizePx) }
+        val cssHeight = node.style["height"]?.let { lengthValue(it, 0f, fontSizePx) }
+        val intrinsicW = bitmap.width.toFloat().coerceAtLeast(1f)
+        val intrinsicH = bitmap.height.toFloat().coerceAtLeast(1f)
+        val (imgW, imgH) = when {
+            cssWidth != null && cssHeight != null -> cssWidth to cssHeight
+            cssWidth != null -> cssWidth to (intrinsicH * (cssWidth / intrinsicW))
+            cssHeight != null -> (intrinsicW * (cssHeight / intrinsicH)) to cssHeight
+            else -> intrinsicW to intrinsicH
+        }
+        addFragment(ImageFragment(bitmap, imgW, imgH), imgW)
+    }
+
+    private fun addFragment(fragment: LineFragment, fragmentWidth: Float) {
         if (lineBuffer.isEmpty()) {
             val (li, ri) = floatInsetsAt(y + cursorY)
             lineLeftInset = li
             lineRightInset = ri
         }
-        val paint = FontCache.paintFor(style)
-        val wordWidth = paint.measureText(word)
-        val spaceWidth = if (trailingSpace) paint.measureText(" ") else 0f
+        val spaceWidth = if (fragment.trailingSpace) spaceWidthFor(fragment) else 0f
         val effectiveWidth = width - lineLeftInset - lineRightInset
-        if (cursorX > 0f && cursorX + wordWidth > effectiveWidth) {
+        if (cursorX > 0f && cursorX + fragmentWidth > effectiveWidth) {
             flushLine()
             val (li, ri) = floatInsetsAt(y + cursorY)
             lineLeftInset = li
             lineRightInset = ri
         }
-        lineBuffer.add(WordFragment(word, style, trailingSpace))
-        cursorX += wordWidth + spaceWidth
+        lineBuffer.add(fragment)
+        cursorX += fragmentWidth + spaceWidth
     }
+
+    private fun spaceWidthFor(fragment: LineFragment): Float =
+        if (fragment is TextFragment) FontCache.paintFor(fragment.style).measureText(" ") else 0f
 
     private fun flushLine() {
         if (lineBuffer.isEmpty()) return
-        // Positions are computed here (not incrementally in addWord) so a
-        // right-to-left paragraph can lay the same words out in reverse
-        // order - see detectParagraphIsRtl.
-        val words = if (rtlContext) lineBuffer.asReversed() else lineBuffer
+        // Positions are computed here (not incrementally in addFragment) so
+        // a right-to-left paragraph can lay the same fragments out in
+        // reverse order - see detectParagraphIsRtl.
+        val fragments = if (rtlContext) lineBuffer.asReversed() else lineBuffer
 
         var maxAscent = 0f
         var maxDescent = 0f
-        val wordWidths = FloatArray(words.size)
-        for ((i, w) in words.withIndex()) {
-            val paint = FontCache.paintFor(w.style)
-            wordWidths[i] = paint.measureText(w.text)
-            val fm = paint.fontMetrics
-            maxAscent = maxOf(maxAscent, -fm.ascent)
-            maxDescent = maxOf(maxDescent, fm.descent)
+        val widths = FloatArray(fragments.size)
+        for ((i, f) in fragments.withIndex()) {
+            when (f) {
+                is TextFragment -> {
+                    val paint = FontCache.paintFor(f.style)
+                    widths[i] = paint.measureText(f.text)
+                    val fm = paint.fontMetrics
+                    maxAscent = maxOf(maxAscent, -fm.ascent)
+                    maxDescent = maxOf(maxDescent, fm.descent)
+                }
+                is ImageFragment -> {
+                    widths[i] = f.imgWidth
+                    maxAscent = maxOf(maxAscent, f.imgHeight) // baseline-aligned: sits entirely above the baseline
+                }
+            }
         }
 
         var lineContentWidth = 0f
-        for ((i, w) in words.withIndex()) {
-            lineContentWidth += wordWidths[i]
-            if (w.trailingSpace) lineContentWidth += FontCache.paintFor(w.style).measureText(" ")
+        for ((i, f) in fragments.withIndex()) {
+            lineContentWidth += widths[i]
+            if (f.trailingSpace) lineContentWidth += spaceWidthFor(f)
         }
         val effectiveWidth = width - lineLeftInset - lineRightInset
         val alignOffset = when (textAlign) {
@@ -919,25 +980,33 @@ class BlockLayout(
 
         val baseline = cursorY + maxAscent
         var runningX = alignOffset
-        for ((i, w) in words.withIndex()) {
-            val paint = FontCache.paintFor(w.style)
-            val fm = paint.fontMetrics
-            val wordX = x + lineLeftInset + runningX
-            inlineDisplay.add(
-                DrawText(
-                    x = wordX,
-                    baselineY = y + baseline,
-                    text = w.text,
-                    style = w.style,
-                    left = wordX,
-                    right = wordX + wordWidths[i],
-                    boxTop = y + baseline + fm.ascent,
-                    boxBottom = y + baseline + fm.descent,
-                    fixed = fixedContext
-                )
-            )
-            runningX += wordWidths[i]
-            if (w.trailingSpace) runningX += paint.measureText(" ")
+        for ((i, f) in fragments.withIndex()) {
+            val fragX = x + lineLeftInset + runningX
+            when (f) {
+                is TextFragment -> {
+                    val paint = FontCache.paintFor(f.style)
+                    val fm = paint.fontMetrics
+                    inlineDisplay.add(
+                        DrawText(
+                            x = fragX,
+                            baselineY = y + baseline,
+                            text = f.text,
+                            style = f.style,
+                            left = fragX,
+                            right = fragX + widths[i],
+                            boxTop = y + baseline + fm.ascent,
+                            boxBottom = y + baseline + fm.descent,
+                            fixed = fixedContext
+                        )
+                    )
+                }
+                is ImageFragment -> {
+                    val imgBottom = y + baseline
+                    inlineDisplay.add(DrawImage(fragX, imgBottom - f.imgHeight, fragX + widths[i], imgBottom, f.bitmap, fixed = fixedContext))
+                }
+            }
+            runningX += widths[i]
+            if (f.trailingSpace) runningX += spaceWidthFor(f)
         }
         cursorY = (baseline + maxDescent) + (maxAscent + maxDescent) * (LINE_LEADING - 1f)
         lineBuffer.clear()
