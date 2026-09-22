@@ -5,17 +5,23 @@ import com.projectfuture.browser.html.Node
 
 /** The browser's built-in (user-agent) stylesheet, applied before any page CSS. */
 const val DEFAULT_STYLESHEET = """
+body { margin: 8px; }
 a { color: #1a0dab; text-decoration: underline; }
 b, strong { font-weight: bold; }
 i, em { font-style: italic; }
-h1 { font-size: 30px; font-weight: bold; }
-h2 { font-size: 24px; font-weight: bold; }
-h3 { font-size: 20px; font-weight: bold; }
-h4 { font-size: 17px; font-weight: bold; }
-h5 { font-size: 15px; font-weight: bold; }
-h6 { font-size: 13px; font-weight: bold; }
+h1 { font-size: 30px; font-weight: bold; margin-top: 0.67em; margin-bottom: 0.67em; }
+h2 { font-size: 24px; font-weight: bold; margin-top: 0.83em; margin-bottom: 0.83em; }
+h3 { font-size: 20px; font-weight: bold; margin-top: 1em; margin-bottom: 1em; }
+h4 { font-size: 17px; font-weight: bold; margin-top: 1.33em; margin-bottom: 1.33em; }
+h5 { font-size: 15px; font-weight: bold; margin-top: 1.67em; margin-bottom: 1.67em; }
+h6 { font-size: 13px; font-weight: bold; margin-top: 2.33em; margin-bottom: 2.33em; }
+p, dl, dd, figure { margin-top: 1em; margin-bottom: 1em; }
+blockquote { margin-top: 1em; margin-bottom: 1em; margin-left: 40px; margin-right: 40px; }
+ul, ol { margin-top: 1em; margin-bottom: 1em; padding-left: 40px; }
+hr { margin-top: 0.5em; margin-bottom: 0.5em; border: 1px solid #888888; }
 small { font-size: 13px; }
 code, pre, tt, kbd, samp { font-family: monospace; }
+pre { margin-top: 1em; margin-bottom: 1em; }
 mark { background-color: #ffff00; }
 del, s, strike { text-decoration: line-through; }
 u, ins { text-decoration: underline; }
