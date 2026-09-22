@@ -68,6 +68,18 @@ import com.projectfuture.browser.html.TextNode
  * class doc. In short, `grid-template-columns` (with `fr`/`repeat()`) plus
  * row-major auto-placement, not explicit item placement or row tracks.
  *
+ * Text direction and line-breaking are approximated, not spec-complete:
+ * CJK characters (which don't use spaces) each get their own break
+ * opportunity instead of forming one unbreakable token (see
+ * tokenizeForLineBreaking) - without this a CJK paragraph would never
+ * wrap. A paragraph's overall direction is guessed from its first
+ * strongly-directional character (detectParagraphIsRtl, mirroring HTML's
+ * `dir="auto"`), and RTL paragraphs lay their words out in reverse; this is
+ * not the full Unicode Bidirectional Algorithm (UAX #9), so a single
+ * paragraph mixing RTL and LTR runs won't get each run's direction
+ * resolved independently. `text-align: left/right/center` is honored;
+ * `justify` falls back to left.
+ *
  * Table support (a literal `<table>` tag, regardless of any `display`
  * override) handles `<tr>`/`<td>`/`<th>` nested directly or via `<thead>`/
  * `<tbody>`/`<tfoot>`, and `colspan`. Column widths come from the first
@@ -170,8 +182,10 @@ class BlockLayout(
     private var cursorX = 0f
     private var cursorY = 0f
     private val lineBuffer = ArrayList<WordFragment>()
+    private var rtlContext = false
+    private var textAlign = "left"
 
-    private class WordFragment(val text: String, val xOffset: Float, val style: TextStyle)
+    private class WordFragment(val text: String, val style: TextStyle, val trailingSpace: Boolean)
 
     fun layout() {
         val currentColor = parseCssColor(node.style["color"]) ?: Color.BLACK
@@ -347,6 +361,8 @@ class BlockLayout(
                 cursorY = 0f
                 lineBuffer.clear()
                 inlineDisplay.clear()
+                rtlContext = detectParagraphIsRtl(node)
+                textAlign = node.style["text-align"]?.let { if (it == "left" && rtlContext) "right" else it } ?: "left"
                 recurse(node, currentLinkHref = null)
                 flushLine()
                 height = forcedHeight ?: (metrics.explicitContentHeight ?: cursorY)
@@ -753,7 +769,10 @@ class BlockLayout(
             is TextNode -> {
                 val style = textStyleForElement(n.parent ?: node, currentLinkHref)
                 for (word in n.text.split(Regex("\\s+")).filter { it.isNotEmpty() }) {
-                    addWord(word, style)
+                    val tokens = tokenizeForLineBreaking(word)
+                    for ((idx, token) in tokens.withIndex()) {
+                        addWord(token, style, trailingSpace = idx == tokens.size - 1)
+                    }
                 }
             }
             is ElementNode -> {
@@ -767,6 +786,71 @@ class BlockLayout(
                 for (child in n.children) recurse(child, linkHref)
             }
         }
+    }
+
+    /**
+     * CJK scripts don't use spaces between "words", so treating whitespace
+     * as the only break opportunity would make e.g. a whole Chinese
+     * paragraph one unbreakable token that overflows the screen. This
+     * splits a whitespace-delimited chunk into individual CJK characters
+     * (each its own break opportunity, packed with no artificial space)
+     * while keeping runs of non-CJK characters (e.g. embedded Latin/digits)
+     * together. It doesn't implement the full UAX #14 line-breaking class
+     * rules (e.g. never breaking before closing punctuation).
+     */
+    private fun tokenizeForLineBreaking(word: String): List<String> {
+        if (word.none { isCjkChar(it) }) return listOf(word)
+        val tokens = ArrayList<String>()
+        val buf = StringBuilder()
+        for (c in word) {
+            if (isCjkChar(c)) {
+                if (buf.isNotEmpty()) { tokens.add(buf.toString()); buf.setLength(0) }
+                tokens.add(c.toString())
+            } else {
+                buf.append(c)
+            }
+        }
+        if (buf.isNotEmpty()) tokens.add(buf.toString())
+        return tokens
+    }
+
+    private fun isCjkChar(c: Char): Boolean {
+        val code = c.code
+        return code in 0x4E00..0x9FFF || // CJK Unified Ideographs
+            code in 0x3040..0x30FF || // Hiragana + Katakana
+            code in 0xAC00..0xD7A3 || // Hangul syllables
+            code in 0x3400..0x4DBF || // CJK Extension A
+            code in 0xFF00..0xFFEF // Halfwidth/fullwidth forms
+    }
+
+    private fun isStrongRtlChar(c: Char): Boolean {
+        val code = c.code
+        return code in 0x0590..0x08FF || // Hebrew, Arabic, Syriac, Thaana, N'Ko, Arabic Extended
+            code in 0xFB1D..0xFDFF || // Hebrew/Arabic presentation forms
+            code in 0xFE70..0xFEFF
+    }
+
+    /**
+     * Approximates HTML's `dir="auto"` heuristic: the paragraph's direction
+     * is decided by its first strongly-directional character. This is not
+     * the full Unicode Bidirectional Algorithm (UAX #9) - mixed-direction
+     * runs within one paragraph aren't resolved per-run, the whole
+     * paragraph's lines are just reversed word-by-word if it reads as RTL.
+     */
+    private fun detectParagraphIsRtl(root: ElementNode): Boolean {
+        fun scan(n: Node): Boolean? {
+            when (n) {
+                is TextNode -> for (c in n.text) {
+                    if (isStrongRtlChar(c)) return true
+                    if (c.isLetter()) return false
+                }
+                is ElementNode -> for (child in n.children) {
+                    scan(child)?.let { return it }
+                }
+            }
+            return null
+        }
+        return scan(root) ?: false
     }
 
     private var lineLeftInset = 0f
@@ -783,7 +867,7 @@ class BlockLayout(
         return leftInset.coerceAtLeast(0f) to rightInset.coerceAtLeast(0f)
     }
 
-    private fun addWord(word: String, style: TextStyle) {
+    private fun addWord(word: String, style: TextStyle, trailingSpace: Boolean = true) {
         if (lineBuffer.isEmpty()) {
             val (li, ri) = floatInsetsAt(y + cursorY)
             lineLeftInset = li
@@ -791,7 +875,7 @@ class BlockLayout(
         }
         val paint = FontCache.paintFor(style)
         val wordWidth = paint.measureText(word)
-        val spaceWidth = paint.measureText(" ")
+        val spaceWidth = if (trailingSpace) paint.measureText(" ") else 0f
         val effectiveWidth = width - lineLeftInset - lineRightInset
         if (cursorX > 0f && cursorX + wordWidth > effectiveWidth) {
             flushLine()
@@ -799,25 +883,46 @@ class BlockLayout(
             lineLeftInset = li
             lineRightInset = ri
         }
-        lineBuffer.add(WordFragment(word, cursorX, style))
+        lineBuffer.add(WordFragment(word, style, trailingSpace))
         cursorX += wordWidth + spaceWidth
     }
 
     private fun flushLine() {
         if (lineBuffer.isEmpty()) return
+        // Positions are computed here (not incrementally in addWord) so a
+        // right-to-left paragraph can lay the same words out in reverse
+        // order - see detectParagraphIsRtl.
+        val words = if (rtlContext) lineBuffer.asReversed() else lineBuffer
+
         var maxAscent = 0f
         var maxDescent = 0f
-        for (w in lineBuffer) {
-            val fm = FontCache.paintFor(w.style).fontMetrics
+        val wordWidths = FloatArray(words.size)
+        for ((i, w) in words.withIndex()) {
+            val paint = FontCache.paintFor(w.style)
+            wordWidths[i] = paint.measureText(w.text)
+            val fm = paint.fontMetrics
             maxAscent = maxOf(maxAscent, -fm.ascent)
             maxDescent = maxOf(maxDescent, fm.descent)
         }
+
+        var lineContentWidth = 0f
+        for ((i, w) in words.withIndex()) {
+            lineContentWidth += wordWidths[i]
+            if (w.trailingSpace) lineContentWidth += FontCache.paintFor(w.style).measureText(" ")
+        }
+        val effectiveWidth = width - lineLeftInset - lineRightInset
+        val alignOffset = when (textAlign) {
+            "right" -> (effectiveWidth - lineContentWidth).coerceAtLeast(0f)
+            "center" -> ((effectiveWidth - lineContentWidth) / 2f).coerceAtLeast(0f)
+            else -> 0f
+        }
+
         val baseline = cursorY + maxAscent
-        for (w in lineBuffer) {
+        var runningX = alignOffset
+        for ((i, w) in words.withIndex()) {
             val paint = FontCache.paintFor(w.style)
-            val wordWidth = paint.measureText(w.text)
             val fm = paint.fontMetrics
-            val wordX = x + lineLeftInset + w.xOffset
+            val wordX = x + lineLeftInset + runningX
             inlineDisplay.add(
                 DrawText(
                     x = wordX,
@@ -825,12 +930,14 @@ class BlockLayout(
                     text = w.text,
                     style = w.style,
                     left = wordX,
-                    right = wordX + wordWidth,
+                    right = wordX + wordWidths[i],
                     boxTop = y + baseline + fm.ascent,
                     boxBottom = y + baseline + fm.descent,
                     fixed = fixedContext
                 )
             )
+            runningX += wordWidths[i]
+            if (w.trailingSpace) runningX += paint.measureText(" ")
         }
         cursorY = (baseline + maxDescent) + (maxAscent + maxDescent) * (LINE_LEADING - 1f)
         lineBuffer.clear()
