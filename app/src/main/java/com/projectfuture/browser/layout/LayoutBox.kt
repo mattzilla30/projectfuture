@@ -68,6 +68,13 @@ import com.projectfuture.browser.html.TextNode
  * class doc. In short, `grid-template-columns` (with `fr`/`repeat()`) plus
  * row-major auto-placement, not explicit item placement or row tracks.
  *
+ * Table support (a literal `<table>` tag, regardless of any `display`
+ * override) handles `<tr>`/`<td>`/`<th>` nested directly or via `<thead>`/
+ * `<tbody>`/`<tfoot>`, and `colspan`. Column widths come from the first
+ * explicit-width cell found per column, with leftover width split evenly
+ * across the rest. `rowspan`, `border-collapse`, and cell vertical-align
+ * (cells are always top-aligned) aren't implemented.
+ *
  * Float support is scoped to the common case - a floated element and the
  * normal-flow content that should wrap around it as DIRECT siblings under
  * the same block parent (e.g. `<div><img style="float:left"><p>...</p></div>`).
@@ -82,7 +89,7 @@ private const val LINE_LEADING = 1.25f
 
 private val SKIPPED_TAGS = setOf("script", "style", "head", "title", "meta", "link", "noscript")
 
-private enum class LayoutMode { BLOCK, INLINE, FLEX, GRID }
+private enum class LayoutMode { BLOCK, INLINE, FLEX, GRID, TABLE }
 
 /** The containing block used to resolve absolute/fixed descendants' geometry. */
 data class PositionContext(
@@ -331,6 +338,10 @@ class BlockLayout(
                 val naturalHeight = layoutGridChildren(gridProps, gridItemNodes, childPosContext)
                 height = forcedHeight ?: (metrics.explicitContentHeight ?: naturalHeight)
             }
+            LayoutMode.TABLE -> {
+                val naturalHeight = layoutTable(childPosContext)
+                height = forcedHeight ?: (metrics.explicitContentHeight ?: naturalHeight)
+            }
             LayoutMode.INLINE -> {
                 cursorX = 0f
                 cursorY = 0f
@@ -353,6 +364,7 @@ class BlockLayout(
         el.tag in SKIPPED_TAGS || el.style["display"] == "none"
 
     private fun layoutMode(): LayoutMode {
+        if (node.tag == "table") return LayoutMode.TABLE
         val display = node.style["display"]
         if (display == "flex" || display == "inline-flex") return LayoutMode.FLEX
         if (display == "grid" || display == "inline-grid") return LayoutMode.GRID
@@ -623,6 +635,90 @@ class BlockLayout(
         return (rowTop - y - props.rowGap).coerceAtLeast(0f)
     }
 
+    // ---- Table ----
+
+    private class TableCell(val node: ElementNode, val colSpan: Int)
+
+    private fun collectTableRows(table: ElementNode): List<ElementNode> {
+        val rows = ArrayList<ElementNode>()
+        for (child in table.children) {
+            if (child !is ElementNode || isSkipped(child)) continue
+            when (child.tag) {
+                "tr" -> rows.add(child)
+                "thead", "tbody", "tfoot" -> for (grandchild in child.children) {
+                    if (grandchild is ElementNode && grandchild.tag == "tr" && !isSkipped(grandchild)) rows.add(grandchild)
+                }
+            }
+        }
+        return rows
+    }
+
+    /**
+     * Column widths: explicit `width` on a colspan=1 cell wins for that
+     * column (first one found), remaining columns split the leftover width
+     * evenly. `rowspan` isn't implemented (would need a 2D cell-occupancy
+     * grid) - a rowspan cell is treated as spanning just its own row, so
+     * later rows won't have that column's slot reserved.
+     */
+    private fun layoutTable(childPosContext: PositionContext): Float {
+        val rows = collectTableRows(node)
+        if (rows.isEmpty()) return 0f
+
+        val rowCells = rows.map { row ->
+            row.children.filterIsInstance<ElementNode>()
+                .filter { (it.tag == "td" || it.tag == "th") && !isSkipped(it) }
+                .map { TableCell(it, it.attr("colspan")?.toIntOrNull()?.coerceAtLeast(1) ?: 1) }
+        }
+        val colCount = rowCells.maxOf { r -> r.sumOf { it.colSpan } }.coerceAtLeast(1)
+
+        val colWidths = FloatArray(colCount)
+        val colExplicit = BooleanArray(colCount)
+        for (row in rowCells) {
+            var col = 0
+            for (cell in row) {
+                if (cell.colSpan == 1 && col < colCount && !colExplicit[col]) {
+                    val fontSizePx = parsePx(cell.node.style["font-size"]) ?: 16f
+                    val m = resolveBoxMetrics(cell.node.style, width, Color.BLACK, fontSizePx)
+                    m.explicitContentWidth?.let {
+                        colWidths[col] = it
+                        colExplicit[col] = true
+                    }
+                }
+                col += cell.colSpan
+            }
+        }
+        val explicitSum = colWidths.filterIndexed { i, _ -> colExplicit[i] }.sum()
+        val flexibleCount = colExplicit.count { !it }
+        val flexWidth = if (flexibleCount > 0) ((width - explicitSum) / flexibleCount).coerceAtLeast(0f) else 0f
+        for (i in 0 until colCount) if (!colExplicit[i]) colWidths[i] = flexWidth
+
+        val colX = FloatArray(colCount)
+        var acc = x
+        for (i in 0 until colCount) {
+            colX[i] = acc
+            acc += colWidths[i]
+        }
+
+        var rowTop = y
+        for (row in rowCells) {
+            var col = 0
+            val laidOutRow = ArrayList<BlockLayout>()
+            for (cell in row) {
+                if (col >= colCount) break
+                val span = cell.colSpan.coerceAtMost(colCount - col)
+                val cellWidth = (0 until span).sumOf { colWidths[col + it].toDouble() }.toFloat()
+                val bl = BlockLayout(cell.node, colX[col], rowTop, cellWidth, childPosContext, fixedContext, forcedWidth = cellWidth)
+                bl.layout()
+                laidOutRow.add(bl)
+                col += span
+            }
+            normalChildren.addAll(laidOutRow)
+            val rowHeight = laidOutRow.maxOfOrNull { it.outerHeight } ?: 0f
+            rowTop += rowHeight
+        }
+        return (rowTop - y).coerceAtLeast(0f)
+    }
+
     /** Unwrapped natural text width, used as a flex-basis fallback for inline-content items. */
     private fun measureNaturalWidth(node: ElementNode): Float {
         if (isSkipped(node)) return 0f
@@ -755,7 +851,7 @@ class BlockLayout(
         if (borderLeft > 0f) cmds.add(DrawRect(borderBoxLeft, borderBoxTop, borderBoxLeft + borderLeft, borderBoxBottom, borderColorLeft, fixed = fixedContext))
         if (borderRight > 0f) cmds.add(DrawRect(borderBoxRight - borderRight, borderBoxTop, borderBoxRight, borderBoxBottom, borderColorRight, fixed = fixedContext))
 
-        if (mode == LayoutMode.BLOCK || mode == LayoutMode.FLEX || mode == LayoutMode.GRID) {
+        if (mode == LayoutMode.BLOCK || mode == LayoutMode.FLEX || mode == LayoutMode.GRID || mode == LayoutMode.TABLE) {
             for (c in normalChildren) c.paint(cmds)
             for (c in positionedChildren.sortedBy { it.zIndex }) c.paint(cmds)
         } else {
