@@ -67,6 +67,16 @@ import com.projectfuture.browser.html.TextNode
  * Grid support (`display: grid`) is deliberately narrow: see Grid.kt's
  * class doc. In short, `grid-template-columns` (with `fr`/`repeat()`) plus
  * row-major auto-placement, not explicit item placement or row tracks.
+ *
+ * Float support is scoped to the common case - a floated element and the
+ * normal-flow content that should wrap around it as DIRECT siblings under
+ * the same block parent (e.g. `<div><img style="float:left"><p>...</p></div>`).
+ * Floats don't propagate into deeper descendants, so text several levels
+ * further down won't wrap around an ancestor's sibling float. `clear`
+ * pushes a later sibling below the relevant float(s). A float's width, when
+ * not explicit, is approximated the same way as an auto flex-basis
+ * (unwrapped text width, or a fallback fraction of the container) - not
+ * true shrink-to-fit.
  */
 private const val LINE_LEADING = 1.25f
 
@@ -81,6 +91,9 @@ data class PositionContext(
     val containerWidth: Float,
     val containerHeight: Float
 )
+
+/** A floated element's page-coordinate exclusion zone, used to narrow inline text that wraps around it. */
+data class FloatBox(val left: Float, val right: Float, val top: Float, val bottom: Float)
 
 class DocumentLayout(private val root: ElementNode) {
     var width = 0f
@@ -108,7 +121,8 @@ class BlockLayout(
     private val posContext: PositionContext,
     private val inheritedFixed: Boolean,
     private val forcedWidth: Float? = null,
-    private val forcedHeight: Float? = null
+    private val forcedHeight: Float? = null,
+    private val floats: List<FloatBox> = emptyList()
 ) {
     /** Content-box geometry, set once [layout] has run. */
     var x = 0f
@@ -231,11 +245,47 @@ class BlockLayout(
         when (mode) {
             LayoutMode.BLOCK -> {
                 var cursor = y
+                var leftFloatBottom = y
+                var rightFloatBottom = y
+                val activeFloats = ArrayList<FloatBox>()
                 for (childNode in node.children) {
                     if (childNode !is ElementNode || isSkipped(childNode)) continue
                     val childPosition = childNode.style["position"] ?: "static"
                     val childRemoved = childPosition == "absolute" || childPosition == "fixed"
-                    val bl = BlockLayout(childNode, x, cursor, width, childPosContext, fixedContext)
+                    val floatSide = childNode.style["float"]
+
+                    if (!childRemoved && (floatSide == "left" || floatSide == "right")) {
+                        val childFontSize = parsePx(childNode.style["font-size"]) ?: 16f
+                        val m = resolveBoxMetrics(childNode.style, width, Color.BLACK, childFontSize)
+                        val floatContentWidth = m.explicitContentWidth
+                            ?: measureNaturalWidth(childNode).let { if (it > 0f) it else width * 0.4f }
+                        val outerWidth = m.marginLeft + m.borderLeft + m.paddingLeft +
+                            floatContentWidth + m.paddingRight + m.borderRight + m.marginRight
+                        val floatTop = if (floatSide == "left") maxOf(cursor, leftFloatBottom) else maxOf(cursor, rightFloatBottom)
+                        val floatContainingX = if (floatSide == "left") x else x + width - outerWidth
+                        val bl = BlockLayout(childNode, floatContainingX, floatTop, width, childPosContext, fixedContext, forcedWidth = floatContentWidth)
+                        bl.layout()
+                        val floatBottom = floatTop + bl.outerHeight
+                        val floatEntry = if (floatSide == "left") {
+                            leftFloatBottom = floatBottom
+                            FloatBox(x, x + outerWidth, floatTop, floatBottom)
+                        } else {
+                            rightFloatBottom = floatBottom
+                            FloatBox(x + width - outerWidth, x + width, floatTop, floatBottom)
+                        }
+                        activeFloats.add(floatEntry)
+                        normalChildren.add(bl) // painted, but outerHeight excluded from cursor advancement below
+                        continue
+                    }
+
+                    val clear = childNode.style["clear"]
+                    if (!childRemoved && (clear == "left" || clear == "both")) cursor = maxOf(cursor, leftFloatBottom)
+                    if (!childRemoved && (clear == "right" || clear == "both")) cursor = maxOf(cursor, rightFloatBottom)
+
+                    val bl = BlockLayout(
+                        childNode, x, cursor, width, childPosContext, fixedContext,
+                        floats = if (childRemoved) emptyList() else activeFloats
+                    )
                     bl.layout()
                     if (childRemoved) {
                         positionedChildren.add(bl)
@@ -244,7 +294,8 @@ class BlockLayout(
                         cursor += bl.outerHeight
                     }
                 }
-                height = forcedHeight ?: (metrics.explicitContentHeight ?: (cursor - y).coerceAtLeast(0f))
+                val floatExtent = maxOf(leftFloatBottom, rightFloatBottom) - y
+                height = forcedHeight ?: (metrics.explicitContentHeight ?: maxOf(cursor - y, floatExtent).coerceAtLeast(0f))
             }
             LayoutMode.FLEX -> {
                 val flexItemNodes = ArrayList<ElementNode>()
@@ -622,11 +673,36 @@ class BlockLayout(
         }
     }
 
+    private var lineLeftInset = 0f
+    private var lineRightInset = 0f
+
+    /** Left/right inset at a given page-y from any active floats, so text wraps around them. */
+    private fun floatInsetsAt(pageY: Float): Pair<Float, Float> {
+        var leftInset = 0f
+        var rightInset = 0f
+        for (f in floats) {
+            if (pageY < f.top || pageY >= f.bottom) continue
+            if (f.left <= x) leftInset = maxOf(leftInset, f.right - x) else rightInset = maxOf(rightInset, (x + width) - f.left)
+        }
+        return leftInset.coerceAtLeast(0f) to rightInset.coerceAtLeast(0f)
+    }
+
     private fun addWord(word: String, style: TextStyle) {
+        if (lineBuffer.isEmpty()) {
+            val (li, ri) = floatInsetsAt(y + cursorY)
+            lineLeftInset = li
+            lineRightInset = ri
+        }
         val paint = FontCache.paintFor(style)
         val wordWidth = paint.measureText(word)
         val spaceWidth = paint.measureText(" ")
-        if (cursorX > 0f && cursorX + wordWidth > width) flushLine()
+        val effectiveWidth = width - lineLeftInset - lineRightInset
+        if (cursorX > 0f && cursorX + wordWidth > effectiveWidth) {
+            flushLine()
+            val (li, ri) = floatInsetsAt(y + cursorY)
+            lineLeftInset = li
+            lineRightInset = ri
+        }
         lineBuffer.add(WordFragment(word, cursorX, style))
         cursorX += wordWidth + spaceWidth
     }
@@ -645,14 +721,15 @@ class BlockLayout(
             val paint = FontCache.paintFor(w.style)
             val wordWidth = paint.measureText(w.text)
             val fm = paint.fontMetrics
+            val wordX = x + lineLeftInset + w.xOffset
             inlineDisplay.add(
                 DrawText(
-                    x = x + w.xOffset,
+                    x = wordX,
                     baselineY = y + baseline,
                     text = w.text,
                     style = w.style,
-                    left = x + w.xOffset,
-                    right = x + w.xOffset + wordWidth,
+                    left = wordX,
+                    right = wordX + wordWidth,
                     boxTop = y + baseline + fm.ascent,
                     boxBottom = y + baseline + fm.descent,
                     fixed = fixedContext
