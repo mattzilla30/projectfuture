@@ -16,6 +16,11 @@ import com.projectfuture.browser.layout.FontCache
  * Paints a DisplayCommand list straight onto a Canvas and turns touch
  * input into scroll offset changes / link taps. This is the entire
  * "renderer" - there is no WebView or system browser widget involved.
+ *
+ * Commands are split into two groups: normal page content, which scrolls
+ * (painted under a scroll translate), and `position: fixed` content, which
+ * is painted in a second, untranslated pass so it stays pinned on screen -
+ * see DisplayCommand's doc for why the coordinate spaces differ.
  */
 class BrowserView @JvmOverloads constructor(
     context: Context,
@@ -23,9 +28,10 @@ class BrowserView @JvmOverloads constructor(
 ) : View(context, attrs) {
 
     var onLinkTapped: ((String) -> Unit)? = null
-    var onWidthAvailable: ((Float) -> Unit)? = null
+    var onSizeAvailable: ((Float, Float) -> Unit)? = null
 
-    private var displayList: List<DisplayCommand> = emptyList()
+    private var normalCommands: List<DisplayCommand> = emptyList()
+    private var fixedCommands: List<DisplayCommand> = emptyList()
     private var contentHeight = 0f
     private var scrollYPx = 0f
     private val rectPaint = Paint()
@@ -40,18 +46,26 @@ class BrowserView @JvmOverloads constructor(
         }
 
         override fun onSingleTapUp(e: MotionEvent): Boolean {
-            val px = e.x
-            val py = e.y + scrollYPx
-            val hit = displayList.asSequence()
+            val fixedHit = fixedCommands.asSequence()
                 .filterIsInstance<DrawText>()
-                .firstOrNull { it.style.linkHref != null && px in it.left..it.right && py in it.top..it.bottom }
+                .firstOrNull { it.style.linkHref != null && e.x in it.left..it.right && e.y in it.top..it.bottom }
+            if (fixedHit != null) {
+                fixedHit.style.linkHref?.let { onLinkTapped?.invoke(it) }
+                return true
+            }
+            val py = e.y + scrollYPx
+            val hit = normalCommands.asSequence()
+                .filterIsInstance<DrawText>()
+                .firstOrNull { it.style.linkHref != null && e.x in it.left..it.right && py in it.top..it.bottom }
             hit?.style?.linkHref?.let { onLinkTapped?.invoke(it) }
             return true
         }
     })
 
     fun setContent(commands: List<DisplayCommand>, height: Float) {
-        displayList = commands
+        val (fixed, normal) = commands.partition { it.fixed }
+        normalCommands = normal
+        fixedCommands = fixed
         contentHeight = height
         scrollYPx = scrollYPx.coerceIn(0f, maxScroll())
         invalidate()
@@ -66,7 +80,7 @@ class BrowserView @JvmOverloads constructor(
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
-        if (w > 0) onWidthAvailable?.invoke(w.toFloat())
+        if (w > 0 && h > 0) onSizeAvailable?.invoke(w.toFloat(), h.toFloat())
     }
 
     override fun onTouchEvent(event: MotionEvent): Boolean {
@@ -76,12 +90,17 @@ class BrowserView @JvmOverloads constructor(
 
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+
         canvas.save()
         canvas.translate(0f, -scrollYPx)
+        drawCommands(canvas, normalCommands, scrollYPx, scrollYPx + height)
+        canvas.restore()
 
-        val viewTop = scrollYPx
-        val viewBottom = scrollYPx + height
-        for (cmd in displayList) {
+        drawCommands(canvas, fixedCommands, 0f, height.toFloat())
+    }
+
+    private fun drawCommands(canvas: Canvas, commands: List<DisplayCommand>, viewTop: Float, viewBottom: Float) {
+        for (cmd in commands) {
             if (cmd.bottom < viewTop || cmd.top > viewBottom) continue
             when (cmd) {
                 is DrawRect -> {
@@ -103,6 +122,5 @@ class BrowserView @JvmOverloads constructor(
                 }
             }
         }
-        canvas.restore()
     }
 }

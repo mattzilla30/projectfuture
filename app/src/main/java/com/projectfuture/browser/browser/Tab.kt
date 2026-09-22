@@ -44,6 +44,7 @@ class Tab(private val onStateChanged: (TabState) -> Unit) {
     var contentHeight: Float = 0f
         private set
     private var viewportWidth: Float = 0f
+    private var viewportHeight: Float = 0f
 
     fun canGoBack() = historyIndex > 0
     fun canGoForward() = historyIndex in 0 until (history.size - 1)
@@ -73,10 +74,11 @@ class Tab(private val onStateChanged: (TabState) -> Unit) {
         load(base.resolve(href), HistoryAction.PUSH)
     }
 
-    /** Called by the view when its width changes; re-runs layout without re-fetching. */
-    fun onViewportWidthChanged(widthPx: Float): Boolean {
-        if (widthPx <= 0f || widthPx == viewportWidth) return false
+    /** Called by the view when its size changes; re-runs layout without re-fetching. */
+    fun onViewportSizeChanged(widthPx: Float, heightPx: Float): Boolean {
+        if (widthPx <= 0f || heightPx <= 0f || (widthPx == viewportWidth && heightPx == viewportHeight)) return false
         viewportWidth = widthPx
+        viewportHeight = heightPx
         relayout()
         return true
     }
@@ -115,9 +117,9 @@ class Tab(private val onStateChanged: (TabState) -> Unit) {
 
     private fun relayout() {
         val doc = currentDoc ?: return
-        if (viewportWidth <= 0f) return
+        if (viewportWidth <= 0f || viewportHeight <= 0f) return
         val docLayout = DocumentLayout(doc)
-        displayList = docLayout.layout(viewportWidth)
+        displayList = docLayout.layout(viewportWidth, viewportHeight)
         contentHeight = docLayout.height
     }
 

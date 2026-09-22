@@ -187,7 +187,7 @@ private fun extractShorthandSide(shorthand: String, side: String): String? {
     }
 }
 
-private fun lengthValue(raw: String, percentBase: Float, fontSizePx: Float): Float? {
+internal fun lengthValue(raw: String, percentBase: Float, fontSizePx: Float): Float? {
     val v = raw.trim()
     if (v.isEmpty() || v == "auto" || v == "none") return null
     return when {

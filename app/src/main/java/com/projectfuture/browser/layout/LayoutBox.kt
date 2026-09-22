@@ -4,6 +4,7 @@ import android.graphics.Color
 import com.projectfuture.browser.css.parseCssColor
 import com.projectfuture.browser.css.parsePx
 import com.projectfuture.browser.css.resolveBoxMetrics
+import com.projectfuture.browser.css.resolvePositionOffsets
 import com.projectfuture.browser.html.ElementNode
 import com.projectfuture.browser.html.HtmlParser
 import com.projectfuture.browser.html.Node
@@ -16,10 +17,22 @@ import com.projectfuture.browser.html.TextNode
  * flowed into wrapped, baseline-aligned lines). This produces the absolute
  * page-coordinate DisplayCommand list that BrowserView paints.
  *
- * Each block box now carries a real CSS box model (margin/border/padding,
- * box-sizing, explicit width/height) via [resolveBoxMetrics]. Sibling
- * vertical margins are summed rather than collapsed - see the note on
- * BoxMetrics for why that's a deliberate, documented simplification.
+ * Positioning support and its known limits:
+ * - `relative` stays in normal flow; top/right/bottom/left just shift its
+ *   painted position (and its subtree's), matching spec.
+ * - `absolute`/`fixed` are removed from flow and positioned against the
+ *   nearest positioned ancestor's padding box (the viewport for `fixed`,
+ *   or for `absolute` with no positioned ancestor). `left`/`top` are fully
+ *   supported; `right`/`bottom` resolve correctly when paired with an
+ *   explicit width/height, but fall back to the normal-flow "static
+ *   position" when the box's own size is auto - true CSS shrink-to-fit and
+ *   a second layout pass for that case aren't implemented.
+ * - `z-index`: positioned descendants paint after normal-flow ones,
+ *   sorted by z-index. This is a flat approximation of real stacking
+ *   contexts (which nest), not a full implementation.
+ * - `sticky` is not implemented - it needs layout to react to scroll
+ *   position, which this single-pass-then-just-translate renderer doesn't
+ *   support yet.
  */
 private const val LINE_LEADING = 1.25f
 
@@ -27,15 +40,24 @@ private val SKIPPED_TAGS = setOf("script", "style", "head", "title", "meta", "li
 
 private enum class LayoutMode { BLOCK, INLINE }
 
+/** The containing block used to resolve absolute/fixed descendants' geometry. */
+data class PositionContext(
+    val containerX: Float,
+    val containerY: Float,
+    val containerWidth: Float,
+    val containerHeight: Float
+)
+
 class DocumentLayout(private val root: ElementNode) {
     var width = 0f
         private set
     var height = 0f
         private set
 
-    fun layout(availableWidth: Float): List<DisplayCommand> {
+    fun layout(availableWidth: Float, availableHeight: Float): List<DisplayCommand> {
         width = availableWidth
-        val child = BlockLayout(root, containingX = 0f, containingY = 0f, containingWidth = availableWidth)
+        val initialContext = PositionContext(0f, 0f, availableWidth, availableHeight)
+        val child = BlockLayout(root, 0f, 0f, availableWidth, initialContext, inheritedFixed = false)
         child.layout()
         height = child.outerHeight
         val cmds = ArrayList<DisplayCommand>()
@@ -48,7 +70,9 @@ class BlockLayout(
     val node: ElementNode,
     private val containingX: Float,
     private val containingY: Float,
-    private val containingWidth: Float
+    private val containingWidth: Float,
+    private val posContext: PositionContext,
+    private val inheritedFixed: Boolean
 ) {
     /** Content-box geometry, set once [layout] has run. */
     var x = 0f
@@ -78,8 +102,11 @@ class BlockLayout(
     private var borderColorRight = Color.BLACK
     private var borderColorBottom = Color.BLACK
     private var borderColorLeft = Color.BLACK
+    private var fixedContext = false
+    private var zIndex = 0
 
-    private val children = ArrayList<BlockLayout>()
+    private val normalChildren = ArrayList<BlockLayout>()
+    private val positionedChildren = ArrayList<BlockLayout>()
     private val inlineDisplay = ArrayList<DisplayCommand>()
     private var mode = LayoutMode.INLINE
 
@@ -92,8 +119,18 @@ class BlockLayout(
     fun layout() {
         val currentColor = parseCssColor(node.style["color"]) ?: Color.BLACK
         val fontSizePx = parsePx(node.style["font-size"]) ?: 16f
-        val metrics = resolveBoxMetrics(node.style, containingWidth, currentColor, fontSizePx)
+        val ownPosition = node.style["position"] ?: "static"
+        fixedContext = inheritedFixed || ownPosition == "fixed"
+        zIndex = node.style["z-index"]?.toIntOrNull() ?: 0
 
+        val removedFromFlow = ownPosition == "absolute" || ownPosition == "fixed"
+        val establishesContainingBlock = ownPosition != "static"
+
+        val effContainingX = if (removedFromFlow) posContext.containerX else containingX
+        val effContainingY = if (removedFromFlow) posContext.containerY else containingY
+        val effContainingWidth = if (removedFromFlow) posContext.containerWidth else containingWidth
+
+        val metrics = resolveBoxMetrics(node.style, effContainingWidth, currentColor, fontSizePx)
         marginTop = metrics.marginTop
         marginBottom = metrics.marginBottom
         borderTop = metrics.borderTop
@@ -109,24 +146,66 @@ class BlockLayout(
         borderColorBottom = metrics.borderColorBottom
         borderColorLeft = metrics.borderColorLeft
 
-        val marginBoxX = containingX + metrics.marginLeft
-        val borderBoxX = marginBoxX + borderLeft
-        x = borderBoxX + paddingLeft
-        y = containingY + marginTop + borderTop + paddingTop
-
-        val availableContentWidth = containingWidth - metrics.marginLeft - metrics.marginRight -
+        val availableContentWidth = effContainingWidth - metrics.marginLeft - metrics.marginRight -
             borderLeft - borderRight - paddingLeft - paddingRight
         width = metrics.explicitContentWidth ?: availableContentWidth.coerceAtLeast(0f)
+
+        if (removedFromFlow) {
+            val offsets = resolvePositionOffsets(node.style, posContext.containerWidth, posContext.containerHeight, fontSizePx)
+            val staticX = containingX + metrics.marginLeft + borderLeft + paddingLeft
+            val staticY = containingY + marginTop + borderTop + paddingTop
+            x = when {
+                offsets.left != null -> posContext.containerX + offsets.left + borderLeft + paddingLeft
+                offsets.right != null -> (posContext.containerX + posContext.containerWidth) - offsets.right - borderRight - paddingRight - width
+                else -> staticX
+            }
+            y = when {
+                offsets.top != null -> posContext.containerY + offsets.top + borderTop + paddingTop
+                offsets.bottom != null && metrics.explicitContentHeight != null ->
+                    (posContext.containerY + posContext.containerHeight) - offsets.bottom - borderBottom - paddingBottom - metrics.explicitContentHeight
+                else -> staticY
+            }
+        } else {
+            x = effContainingX + metrics.marginLeft + borderLeft + paddingLeft
+            y = effContainingY + marginTop + borderTop + paddingTop
+            if (ownPosition == "relative") {
+                val offsets = resolvePositionOffsets(node.style, effContainingWidth, posContext.containerHeight, fontSizePx)
+                x += offsets.left ?: offsets.right?.let { -it } ?: 0f
+                y += offsets.top ?: offsets.bottom?.let { -it } ?: 0f
+            }
+        }
+
+        // Containing block passed to descendants when this box establishes one.
+        // Height is approximated from the nearest known height when this box's
+        // own height is auto (a real second layout pass isn't implemented -
+        // see the class doc's note on right/bottom + auto-size).
+        val childPosContext = if (establishesContainingBlock) {
+            val approxHeight = metrics.explicitContentHeight ?: posContext.containerHeight
+            PositionContext(
+                containerX = x - paddingLeft,
+                containerY = y - paddingTop,
+                containerWidth = width + paddingLeft + paddingRight,
+                containerHeight = approxHeight + paddingTop + paddingBottom
+            )
+        } else {
+            posContext
+        }
 
         mode = layoutMode()
         if (mode == LayoutMode.BLOCK) {
             var cursor = y
             for (childNode in node.children) {
                 if (childNode !is ElementNode || isSkipped(childNode)) continue
-                val bl = BlockLayout(childNode, x, cursor, width)
+                val childPosition = childNode.style["position"] ?: "static"
+                val childRemoved = childPosition == "absolute" || childPosition == "fixed"
+                val bl = BlockLayout(childNode, x, cursor, width, childPosContext, fixedContext)
                 bl.layout()
-                children.add(bl)
-                cursor += bl.outerHeight
+                if (childRemoved) {
+                    positionedChildren.add(bl)
+                } else {
+                    normalChildren.add(bl)
+                    cursor += bl.outerHeight
+                }
             }
             height = metrics.explicitContentHeight ?: (cursor - y).coerceAtLeast(0f)
         } else {
@@ -139,7 +218,11 @@ class BlockLayout(
             height = metrics.explicitContentHeight ?: cursorY
         }
 
-        outerHeight = marginTop + borderTop + paddingTop + height + paddingBottom + borderBottom + marginBottom
+        outerHeight = if (removedFromFlow) {
+            0f // takes no space in the flow it was removed from
+        } else {
+            marginTop + borderTop + paddingTop + height + paddingBottom + borderBottom + marginBottom
+        }
     }
 
     private fun isSkipped(el: ElementNode): Boolean =
@@ -204,7 +287,8 @@ class BlockLayout(
                     left = x + w.xOffset,
                     right = x + w.xOffset + wordWidth,
                     boxTop = y + baseline + fm.ascent,
-                    boxBottom = y + baseline + fm.descent
+                    boxBottom = y + baseline + fm.descent,
+                    fixed = fixedContext
                 )
             )
         }
@@ -220,15 +304,16 @@ class BlockLayout(
         val borderBoxBottom = y + height + paddingBottom + borderBottom
 
         parseCssColor(node.style["background-color"])?.let { bg ->
-            cmds.add(DrawRect(borderBoxLeft, borderBoxTop, borderBoxRight, borderBoxBottom, bg))
+            cmds.add(DrawRect(borderBoxLeft, borderBoxTop, borderBoxRight, borderBoxBottom, bg, fixed = fixedContext))
         }
-        if (borderTop > 0f) cmds.add(DrawRect(borderBoxLeft, borderBoxTop, borderBoxRight, borderBoxTop + borderTop, borderColorTop))
-        if (borderBottom > 0f) cmds.add(DrawRect(borderBoxLeft, borderBoxBottom - borderBottom, borderBoxRight, borderBoxBottom, borderColorBottom))
-        if (borderLeft > 0f) cmds.add(DrawRect(borderBoxLeft, borderBoxTop, borderBoxLeft + borderLeft, borderBoxBottom, borderColorLeft))
-        if (borderRight > 0f) cmds.add(DrawRect(borderBoxRight - borderRight, borderBoxTop, borderBoxRight, borderBoxBottom, borderColorRight))
+        if (borderTop > 0f) cmds.add(DrawRect(borderBoxLeft, borderBoxTop, borderBoxRight, borderBoxTop + borderTop, borderColorTop, fixed = fixedContext))
+        if (borderBottom > 0f) cmds.add(DrawRect(borderBoxLeft, borderBoxBottom - borderBottom, borderBoxRight, borderBoxBottom, borderColorBottom, fixed = fixedContext))
+        if (borderLeft > 0f) cmds.add(DrawRect(borderBoxLeft, borderBoxTop, borderBoxLeft + borderLeft, borderBoxBottom, borderColorLeft, fixed = fixedContext))
+        if (borderRight > 0f) cmds.add(DrawRect(borderBoxRight - borderRight, borderBoxTop, borderBoxRight, borderBoxBottom, borderColorRight, fixed = fixedContext))
 
         if (mode == LayoutMode.BLOCK) {
-            for (c in children) c.paint(cmds)
+            for (c in normalChildren) c.paint(cmds)
+            for (c in positionedChildren.sortedBy { it.zIndex }) c.paint(cmds)
         } else {
             cmds.addAll(inlineDisplay)
         }

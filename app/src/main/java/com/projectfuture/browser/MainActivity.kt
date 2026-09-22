@@ -27,8 +27,8 @@ class MainActivity : AppCompatActivity() {
 
         tab = Tab(::onTabStateChanged)
 
-        binding.browserView.onWidthAvailable = { width ->
-            if (tab.onViewportWidthChanged(width)) refreshView()
+        binding.browserView.onSizeAvailable = { width, height ->
+            if (tab.onViewportSizeChanged(width, height)) refreshView()
         }
         binding.browserView.onLinkTapped = { href -> tab.followLink(href) }
 
