@@ -1,9 +1,20 @@
 package com.projectfuture.browser.layout
 
 import android.graphics.Color
+import com.projectfuture.browser.css.AlignItems
+import com.projectfuture.browser.css.BoxMetrics
+import com.projectfuture.browser.css.FlexContainerProps
+import com.projectfuture.browser.css.FlexDirection
+import com.projectfuture.browser.css.FlexItemProps
+import com.projectfuture.browser.css.FlexWrapMode
+import com.projectfuture.browser.css.JustifyContent
+import com.projectfuture.browser.css.lengthValue
 import com.projectfuture.browser.css.parseCssColor
 import com.projectfuture.browser.css.parsePx
 import com.projectfuture.browser.css.resolveBoxMetrics
+import com.projectfuture.browser.css.resolveFlexContainerProps
+import com.projectfuture.browser.css.resolveFlexItemProps
+import com.projectfuture.browser.css.resolveFlexMainSizes
 import com.projectfuture.browser.css.resolvePositionOffsets
 import com.projectfuture.browser.html.ElementNode
 import com.projectfuture.browser.html.HtmlParser
@@ -11,11 +22,12 @@ import com.projectfuture.browser.html.Node
 import com.projectfuture.browser.html.TextNode
 
 /**
- * The box tree + line-breaking layout engine. Two layout modes, chosen per
- * box the way real browsers approximate it for a simple engine: BLOCK
- * (children stack vertically, each full-width) or INLINE (children are text
- * flowed into wrapped, baseline-aligned lines). This produces the absolute
- * page-coordinate DisplayCommand list that BrowserView paints.
+ * The box tree + line-breaking layout engine. Three layout modes, chosen
+ * per box the way real browsers approximate it for a simple engine: BLOCK
+ * (children stack vertically, each full-width), INLINE (children are text
+ * flowed into wrapped, baseline-aligned lines), or FLEX (`display: flex`).
+ * This produces the absolute page-coordinate DisplayCommand list that
+ * BrowserView paints.
  *
  * Positioning support and its known limits:
  * - `relative` stays in normal flow; top/right/bottom/left just shift its
@@ -33,12 +45,27 @@ import com.projectfuture.browser.html.TextNode
  * - `sticky` is not implemented - it needs layout to react to scroll
  *   position, which this single-pass-then-just-translate renderer doesn't
  *   support yet.
+ *
+ * Flexbox support and its known limits:
+ * - `flex-direction: row`/`row-reverse` gets the full treatment: wrapping,
+ *   grow/shrink, justify-content, align-items/align-self (incl. stretch).
+ * - `flex-direction: column`/`column-reverse` supports grow/shrink,
+ *   justify-content and align, but NOT wrapping (multi-column flex-wrap is
+ *   rare in practice versus row-wrap, e.g. card grids, so it was left out
+ *   to bound scope) - items always form a single column.
+ * - A flex item's basis, when `flex-basis`/`width`(row)/`height`(column)
+ *   aren't set, is approximated: for row direction from its unwrapped text
+ *   width (no true intrinsic-sizing pass for nested block content); for
+ *   column direction via a one-off probe layout at full width. Both are
+ *   reasonable approximations, not spec-exact shrink-to-fit.
+ * - `align-content` (multi-line cross-axis distribution) isn't
+ *   implemented - wrapped lines always stack from the start.
  */
 private const val LINE_LEADING = 1.25f
 
 private val SKIPPED_TAGS = setOf("script", "style", "head", "title", "meta", "link", "noscript")
 
-private enum class LayoutMode { BLOCK, INLINE }
+private enum class LayoutMode { BLOCK, INLINE, FLEX }
 
 /** The containing block used to resolve absolute/fixed descendants' geometry. */
 data class PositionContext(
@@ -72,7 +99,9 @@ class BlockLayout(
     private val containingY: Float,
     private val containingWidth: Float,
     private val posContext: PositionContext,
-    private val inheritedFixed: Boolean
+    private val inheritedFixed: Boolean,
+    private val forcedWidth: Float? = null,
+    private val forcedHeight: Float? = null
 ) {
     /** Content-box geometry, set once [layout] has run. */
     var x = 0f
@@ -148,7 +177,7 @@ class BlockLayout(
 
         val availableContentWidth = effContainingWidth - metrics.marginLeft - metrics.marginRight -
             borderLeft - borderRight - paddingLeft - paddingRight
-        width = metrics.explicitContentWidth ?: availableContentWidth.coerceAtLeast(0f)
+        width = forcedWidth ?: (metrics.explicitContentWidth ?: availableContentWidth.coerceAtLeast(0f))
 
         if (removedFromFlow) {
             val offsets = resolvePositionOffsets(node.style, posContext.containerWidth, posContext.containerHeight, fontSizePx)
@@ -192,30 +221,50 @@ class BlockLayout(
         }
 
         mode = layoutMode()
-        if (mode == LayoutMode.BLOCK) {
-            var cursor = y
-            for (childNode in node.children) {
-                if (childNode !is ElementNode || isSkipped(childNode)) continue
-                val childPosition = childNode.style["position"] ?: "static"
-                val childRemoved = childPosition == "absolute" || childPosition == "fixed"
-                val bl = BlockLayout(childNode, x, cursor, width, childPosContext, fixedContext)
-                bl.layout()
-                if (childRemoved) {
-                    positionedChildren.add(bl)
-                } else {
-                    normalChildren.add(bl)
-                    cursor += bl.outerHeight
+        when (mode) {
+            LayoutMode.BLOCK -> {
+                var cursor = y
+                for (childNode in node.children) {
+                    if (childNode !is ElementNode || isSkipped(childNode)) continue
+                    val childPosition = childNode.style["position"] ?: "static"
+                    val childRemoved = childPosition == "absolute" || childPosition == "fixed"
+                    val bl = BlockLayout(childNode, x, cursor, width, childPosContext, fixedContext)
+                    bl.layout()
+                    if (childRemoved) {
+                        positionedChildren.add(bl)
+                    } else {
+                        normalChildren.add(bl)
+                        cursor += bl.outerHeight
+                    }
                 }
+                height = forcedHeight ?: (metrics.explicitContentHeight ?: (cursor - y).coerceAtLeast(0f))
             }
-            height = metrics.explicitContentHeight ?: (cursor - y).coerceAtLeast(0f)
-        } else {
-            cursorX = 0f
-            cursorY = 0f
-            lineBuffer.clear()
-            inlineDisplay.clear()
-            recurse(node, currentLinkHref = null)
-            flushLine()
-            height = metrics.explicitContentHeight ?: cursorY
+            LayoutMode.FLEX -> {
+                val flexItemNodes = ArrayList<ElementNode>()
+                for (childNode in node.children) {
+                    if (childNode !is ElementNode || isSkipped(childNode)) continue
+                    val childPosition = childNode.style["position"] ?: "static"
+                    if (childPosition == "absolute" || childPosition == "fixed") {
+                        val bl = BlockLayout(childNode, x, y, width, childPosContext, fixedContext)
+                        bl.layout()
+                        positionedChildren.add(bl)
+                    } else {
+                        flexItemNodes.add(childNode)
+                    }
+                }
+                val containerProps = resolveFlexContainerProps(node.style, width, fontSizePx)
+                val naturalMain = layoutFlexChildren(containerProps, flexItemNodes, childPosContext, metrics.explicitContentHeight)
+                height = forcedHeight ?: (metrics.explicitContentHeight ?: naturalMain)
+            }
+            LayoutMode.INLINE -> {
+                cursorX = 0f
+                cursorY = 0f
+                lineBuffer.clear()
+                inlineDisplay.clear()
+                recurse(node, currentLinkHref = null)
+                flushLine()
+                height = forcedHeight ?: (metrics.explicitContentHeight ?: cursorY)
+            }
         }
 
         outerHeight = if (removedFromFlow) {
@@ -229,10 +278,259 @@ class BlockLayout(
         el.tag in SKIPPED_TAGS || el.style["display"] == "none"
 
     private fun layoutMode(): LayoutMode {
+        val display = node.style["display"]
+        if (display == "flex" || display == "inline-flex") return LayoutMode.FLEX
         val elementChildren = node.children.filterIsInstance<ElementNode>().filterNot { isSkipped(it) }
         if (elementChildren.isEmpty()) return LayoutMode.INLINE
         return if (elementChildren.any { it.tag in HtmlParser.BLOCK_ELEMENTS }) LayoutMode.BLOCK else LayoutMode.INLINE
     }
+
+    // ---- Flexbox ----
+
+    private class FlexItem(
+        val node: ElementNode,
+        val props: FlexItemProps,
+        val metrics: BoxMetrics,
+        val basis: Float
+    )
+
+    private fun layoutFlexChildren(
+        containerProps: FlexContainerProps,
+        itemNodes: List<ElementNode>,
+        childPosContext: PositionContext,
+        ownExplicitHeight: Float?
+    ): Float {
+        if (itemNodes.isEmpty()) return 0f
+        val isRow = containerProps.direction == FlexDirection.ROW || containerProps.direction == FlexDirection.ROW_REVERSE
+        val reverse = containerProps.direction == FlexDirection.ROW_REVERSE || containerProps.direction == FlexDirection.COLUMN_REVERSE
+        val ordered = if (reverse) itemNodes.asReversed() else itemNodes
+        return if (isRow) layoutFlexRow(containerProps, ordered, childPosContext) else layoutFlexColumn(containerProps, ordered, childPosContext, ownExplicitHeight)
+    }
+
+    private fun buildFlexItem(child: ElementNode, mainAxisBasisFallback: () -> Float): FlexItem {
+        val childColor = parseCssColor(child.style["color"]) ?: Color.BLACK
+        val childFontSize = parsePx(child.style["font-size"]) ?: 16f
+        val m = resolveBoxMetrics(child.style, width, childColor, childFontSize)
+        val props = resolveFlexItemProps(child.style)
+        return FlexItem(child, props, m, mainAxisBasisFallback())
+    }
+
+    private fun layoutFlexRow(
+        containerProps: FlexContainerProps,
+        itemNodes: List<ElementNode>,
+        childPosContext: PositionContext
+    ): Float {
+        val items = itemNodes.map { child ->
+            buildFlexItem(child) {
+                val childFontSize = parsePx(child.style["font-size"]) ?: 16f
+                val props = resolveFlexItemProps(child.style)
+                val m = resolveBoxMetrics(child.style, width, Color.BLACK, childFontSize)
+                when {
+                    props.basis != "auto" -> lengthValue(props.basis, width, childFontSize) ?: 0f
+                    m.explicitContentWidth != null -> m.explicitContentWidth
+                    else -> measureNaturalWidth(child)
+                }
+            }
+        }
+        val orderedIndices = items.indices.sortedBy { items[it].props.order }
+
+        val lines = ArrayList<MutableList<Int>>()
+        if (containerProps.wrap == FlexWrapMode.NOWRAP) {
+            lines.add(orderedIndices.toMutableList())
+        } else {
+            var current = ArrayList<Int>()
+            var currentMain = 0f
+            for (idx in orderedIndices) {
+                val item = items[idx]
+                val extra = item.metrics.marginLeft + item.metrics.marginRight + item.metrics.borderLeft +
+                    item.metrics.borderRight + item.metrics.paddingLeft + item.metrics.paddingRight
+                val outer = item.basis + extra
+                val withGap = if (current.isEmpty()) outer else outer + containerProps.columnGap
+                if (current.isNotEmpty() && currentMain + withGap > width) {
+                    lines.add(current)
+                    current = arrayListOf(idx)
+                    currentMain = outer
+                } else {
+                    current.add(idx)
+                    currentMain += withGap
+                }
+            }
+            if (current.isNotEmpty()) lines.add(current)
+        }
+
+        var lineTop = y
+        for (lineIndices in lines) {
+            val n = lineIndices.size
+            val basisList = lineIndices.map { items[it].basis }
+            val growList = lineIndices.map { items[it].props.grow }
+            val shrinkList = lineIndices.map { items[it].props.shrink }
+            val extraList = lineIndices.map { i ->
+                val m = items[i].metrics
+                m.marginLeft + m.marginRight + m.borderLeft + m.borderRight + m.paddingLeft + m.paddingRight
+            }
+            val finalMain = resolveFlexMainSizes(basisList, growList, shrinkList, extraList, width, containerProps.columnGap)
+
+            val totalOuterMain = finalMain.indices.sumOf { (finalMain[it] + extraList[it]).toDouble() }.toFloat() +
+                containerProps.columnGap * (n - 1).coerceAtLeast(0)
+            val remaining = (width - totalOuterMain).coerceAtLeast(0f)
+            var cursorMainX = x
+            var betweenExtra = 0f
+            when (containerProps.justifyContent) {
+                JustifyContent.FLEX_START -> {}
+                JustifyContent.FLEX_END -> cursorMainX += remaining
+                JustifyContent.CENTER -> cursorMainX += remaining / 2
+                JustifyContent.SPACE_BETWEEN -> if (n > 1) betweenExtra = remaining / (n - 1) else cursorMainX += remaining / 2
+                JustifyContent.SPACE_AROUND -> {
+                    val each = if (n > 0) remaining / n else 0f
+                    cursorMainX += each / 2
+                    betweenExtra = each
+                }
+            }
+
+            val laidOut = arrayOfNulls<BlockLayout>(n)
+            val itemX = FloatArray(n)
+            for ((pos, idx) in lineIndices.withIndex()) {
+                itemX[pos] = cursorMainX
+                val bl = BlockLayout(items[idx].node, cursorMainX, lineTop, width, childPosContext, fixedContext, forcedWidth = finalMain[pos])
+                bl.layout()
+                laidOut[pos] = bl
+                cursorMainX += finalMain[pos] + extraList[pos] + containerProps.columnGap + betweenExtra
+            }
+
+            val lineCrossSize = laidOut.filterNotNull().maxOfOrNull { it.outerHeight } ?: 0f
+
+            for ((pos, idx) in lineIndices.withIndex()) {
+                val item = items[idx]
+                val alignSelf = item.props.alignSelf ?: containerProps.alignItems
+                var finalBl = laidOut[pos]!!
+                if (alignSelf == AlignItems.STRETCH && item.metrics.explicitContentHeight == null) {
+                    val m = item.metrics
+                    val forcedContentHeight = (lineCrossSize - m.marginTop - m.marginBottom - m.borderTop - m.borderBottom - m.paddingTop - m.paddingBottom).coerceAtLeast(0f)
+                    finalBl = BlockLayout(item.node, itemX[pos], lineTop, width, childPosContext, fixedContext, forcedWidth = finalMain[pos], forcedHeight = forcedContentHeight)
+                    finalBl.layout()
+                } else if (alignSelf != AlignItems.FLEX_START) {
+                    val extra = lineCrossSize - finalBl.outerHeight
+                    val dy = if (alignSelf == AlignItems.CENTER) extra / 2 else extra
+                    if (dy > 0f) {
+                        finalBl = BlockLayout(item.node, itemX[pos], lineTop + dy, width, childPosContext, fixedContext, forcedWidth = finalMain[pos])
+                        finalBl.layout()
+                    }
+                }
+                normalChildren.add(finalBl)
+            }
+
+            lineTop += lineCrossSize + containerProps.rowGap
+        }
+
+        return (lineTop - y - containerProps.rowGap).coerceAtLeast(0f)
+    }
+
+    private fun layoutFlexColumn(
+        containerProps: FlexContainerProps,
+        itemNodes: List<ElementNode>,
+        childPosContext: PositionContext,
+        ownExplicitHeight: Float?
+    ): Float {
+        val items = itemNodes.map { child ->
+            buildFlexItem(child) {
+                val childFontSize = parsePx(child.style["font-size"]) ?: 16f
+                val props = resolveFlexItemProps(child.style)
+                val m = resolveBoxMetrics(child.style, width, Color.BLACK, childFontSize)
+                when {
+                    props.basis != "auto" -> lengthValue(props.basis, ownExplicitHeight ?: 0f, childFontSize) ?: 0f
+                    m.explicitContentHeight != null -> m.explicitContentHeight
+                    else -> {
+                        val probe = BlockLayout(child, x, y, width, childPosContext, fixedContext)
+                        probe.layout()
+                        (probe.outerHeight - m.marginTop - m.marginBottom - m.borderTop - m.borderBottom - m.paddingTop - m.paddingBottom).coerceAtLeast(0f)
+                    }
+                }
+            }
+        }
+        val orderedIndices = items.indices.sortedBy { items[it].props.order }
+
+        val basisList = orderedIndices.map { items[it].basis }
+        val growList = orderedIndices.map { items[it].props.grow }
+        val shrinkList = orderedIndices.map { items[it].props.shrink }
+        val extraList = orderedIndices.map { i ->
+            val m = items[i].metrics
+            m.marginTop + m.marginBottom + m.borderTop + m.borderBottom + m.paddingTop + m.paddingBottom
+        }
+
+        val n = orderedIndices.size
+        val availableMain = ownExplicitHeight ?: (basisList.sum() + extraList.sum() + containerProps.rowGap * (n - 1).coerceAtLeast(0))
+        val finalMain = resolveFlexMainSizes(basisList, growList, shrinkList, extraList, availableMain, containerProps.rowGap)
+
+        val totalOuterMain = finalMain.indices.sumOf { (finalMain[it] + extraList[it]).toDouble() }.toFloat() +
+            containerProps.rowGap * (n - 1).coerceAtLeast(0)
+        val remaining = (availableMain - totalOuterMain).coerceAtLeast(0f)
+        var cursorMainY = y
+        var betweenExtra = 0f
+        when (containerProps.justifyContent) {
+            JustifyContent.FLEX_START -> {}
+            JustifyContent.FLEX_END -> cursorMainY += remaining
+            JustifyContent.CENTER -> cursorMainY += remaining / 2
+            JustifyContent.SPACE_BETWEEN -> if (n > 1) betweenExtra = remaining / (n - 1) else cursorMainY += remaining / 2
+            JustifyContent.SPACE_AROUND -> {
+                val each = if (n > 0) remaining / n else 0f
+                cursorMainY += each / 2
+                betweenExtra = each
+            }
+        }
+
+        for ((pos, idx) in orderedIndices.withIndex()) {
+            val item = items[idx]
+            val alignSelf = item.props.alignSelf ?: containerProps.alignItems
+            val m = item.metrics
+            val stretch = alignSelf == AlignItems.STRETCH && m.explicitContentWidth == null
+            val forcedW = if (stretch) width else null
+            var itemX = x
+            if (!stretch) {
+                val naturalWidthGuess = m.explicitContentWidth ?: width
+                val extraSpace = (width - naturalWidthGuess).coerceAtLeast(0f)
+                itemX = when (alignSelf) {
+                    AlignItems.CENTER -> x + extraSpace / 2
+                    AlignItems.FLEX_END -> x + extraSpace
+                    else -> x
+                }
+            }
+            val bl = BlockLayout(item.node, itemX, cursorMainY, width, childPosContext, fixedContext, forcedWidth = forcedW, forcedHeight = finalMain[pos])
+            bl.layout()
+            normalChildren.add(bl)
+            cursorMainY += finalMain[pos] + extraList[pos] + containerProps.rowGap + betweenExtra
+        }
+
+        return (cursorMainY - y - containerProps.rowGap).coerceAtLeast(0f)
+    }
+
+    /** Unwrapped natural text width, used as a flex-basis fallback for inline-content items. */
+    private fun measureNaturalWidth(node: ElementNode): Float {
+        if (isSkipped(node)) return 0f
+        val elementChildren = node.children.filterIsInstance<ElementNode>().filterNot { isSkipped(it) }
+        val isInlineContent = elementChildren.isEmpty() || elementChildren.none { it.tag in HtmlParser.BLOCK_ELEMENTS }
+        if (!isInlineContent) return 0f
+        var total = 0f
+        fun walk(n: Node, linkHref: String?) {
+            when (n) {
+                is TextNode -> {
+                    val style = textStyleForElement(n.parent ?: node, linkHref)
+                    val paint = FontCache.paintFor(style)
+                    for (word in n.text.split(Regex("\\s+")).filter { it.isNotEmpty() }) {
+                        total += paint.measureText(word) + paint.measureText(" ")
+                    }
+                }
+                is ElementNode -> {
+                    if (isSkipped(n) || n.tag == "br" || n.tag == "img") return
+                    val href = if (n.tag == "a") n.attr("href") else linkHref
+                    for (c in n.children) walk(c, href)
+                }
+            }
+        }
+        walk(node, null)
+        return total
+    }
+
+    // ---- Inline text flow ----
 
     private fun recurse(n: Node, currentLinkHref: String?) {
         when (n) {
@@ -311,7 +609,7 @@ class BlockLayout(
         if (borderLeft > 0f) cmds.add(DrawRect(borderBoxLeft, borderBoxTop, borderBoxLeft + borderLeft, borderBoxBottom, borderColorLeft, fixed = fixedContext))
         if (borderRight > 0f) cmds.add(DrawRect(borderBoxRight - borderRight, borderBoxTop, borderBoxRight, borderBoxBottom, borderColorRight, fixed = fixedContext))
 
-        if (mode == LayoutMode.BLOCK) {
+        if (mode == LayoutMode.BLOCK || mode == LayoutMode.FLEX) {
             for (c in normalChildren) c.paint(cmds)
             for (c in positionedChildren.sortedBy { it.zIndex }) c.paint(cmds)
         } else {
