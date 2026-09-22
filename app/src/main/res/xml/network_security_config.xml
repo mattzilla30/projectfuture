@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     This is a from-scratch browser: it must be able to load plain-HTTP
+     pages a user types in, not just HTTPS, so cleartext is allowed
+     broadly rather than pinned to a fixed domain list.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

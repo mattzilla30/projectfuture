@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <style name="Theme.ProjectFutureBrowser" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#FF3B7DE0</item>
+        <item name="colorPrimaryDark">#FF2D5FB0</item>
+        <item name="colorAccent">#FF3B7DE0</item>
+        <item name="android:windowBackground">@color/page_background</item>
+    </style>
+</resources>

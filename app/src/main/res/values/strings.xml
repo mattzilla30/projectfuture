@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ProjectFuture Browser</string>
+    <string name="address_hint">Search or type a URL</string>
+    <string name="action_go">Go</string>
+    <string name="action_back">Back</string>
+    <string name="action_forward">Forward</string>
+    <string name="action_reload">Reload</string>
+    <string name="loading">Loading…</string>
+    <string name="error_load_failed">Couldn\'t load %1$s: %2$s</string>
+</resources>
