@@ -4,8 +4,15 @@ package com.projectfuture.browser.html
  * A small hand-written "tag soup" HTML parser: tokenizes `<...>` markup and
  * builds a DOM tree, inserting the usual implicit html/head/body the way
  * real browsers tolerate malformed documents. It does not implement the
- * full HTML5 parsing spec (no full set of special parsing states), but it
- * is enough to render ordinary pages. No platform HTML/webview parser is used.
+ * full HTML5 parsing spec - no tokenizer state machine with RCDATA/RAWTEXT
+ * states beyond script/style, no adoption agency algorithm for misnested
+ * formatting elements (`<b>a <i>b</b> c</i>` won't get spec-correct
+ * reconstruction), no foster parenting for stray table content. Those are
+ * mostly long-tail malformed-markup edge cases. What real pages actually
+ * lean on constantly - unclosed `<p>`/`<li>`/`<tr>`/`<td>` tags, and `>`
+ * appearing inside a quoted attribute value - is handled via
+ * [findTagEnd] and [autoCloseForNewTag]. No platform HTML/webview parser
+ * is used.
  */
 class HtmlParser(private val source: String) {
 
@@ -34,7 +41,7 @@ class HtmlParser(private val source: String) {
                     addText(text.toString())
                     text.setLength(0)
                 }
-                val tagEnd = source.indexOf('>', i)
+                val tagEnd = findTagEnd(source, i + 1)
                 if (tagEnd == -1) break
                 val tagContent = source.substring(i + 1, tagEnd)
                 addTag(tagContent)
@@ -90,6 +97,7 @@ class HtmlParser(private val source: String) {
             return
         }
 
+        autoCloseForNewTag(tag)
         implicitTags(tag)
 
         val parent = unfinished.lastOrNull()
@@ -98,6 +106,23 @@ class HtmlParser(private val source: String) {
             parent?.children?.add(node)
         } else {
             unfinished.add(node)
+        }
+    }
+
+    /**
+     * A bounded version of the spec's "implied end tags": closes the
+     * innermost open element when a new tag would otherwise nest illegally
+     * inside it, covering the unclosed `<p>`/`<li>`/`<dt>`/`<dd>`/table-row
+     * tags that real-world (especially hand-written or older CMS) HTML is
+     * full of. Not the full per-spec scope-chain check.
+     */
+    private fun autoCloseForNewTag(tag: String) {
+        val innermost = unfinished.lastOrNull() ?: return
+        val closesTags = AUTO_CLOSE_RULES[tag]
+        if (closesTags != null) {
+            if (innermost.tag in closesTags) closeTag(innermost.tag)
+        } else if (tag in BLOCK_ELEMENTS && innermost.tag == "p") {
+            closeTag("p")
         }
     }
 
@@ -192,6 +217,22 @@ class HtmlParser(private val source: String) {
         return parts
     }
 
+    /** Finds a tag's closing `>`, ignoring one inside a quoted attribute value (e.g. `title="a > b"`). */
+    private fun findTagEnd(source: String, start: Int): Int {
+        var i = start
+        var quote: Char? = null
+        while (i < source.length) {
+            val c = source[i]
+            when {
+                quote != null -> if (c == quote) quote = null
+                c == '"' || c == '\'' -> quote = c
+                c == '>' -> return i
+            }
+            i++
+        }
+        return -1
+    }
+
     private fun indexOfIgnoreCase(haystack: String, needle: String, from: Int): Int {
         val lowerHaystack = haystack
         var i = from
@@ -209,6 +250,19 @@ class HtmlParser(private val source: String) {
         )
         val HEAD_TAGS = setOf(
             "base", "basefont", "bgsound", "noscript", "link", "meta", "title", "style", "script"
+        )
+        /** Tag -> the set of currently-open innermost tags it implicitly closes. See [autoCloseForNewTag]. */
+        val AUTO_CLOSE_RULES: Map<String, Set<String>> = mapOf(
+            "li" to setOf("li"),
+            "dt" to setOf("dt", "dd"),
+            "dd" to setOf("dt", "dd"),
+            "tr" to setOf("tr"),
+            "td" to setOf("td", "th"),
+            "th" to setOf("td", "th"),
+            "option" to setOf("option"),
+            "thead" to setOf("thead", "tbody", "tfoot", "tr", "td", "th"),
+            "tbody" to setOf("thead", "tbody", "tfoot", "tr", "td", "th"),
+            "tfoot" to setOf("thead", "tbody", "tfoot", "tr", "td", "th")
         )
         val BLOCK_ELEMENTS = setOf(
             "html", "body", "article", "section", "nav", "aside", "h1", "h2", "h3", "h4", "h5", "h6",
