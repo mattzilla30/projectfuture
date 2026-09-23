@@ -65,24 +65,27 @@ data class Url(
     }
 
     /**
-     * Performs a blocking GET over a raw TCP (or TLS) socket, hand-rolling the
-     * HTTP/1.1 request/response format. Must be called off the main thread.
-     * Follows redirects itself, since there is no library to do it for us.
+     * Performs a blocking request over a raw TCP (or TLS) socket, hand-rolling
+     * the HTTP/1.1 request/response format. Must be called off the main
+     * thread. Follows redirects itself, since there is no library to do it
+     * for us. [method]/[body]/[extraHeaders] back `fetch()`'s options object
+     * and `XMLHttpRequest`, in addition to the plain GETs used elsewhere
+     * (page loads, images, stylesheets).
      */
-    fun fetch(redirectsLeft: Int = 10): HttpResponse {
-        val raw = fetchRaw(redirectsLeft)
+    fun fetch(method: String = "GET", body: ByteArray? = null, extraHeaders: Map<String, String> = emptyMap(), redirectsLeft: Int = 10): HttpResponse {
+        val raw = fetchRaw(method, body, extraHeaders, redirectsLeft)
         val charset = charsetFromContentType(raw.headers["content-type"])
         return HttpResponse(raw.statusCode, raw.headers, String(raw.body, charset), raw.url)
     }
 
     /** Same request as [fetch], but returns the raw body bytes undecoded - for binary resources like images. */
     fun fetchBytes(redirectsLeft: Int = 10): HttpBytesResponse {
-        val raw = fetchRaw(redirectsLeft)
+        val raw = fetchRaw("GET", null, emptyMap(), redirectsLeft)
         return HttpBytesResponse(raw.statusCode, raw.headers, raw.body, raw.url)
     }
 
     /** Shared socket/request/response-header/body-bytes plumbing for [fetch] and [fetchBytes]. Follows redirects itself. */
-    private fun fetchRaw(redirectsLeft: Int): RawHttpResponse {
+    private fun fetchRaw(method: String, body: ByteArray?, extraHeaders: Map<String, String>, redirectsLeft: Int): RawHttpResponse {
         if (scheme != "http" && scheme != "https") {
             throw IOException("Unsupported scheme: $scheme")
         }
@@ -101,18 +104,22 @@ data class Url(
 
         try {
             val cookieHeader = sharedCookieJar?.cookieHeaderFor(this)
-            val request = buildString {
-                append("GET $path HTTP/1.1\r\n")
+            val requestHead = buildString {
+                append("${method.uppercase()} $path HTTP/1.1\r\n")
                 append("Host: $host\r\n")
                 append("Connection: close\r\n")
                 append("User-Agent: ProjectFutureBrowser/0.1 (Android; from-scratch)\r\n")
                 append("Accept: text/html,text/css,*/*\r\n")
                 append("Accept-Encoding: gzip\r\n")
                 if (cookieHeader != null) append("Cookie: $cookieHeader\r\n")
+                if (body != null) append("Content-Length: ${body.size}\r\n")
+                for ((k, v) in extraHeaders) append("$k: $v\r\n")
                 append("\r\n")
             }
-            socket.getOutputStream().write(request.toByteArray(Charsets.US_ASCII))
-            socket.getOutputStream().flush()
+            val out = socket.getOutputStream()
+            out.write(requestHead.toByteArray(Charsets.US_ASCII))
+            if (body != null) out.write(body)
+            out.flush()
 
             val input = BufferedInputStream(socket.getInputStream())
 
@@ -141,7 +148,14 @@ data class Url(
                 val location = headers["location"]
                 if (location != null) {
                     val next = resolve(location)
-                    return next.fetchRaw(redirectsLeft - 1)
+                    // 303 (and, in practice, 301/302 for non-GET/HEAD) always redirects as a GET with no body;
+                    // 307/308 preserve the original method and body, per spec.
+                    val (nextMethod, nextBody) = if (statusCode == 303 || (statusCode in intArrayOf(301, 302) && method != "GET" && method != "HEAD")) {
+                        "GET" to null
+                    } else {
+                        method to body
+                    }
+                    return next.fetchRaw(nextMethod, nextBody, extraHeaders, redirectsLeft - 1)
                 }
             }
 
@@ -277,6 +291,24 @@ data class HttpResponse(
     val body: String,
     val url: Url
 )
+
+fun isSameOrigin(a: Url, b: Url): Boolean = a.scheme == b.scheme && a.host == b.host && a.port == b.port
+
+/**
+ * Simple-request CORS only (no preflight `OPTIONS` for non-"simple"
+ * requests, no `Access-Control-Allow-Credentials` handling) - the core
+ * cross-origin check from the Fetch spec: a response is exposed to script
+ * only if its `Access-Control-Allow-Origin` header is `*` or matches the
+ * page's own origin exactly. Pulled out as a free function (see
+ * CookieJar.kt's parseSetCookie for the same reasoning) so it's directly
+ * unit-testable without a real network round-trip.
+ */
+fun corsAllows(pageOrigin: Url, responseHeaders: Map<String, String>): Boolean {
+    val allow = responseHeaders["access-control-allow-origin"] ?: return false
+    if (allow.trim() == "*") return true
+    val allowedOrigin = try { Url.parse(allow.trim()) } catch (_: Exception) { return false }
+    return isSameOrigin(pageOrigin, allowedOrigin)
+}
 
 /** Same shape as [HttpResponse] but for binary resources (images) - see [Url.fetchBytes]. */
 data class HttpBytesResponse(

@@ -40,4 +40,19 @@ class CookieJarTest {
         assertTrue(!domainMatches("example.com", "notexample.com"))
         assertTrue(!domainMatches("example.com", "example.org"))
     }
+
+    @Test fun sameOriginRequiresSchemeHostAndPort() {
+        assertTrue(isSameOrigin(Url.parse("https://example.com/a"), Url.parse("https://example.com/b")))
+        assertTrue(!isSameOrigin(Url.parse("https://example.com/"), Url.parse("http://example.com/")))
+        assertTrue(!isSameOrigin(Url.parse("https://example.com/"), Url.parse("https://other.com/")))
+        assertTrue(!isSameOrigin(Url.parse("https://example.com:8443/"), Url.parse("https://example.com/")))
+    }
+
+    @Test fun corsAllowsWildcardOrMatchingOrigin() {
+        val page = Url.parse("https://app.example.com/")
+        assertTrue(corsAllows(page, mapOf("access-control-allow-origin" to "*")))
+        assertTrue(corsAllows(page, mapOf("access-control-allow-origin" to "https://app.example.com")))
+        assertTrue(!corsAllows(page, mapOf("access-control-allow-origin" to "https://other.com")))
+        assertTrue(!corsAllows(page, emptyMap()))
+    }
 }

@@ -23,9 +23,11 @@ import com.projectfuture.browser.js.JsObject
 import com.projectfuture.browser.js.JsPromise
 import com.projectfuture.browser.js.JsString
 import com.projectfuture.browser.js.JsUndefined
+import com.projectfuture.browser.js.JsValue
 import com.projectfuture.browser.js.Lexer
 import com.projectfuture.browser.js.NativeFunction
 import com.projectfuture.browser.js.Parser
+import com.projectfuture.browser.js.jsError
 import com.projectfuture.browser.js.parseJsonToJsValue
 import com.projectfuture.browser.js.toJsString
 import com.projectfuture.browser.layout.DisplayCommand
@@ -34,6 +36,8 @@ import com.projectfuture.browser.layout.FontDecoder
 import com.projectfuture.browser.layout.customFonts
 import com.projectfuture.browser.net.HttpResponse
 import com.projectfuture.browser.net.Url
+import com.projectfuture.browser.net.corsAllows
+import com.projectfuture.browser.net.isSameOrigin
 import java.io.File
 import java.util.concurrent.Executors
 
@@ -229,17 +233,20 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
     }
 
     /**
-     * A basic GET-only form submission: collects every named, enabled,
+     * A basic GET/POST form submission: collects every named, enabled,
      * non-button input/textarea's current value (checkboxes/radios only if
-     * checked) into a query string and navigates to `action?query`. No POST
-     * support, no `<select>`, no file inputs, no multipart encoding - a
-     * script that wants more than this should call `preventDefault()` in a
-     * `submit` listener and handle it itself via `fetch()`.
+     * checked) and either appends them as a query string (GET, or no
+     * explicit `method`) or sends them as an
+     * `application/x-www-form-urlencoded` POST body. No `<select>`, no file
+     * inputs, no multipart encoding - a script that wants more than this
+     * should call `preventDefault()` in a `submit` listener and handle it
+     * itself via `fetch()`.
      */
     private fun submitForm(form: ElementNode) {
         val base = currentUrl ?: return
         val action = form.attr("action")
         val target = if (action.isNullOrBlank()) base else base.resolve(action)
+        val isPost = form.attr("method")?.lowercase() == "post"
         val params = ArrayList<Pair<String, String>>()
         form.walkElements { el ->
             if (el === form) return@walkElements
@@ -256,9 +263,13 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         val query = params.joinToString("&") { (k, v) ->
             java.net.URLEncoder.encode(k, "UTF-8") + "=" + java.net.URLEncoder.encode(v, "UTF-8")
         }
-        val separator = if (target.path.contains("?")) "&" else "?"
-        val finalUrl = if (query.isEmpty()) target else target.copy(path = target.path + separator + query)
-        load(finalUrl, HistoryAction.PUSH)
+        if (isPost) {
+            load(target, HistoryAction.PUSH, method = "POST", body = query.toByteArray(Charsets.UTF_8))
+        } else {
+            val separator = if (target.path.contains("?")) "&" else "?"
+            val finalUrl = if (query.isEmpty()) target else target.copy(path = target.path + separator + query)
+            load(finalUrl, HistoryAction.PUSH)
+        }
     }
 
     /** Called by the view when its size changes; re-runs layout without re-fetching. */
@@ -270,7 +281,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         return true
     }
 
-    private fun load(url: Url, action: HistoryAction) {
+    private fun load(url: Url, action: HistoryAction, method: String = "GET", body: ByteArray? = null) {
         onStateChanged(TabState.Loading(url))
         // Read on the main thread (load() is always called from one) before
         // handing off to the background executor, rather than reading the
@@ -278,7 +289,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         val mediaViewportWidth = if (viewportWidth > 0f) viewportWidth else 360f
         executor.execute {
             try {
-                val response = url.fetch()
+                val response = url.fetch(method, body, if (body != null) mapOf("Content-Type" to "application/x-www-form-urlencoded") else emptyMap())
                 val root = HtmlParser(response.body).parse()
                 // Scripts may mutate the DOM, so this runs before CSS/images/fonts are collected below.
                 val (interpreter, bridge) = runScripts(root, response.url)
@@ -443,16 +454,29 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             if (requestUrl == null) {
                 promise.reject(JsString("Invalid URL"))
             } else {
+                val options = args.getOrNull(1) as? JsObject
+                val method = options?.get("method")?.let { if (it != JsUndefined) toJsString(it) else null } ?: "GET"
+                val bodyText = options?.get("body")?.let { if (it != JsUndefined) toJsString(it) else null }
+                val headers = HashMap<String, String>()
+                (options?.get("headers") as? JsObject)?.let { h -> for (k in h.ownKeys()) headers[k] = toJsString(h.get(k)) }
                 executor.execute {
                     try {
-                        val response = requestUrl.fetch()
+                        val response = requestUrl.fetch(method, bodyText?.toByteArray(Charsets.UTF_8), headers)
                         mainHandler.post {
-                            promise.resolve(makeFetchResponse(response))
+                            if (isSameOrigin(baseUrl, response.url) || corsAllows(baseUrl, response.headers)) {
+                                promise.resolve(makeFetchResponse(response))
+                            } else {
+                                // The request went out (matching real browser CORS behavior - it's the
+                                // *response* that's withheld from script, not the request itself), but
+                                // without a matching Access-Control-Allow-Origin header the response body
+                                // is not exposed to the page.
+                                promise.reject(makeError("Failed to fetch '$requestUrl': blocked by CORS policy (no matching Access-Control-Allow-Origin)"))
+                            }
                             afterAsyncWork()
                         }
                     } catch (e: Exception) {
                         mainHandler.post {
-                            promise.reject(JsString(e.message ?: "Network request failed"))
+                            promise.reject(makeError(e.message ?: "Network request failed"))
                             afterAsyncWork()
                         }
                     }
@@ -460,6 +484,8 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             }
             promise
         })
+
+        installXmlHttpRequest(interpreter, baseUrl, ::afterAsyncWork)
 
         interpreter.globalEnv.declare("setTimeout", NativeFunction("setTimeout", 2) { _, _, args ->
             val fn = args.getOrNull(0) as? JsFunction
@@ -518,6 +544,83 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             }
         })
         return obj
+    }
+
+    private fun makeError(message: String): JsValue = jsError(message).value
+
+    /**
+     * `XMLHttpRequest`: the older callback-based sibling of `fetch`, still
+     * common enough in real pages to be worth supporting. Same same-origin/
+     * CORS check as `fetch` (see [corsAllows]), same background-executor +
+     * main-thread-callback plumbing as everything else in this file, and
+     * the same `afterAsyncWork` re-style/re-layout-if-still-on-this-page
+     * hook. Only `onload`/`onerror`/`onreadystatechange` callbacks and
+     * `responseText`/`status`/`readyState` are implemented - no
+     * `withCredentials`, no upload progress events, no synchronous mode
+     * (real sync XHR would need a *second* blocking network call path on
+     * the main thread, which Android's NetworkOnMainThreadException
+     * forbids anyway).
+     */
+    private fun installXmlHttpRequest(interpreter: Interpreter, baseUrl: Url, afterAsyncWork: () -> Unit) {
+        val ctor = NativeFunction("XMLHttpRequest", 0) { _, thisArg, _ ->
+            val xhr = thisArg as? JsObject ?: JsObject()
+            var method = "GET"
+            var targetUrl: Url? = null
+            val requestHeaders = HashMap<String, String>()
+            xhr.set("readyState", JsNumber(0.0))
+            xhr.set("status", JsNumber(0.0))
+            xhr.set("responseText", JsString(""))
+            xhr.set("open", NativeFunction("open", 2) { _, _, args ->
+                method = toJsString(args.getOrElse(0) { JsString("GET") }).ifBlank { "GET" }
+                targetUrl = try { baseUrl.resolve(toJsString(args.getOrElse(1) { JsUndefined })) } catch (_: Exception) { null }
+                xhr.set("readyState", JsNumber(1.0))
+                JsUndefined
+            })
+            xhr.set("setRequestHeader", NativeFunction("setRequestHeader", 2) { _, _, args ->
+                requestHeaders[toJsString(args.getOrElse(0) { JsUndefined })] = toJsString(args.getOrElse(1) { JsUndefined })
+                JsUndefined
+            })
+            xhr.set("send", NativeFunction("send", 1) { interp, _, args ->
+                val url = targetUrl
+                fun fire(type: String) {
+                    (xhr.get("on$type") as? JsFunction)?.call(interp, xhr, emptyList())
+                    (xhr.get("onreadystatechange") as? JsFunction)?.call(interp, xhr, emptyList())
+                }
+                if (url == null) {
+                    xhr.set("readyState", JsNumber(4.0))
+                    fire("error")
+                    afterAsyncWork()
+                    return@NativeFunction JsUndefined
+                }
+                val bodyText = args.getOrNull(0)?.let { if (it != JsUndefined) toJsString(it) else null }
+                executor.execute {
+                    try {
+                        val response = url.fetch(method, bodyText?.toByteArray(Charsets.UTF_8), requestHeaders)
+                        mainHandler.post {
+                            if (isSameOrigin(baseUrl, response.url) || corsAllows(baseUrl, response.headers)) {
+                                xhr.set("status", JsNumber(response.statusCode.toDouble()))
+                                xhr.set("responseText", JsString(response.body))
+                                xhr.set("readyState", JsNumber(4.0))
+                                fire("load")
+                            } else {
+                                xhr.set("readyState", JsNumber(4.0))
+                                fire("error")
+                            }
+                            afterAsyncWork()
+                        }
+                    } catch (e: Exception) {
+                        mainHandler.post {
+                            xhr.set("readyState", JsNumber(4.0))
+                            fire("error")
+                            afterAsyncWork()
+                        }
+                    }
+                }
+                JsUndefined
+            })
+            xhr
+        }
+        interpreter.globalEnv.declare("XMLHttpRequest", ctor)
     }
 
     private class AuthorCss(val rules: List<CssRule>, val fontFaces: List<Pair<FontFaceRule, Url>>)
