@@ -24,6 +24,8 @@ import com.projectfuture.browser.browser.HistoryStore
 import com.projectfuture.browser.browser.Tab
 import com.projectfuture.browser.browser.TabManager
 import com.projectfuture.browser.browser.TabState
+import com.projectfuture.browser.net.CookieJar
+import com.projectfuture.browser.net.sharedCookieJar
 import com.projectfuture.browser.databinding.ActivityMainBinding
 
 private const val START_URL = "https://example.com/"
@@ -46,6 +48,7 @@ class MainActivity : AppCompatActivity() {
         tabManager = TabManager(this, ::onTabStateChanged)
         bookmarkStore = BookmarkStore(this)
         historyStore = HistoryStore(this)
+        if (sharedCookieJar == null) sharedCookieJar = CookieJar(applicationContext)
 
         binding.browserView.onSizeAvailable = { width, height ->
             lastViewportWidth = width

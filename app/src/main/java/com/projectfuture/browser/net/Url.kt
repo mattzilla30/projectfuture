@@ -6,12 +6,23 @@ import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.charset.Charset
+import java.util.zip.GZIPInputStream
 import javax.net.ssl.SSLSocketFactory
 
 /**
  * A URL, parsed by hand, and the raw-socket HTTP/1.1 client used to fetch it.
  * No java.net.URLConnection / OkHttp / WebView networking is used here -
  * everything from the TCP handshake up is written for this project.
+ *
+ * Cookies are sent/stored via [sharedCookieJar] (see CookieJar.kt for what
+ * it does and doesn't cover). `Accept-Encoding: gzip` is sent, and a gzip
+ * `Content-Encoding` response is decompressed via the standard
+ * `java.util.zip.GZIPInputStream` - a platform compression utility, the
+ * same tier as `Inflater` (used for WOFF font decompression) elsewhere in
+ * this project, not "browser engine" logic. Brotli isn't supported (no
+ * standard-library equivalent, and writing a Brotli decoder is its own
+ * substantial project - same reasoning as the WOFF2 gap in FontDecoder.kt),
+ * so a server that only offers `br` encoding won't get it requested.
  */
 data class Url(
     val scheme: String,
@@ -89,12 +100,15 @@ data class Url(
         socket.soTimeout = 20000
 
         try {
+            val cookieHeader = sharedCookieJar?.cookieHeaderFor(this)
             val request = buildString {
                 append("GET $path HTTP/1.1\r\n")
                 append("Host: $host\r\n")
                 append("Connection: close\r\n")
                 append("User-Agent: ProjectFutureBrowser/0.1 (Android; from-scratch)\r\n")
                 append("Accept: text/html,text/css,*/*\r\n")
+                append("Accept-Encoding: gzip\r\n")
+                if (cookieHeader != null) append("Cookie: $cookieHeader\r\n")
                 append("\r\n")
             }
             socket.getOutputStream().write(request.toByteArray(Charsets.US_ASCII))
@@ -107,7 +121,10 @@ data class Url(
             if (statusParts.size < 2) throw IOException("Malformed status line: $statusLine")
             val statusCode = statusParts[1].toIntOrNull() ?: throw IOException("Bad status code: $statusLine")
 
+            // Multiple Set-Cookie response headers are legal and common (one per cookie),
+            // so they're tracked separately rather than folded into the single-value headers map.
             val headers = LinkedHashMap<String, String>()
+            val setCookieHeaders = ArrayList<String>()
             while (true) {
                 val line = readLine(input) ?: break
                 if (line.isEmpty()) break
@@ -115,8 +132,9 @@ data class Url(
                 if (idx == -1) continue
                 val key = line.substring(0, idx).trim().lowercase()
                 val value = line.substring(idx + 1).trim()
-                headers[key] = value
+                if (key == "set-cookie") setCookieHeaders.add(value) else headers[key] = value
             }
+            if (setCookieHeaders.isNotEmpty()) sharedCookieJar?.store(this, setCookieHeaders)
 
             // Redirects: follow them ourselves rather than the body.
             if (statusCode in intArrayOf(301, 302, 303, 307, 308) && redirectsLeft > 0) {
@@ -127,11 +145,16 @@ data class Url(
                 }
             }
 
-            val bodyBytes = if (headers["transfer-encoding"]?.contains("chunked") == true) {
+            val rawBody = if (headers["transfer-encoding"]?.contains("chunked") == true) {
                 readChunkedBody(input)
             } else {
                 val contentLength = headers["content-length"]?.toIntOrNull()
                 if (contentLength != null) readExactly(input, contentLength) else readToEnd(input)
+            }
+            val bodyBytes = if (headers["content-encoding"]?.contains("gzip") == true) {
+                try { GZIPInputStream(rawBody.inputStream()).use { it.readBytes() } } catch (_: Exception) { rawBody }
+            } else {
+                rawBody
             }
 
             return RawHttpResponse(statusCode, headers, bodyBytes, this)
