@@ -41,7 +41,7 @@ sealed class TabState {
     data class Loading(val url: Url) : TabState()
     data class Loaded(val url: Url, val title: String?) : TabState()
     /** DOM was mutated by a click handler after load (not a navigation) - just repaint, don't touch scroll/address bar. */
-    data class Updated(val url: Url) : TabState()
+    data class Updated(val url: Url, val title: String?) : TabState()
     data class Error(val url: Url, val message: String) : TabState()
 }
 
@@ -126,7 +126,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         if (handled) {
             computeStyles(doc, currentAuthorRules)
             relayout()
-            onStateChanged(TabState.Updated(url))
+            onStateChanged(TabState.Updated(url, extractTitle(doc)))
         }
     }
 
@@ -299,7 +299,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             if (currentDoc !== pageRoot) return
             computeStyles(pageRoot, currentAuthorRules)
             relayout()
-            currentUrl?.let { onStateChanged(TabState.Updated(it)) }
+            currentUrl?.let { onStateChanged(TabState.Updated(it, extractTitle(pageRoot))) }
         }
 
         interpreter.globalEnv.declare("fetch", NativeFunction("fetch", 2) { _, _, args ->

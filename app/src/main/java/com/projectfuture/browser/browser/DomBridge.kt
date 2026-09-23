@@ -39,11 +39,10 @@ import com.projectfuture.browser.js.toJsString
  *   executor/main-thread Handler - see that method's doc. No
  *   `XMLHttpRequest`. `window.alert` just logs; there's no dialog
  *   plumbing yet.
- * - `innerHTML` read isn't implemented (no HTML serializer); innerHTML
- *   write re-parses the assigned string via the existing HtmlParser and
- *   replaces the element's children.
  * - `children`/`querySelectorAll` return a plain snapshot array, not a
  *   live NodeList that updates as the DOM changes later.
+ * - `document.title` reads/writes the actual `<title>` element (creating
+ *   one under `<head>` on first write if none exists yet).
  */
 class DomBridge(private val root: ElementNode) {
     private val wrappers = HashMap<ElementNode, DomElement>()
@@ -89,7 +88,7 @@ class DomBridge(private val root: ElementNode) {
     }
 
     fun install(env: Environment) {
-        val document = JsObject()
+        val document = DomDocument(root)
         document.set("documentElement", wrap(root))
         document.set("body", findFirst(root, "body")?.let { wrap(it) } ?: JsNull)
         document.set("getElementById", NativeFunction("getElementById", 1) { _, _, args ->
@@ -157,11 +156,30 @@ class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObjec
         "id" -> JsString(node.attr("id") ?: "")
         "className" -> JsString(node.attr("class") ?: "")
         "textContent" -> JsString(collectText(node))
-        "innerHTML" -> JsString("") // read not implemented - see class doc
+        "innerHTML" -> JsString(node.children.joinToString("") { serializeHtml(it) })
         "style" -> DomStyle(node)
         "children" -> JsArray(node.children.filterIsInstance<ElementNode>().map { bridge.wrap(it) as JsValue }.toMutableList())
         "parentNode", "parentElement" -> node.parent?.let { bridge.wrap(it) } ?: JsNull
+        "nextElementSibling" -> adjacentElementSibling(1)
+        "previousElementSibling" -> adjacentElementSibling(-1)
         "classList" -> makeClassList(node)
+        "hasAttribute" -> NativeFunction("hasAttribute", 1) { _, _, args ->
+            JsBoolean(node.attr(toJsString(args.getOrElse(0) { JsUndefined })) != null)
+        }
+        "matches" -> NativeFunction("matches", 1) { _, _, args ->
+            val selector = CssParser("").parseSingleSelector(toJsString(args.getOrElse(0) { JsUndefined }))
+            JsBoolean(selector?.matches(node) ?: false)
+        }
+        "closest" -> NativeFunction("closest", 1) { _, _, args ->
+            val selector = CssParser("").parseSingleSelector(toJsString(args.getOrElse(0) { JsUndefined }))
+            var current: ElementNode? = node
+            var result: JsValue = JsNull
+            while (current != null && selector != null) {
+                if (selector.matches(current)) { result = bridge.wrap(current); break }
+                current = current.parent
+            }
+            result
+        }
         "setAttribute" -> NativeFunction("setAttribute", 2) { _, _, args ->
             node.attributes[toJsString(args.getOrElse(0) { JsUndefined })] = toJsString(args.getOrElse(1) { JsUndefined })
             JsUndefined
@@ -227,6 +245,16 @@ class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObjec
         is ElementNode -> n.children.joinToString("") { collectText(it) }
     }
 
+    private fun adjacentElementSibling(step: Int): JsValue {
+        val siblings = node.parent?.children ?: return JsNull
+        var i = siblings.indexOf(node) + step
+        while (i in siblings.indices) {
+            (siblings[i] as? ElementNode)?.let { return bridge.wrap(it) }
+            i += step
+        }
+        return JsNull
+    }
+
     private fun makeClassList(node: ElementNode): JsObject {
         val obj = JsObject()
         fun classes(): MutableList<String> = (node.attr("class") ?: "").split(Regex("\\s+")).filter { it.isNotEmpty() }.toMutableList()
@@ -273,3 +301,60 @@ class DomStyle(private val node: ElementNode) : JsObject() {
     /** JS uses camelCase (backgroundColor); CSS uses kebab-case (background-color). */
     private fun cssPropertyName(js: String): String = js.replace(Regex("[A-Z]")) { "-" + it.value.lowercase() }
 }
+
+/** `document`: mostly a flat property bag (see DomBridge.install), except `title`, which reads/writes the live `<title>` element. */
+class DomDocument(private val root: ElementNode) : JsObject() {
+    override fun get(name: String): JsValue = when (name) {
+        "title" -> JsString(findTitle(root)?.let { collectTextStatic(it) } ?: "")
+        else -> super.get(name)
+    }
+
+    override fun set(name: String, value: JsValue) {
+        if (name == "title") {
+            val text = toJsString(value)
+            val existing = findTitle(root)
+            if (existing != null) {
+                existing.children.clear()
+                existing.children.add(TextNode(text, existing))
+            } else {
+                val head = root.children.filterIsInstance<ElementNode>().firstOrNull { it.tag == "head" } ?: return
+                val newTitle = ElementNode("title", parent = head)
+                newTitle.children.add(TextNode(text, newTitle))
+                head.children.add(newTitle)
+            }
+        } else {
+            super.set(name, value)
+        }
+    }
+
+    private fun findTitle(root: ElementNode): ElementNode? {
+        var found: ElementNode? = null
+        root.walkElements { if (found == null && it.tag == "title") found = it }
+        return found
+    }
+
+    private fun collectTextStatic(n: Node): String = when (n) {
+        is TextNode -> n.text
+        is ElementNode -> n.children.joinToString("") { collectTextStatic(it) }
+    }
+}
+
+private val VOID_HTML_TAGS = setOf(
+    "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"
+)
+
+/** Serializes a DOM subtree back to markup, backing `innerHTML` reads. */
+fun serializeHtml(node: Node): String = when (node) {
+    is TextNode -> escapeHtmlText(node.text)
+    is ElementNode -> {
+        val attrs = node.attributes.entries.joinToString("") { (k, v) -> " $k=\"${escapeHtmlAttr(v)}\"" }
+        if (node.tag in VOID_HTML_TAGS) {
+            "<${node.tag}$attrs>"
+        } else {
+            "<${node.tag}$attrs>" + node.children.joinToString("") { serializeHtml(it) } + "</${node.tag}>"
+        }
+    }
+}
+
+private fun escapeHtmlText(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+private fun escapeHtmlAttr(s: String) = escapeHtmlText(s).replace("\"", "&quot;")

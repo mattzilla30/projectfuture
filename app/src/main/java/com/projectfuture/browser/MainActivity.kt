@@ -126,7 +126,10 @@ class MainActivity : AppCompatActivity() {
                 refreshView()
                 updateNavButtons()
             }
-            is TabState.Updated -> refreshView()
+            is TabState.Updated -> {
+                state.title?.let { tabTitles[tab] = it; title = it }
+                refreshView()
+            }
             is TabState.Error -> {
                 binding.progressBar.visibility = View.GONE
                 Toast.makeText(
