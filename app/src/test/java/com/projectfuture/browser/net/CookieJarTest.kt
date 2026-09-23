@@ -141,6 +141,22 @@ class CookieJarTest {
         assertTrue(!csp.allowsImgSrc(page, Url.parse("https://example.com/x.png"))) // no img-src, falls back to default-src 'none'
     }
 
+    @Test fun trackingProtectionBlocksKnownDomainsOnlyWhenEnabled() {
+        val page = Url.parse("https://example.com/")
+        val tracker = Url.parse("https://www.doubleclick.net/pixel")
+        try {
+            TrackingProtection.enabled = false
+            assertTrue(!TrackingProtection.isBlocked(page, tracker))
+
+            TrackingProtection.enabled = true
+            assertTrue(TrackingProtection.isBlocked(page, tracker))
+            assertTrue(!TrackingProtection.isBlocked(page, Url.parse("https://example.com/script.js"))) // first-party
+            assertTrue(!TrackingProtection.isBlocked(page, Url.parse("https://cdn.example.org/lib.js"))) // not on the list
+        } finally {
+            TrackingProtection.enabled = false
+        }
+    }
+
     @Test fun httpCacheServesFreshEntryAndDropsExpiredOne() {
         HttpCache.clear()
         val url = Url.parse("https://example.com/cached")

@@ -22,9 +22,14 @@ class Settings(context: Context) {
         get() = prefs.getString(KEY_SEARCH_TEMPLATE, DEFAULT_SEARCH_TEMPLATE) ?: DEFAULT_SEARCH_TEMPLATE
         set(value) = prefs.edit().putString(KEY_SEARCH_TEMPLATE, value.ifBlank { DEFAULT_SEARCH_TEMPLATE }).apply()
 
+    var trackingProtectionEnabled: Boolean
+        get() = prefs.getBoolean(KEY_TRACKING_PROTECTION, false)
+        set(value) = prefs.edit().putBoolean(KEY_TRACKING_PROTECTION, value).apply()
+
     companion object {
         private const val KEY_HOME_PAGE = "home_page"
         private const val KEY_SEARCH_TEMPLATE = "search_template"
+        private const val KEY_TRACKING_PROTECTION = "tracking_protection"
         const val DEFAULT_HOME_PAGE = "https://example.com/"
         const val DEFAULT_SEARCH_TEMPLATE = "https://duckduckgo.com/html/?q=%s"
     }

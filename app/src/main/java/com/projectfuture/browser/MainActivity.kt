@@ -32,6 +32,7 @@ import com.projectfuture.browser.browser.TabManager
 import com.projectfuture.browser.browser.TabState
 import com.projectfuture.browser.layout.DrawText
 import com.projectfuture.browser.net.CookieJar
+import com.projectfuture.browser.net.TrackingProtection
 import com.projectfuture.browser.net.sharedCookieJar
 import com.projectfuture.browser.databinding.ActivityMainBinding
 
@@ -56,6 +57,7 @@ class MainActivity : AppCompatActivity() {
         bookmarkStore = BookmarkStore(this)
         historyStore = HistoryStore(this)
         settings = Settings(this)
+        TrackingProtection.enabled = settings.trackingProtectionEnabled
         if (sharedCookieJar == null) sharedCookieJar = CookieJar(applicationContext)
 
         binding.browserView.onSizeAvailable = { width, height ->
@@ -379,6 +381,10 @@ class MainActivity : AppCompatActivity() {
             isChecked = tabManager.activeTab?.readerModeActive == true
             isEnabled = currentUrl != null
         }
+        popup.menu.add(0, 11, 10, R.string.menu_tracking_protection).apply {
+            isCheckable = true
+            isChecked = TrackingProtection.enabled
+        }
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> {
@@ -412,6 +418,11 @@ class MainActivity : AppCompatActivity() {
                 8 -> { showSettingsDialog(); true }
                 9 -> { printCurrentPage(); true }
                 10 -> { tabManager.activeTab?.toggleReaderMode(); true }
+                11 -> {
+                    TrackingProtection.enabled = !TrackingProtection.enabled
+                    settings.trackingProtectionEnabled = TrackingProtection.enabled
+                    true
+                }
                 else -> false
             }
         }

@@ -36,6 +36,7 @@ import com.projectfuture.browser.layout.FontDecoder
 import com.projectfuture.browser.layout.customFonts
 import com.projectfuture.browser.layout.textScaleFactor
 import com.projectfuture.browser.net.HttpResponse
+import com.projectfuture.browser.net.TrackingProtection
 import com.projectfuture.browser.net.Url
 import com.projectfuture.browser.net.ContentSecurityPolicy
 import com.projectfuture.browser.net.corsAllows
@@ -451,6 +452,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                     val imgUrl = baseUrl.resolve(src)
                     if (isMixedContent(baseUrl, imgUrl)) return@walkElements
                     if (!csp.allowsImgSrc(baseUrl, imgUrl)) return@walkElements
+                    if (TrackingProtection.isBlocked(baseUrl, imgUrl)) return@walkElements
                     try {
                         val bytes = imgUrl.fetchBytes().body
                         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { result[el] = it }
@@ -501,7 +503,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             val src = scriptEl.attr("src")
             val code = if (!src.isNullOrBlank()) {
                 val scriptUrl = baseUrl.resolve(src)
-                if (isMixedContent(baseUrl, scriptUrl) || !csp.allowsScriptSrc(baseUrl, scriptUrl)) null
+                if (isMixedContent(baseUrl, scriptUrl) || !csp.allowsScriptSrc(baseUrl, scriptUrl) || TrackingProtection.isBlocked(baseUrl, scriptUrl)) null
                 else try { scriptUrl.fetch().body } catch (_: Exception) { null }
             } else if (csp.allowsInlineScript()) {
                 scriptEl.children.filterIsInstance<TextNode>().joinToString("") { it.text }
@@ -560,6 +562,8 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                 promise.reject(makeError("Mixed Content: the page at '$baseUrl' was loaded over HTTPS, but requested an insecure resource '$requestUrl'. This request has been blocked."))
             } else if (!csp.allowsConnectSrc(baseUrl, requestUrl)) {
                 promise.reject(makeError("Refused to connect to '$requestUrl' because it violates the page's Content Security Policy."))
+            } else if (TrackingProtection.isBlocked(baseUrl, requestUrl)) {
+                promise.reject(makeError("Blocked by tracking protection: '$requestUrl'"))
             } else {
                 val options = args.getOrNull(1) as? JsObject
                 val method = options?.get("method")?.let { if (it != JsUndefined) toJsString(it) else null } ?: "GET"
@@ -693,7 +697,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                     (xhr.get("on$type") as? JsFunction)?.call(interp, xhr, emptyList())
                     (xhr.get("onreadystatechange") as? JsFunction)?.call(interp, xhr, emptyList())
                 }
-                if (url == null || isMixedContent(baseUrl, url) || !csp.allowsConnectSrc(baseUrl, url)) {
+                if (url == null || isMixedContent(baseUrl, url) || !csp.allowsConnectSrc(baseUrl, url) || TrackingProtection.isBlocked(baseUrl, url)) {
                     xhr.set("readyState", JsNumber(4.0))
                     fire("error")
                     afterAsyncWork()
@@ -755,7 +759,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                     val href = el.attr("href")
                     if (href != null) {
                         val styleSheetUrl = baseUrl.resolve(href)
-                        if (!isMixedContent(baseUrl, styleSheetUrl) && csp.allowsStyleSrc(baseUrl, styleSheetUrl)) {
+                        if (!isMixedContent(baseUrl, styleSheetUrl) && csp.allowsStyleSrc(baseUrl, styleSheetUrl) && !TrackingProtection.isBlocked(baseUrl, styleSheetUrl)) {
                             try {
                                 val response = styleSheetUrl.fetch()
                                 // url()s inside an external stylesheet resolve against ITS location, not the page's.
@@ -786,7 +790,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             val key = rule.family.lowercase()
             if (result.containsKey(key)) continue
             val fontUrl = styleSheetBase.resolve(rule.srcUrl)
-            if (isMixedContent(pageUrl, fontUrl) || !csp.allowsFontSrc(pageUrl, fontUrl)) continue
+            if (isMixedContent(pageUrl, fontUrl) || !csp.allowsFontSrc(pageUrl, fontUrl) || TrackingProtection.isBlocked(pageUrl, fontUrl)) continue
             try {
                 val bytes = fontUrl.fetchBytes().body
                 val sfnt = FontDecoder.toSfnt(bytes) ?: continue
