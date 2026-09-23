@@ -462,6 +462,36 @@ class InterpreterTest {
         )
     }
 
+    @Test fun dateFromComponentsAndGetters() {
+        assertNum(2024.0, "var d = new Date(2024, 5, 15, 10, 30, 0); var result = d.getFullYear();")
+        assertNum(5.0, "var d = new Date(2024, 5, 15, 10, 30, 0); var result = d.getMonth();") // 0-indexed: June
+        assertNum(15.0, "var d = new Date(2024, 5, 15, 10, 30, 0); var result = d.getDate();")
+        assertNum(10.0, "var d = new Date(2024, 5, 15, 10, 30, 0); var result = d.getHours();")
+        assertNum(30.0, "var d = new Date(2024, 5, 15, 10, 30, 0); var result = d.getMinutes();")
+    }
+
+    @Test fun dateFromIsoStringAndToISOString() {
+        assertEquals("2024-06-15T10:30:00.000Z", str("var result = new Date('2024-06-15T10:30:00Z').toISOString();"))
+    }
+
+    @Test fun dateNowAndGetTimeAreConsistent() {
+        assertTrue(bool("var result = Date.now() > 0;"))
+        assertNum(1000.0, "var d1 = new Date(1000); var result = d1.getTime();")
+    }
+
+    @Test fun dateSettersMutateInPlace() {
+        assertNum(2030.0, """
+            var d = new Date(2020, 0, 1);
+            d.setFullYear(2030);
+            var result = d.getFullYear();
+            """.trimIndent()
+        )
+    }
+
+    @Test fun invalidDateStringProducesNaNGetters() {
+        assertTrue((result("var result = new Date('not-a-date').getTime();") as JsNumber).value.isNaN())
+    }
+
     /** The structured-clone approximation Tab.kt's Web Worker bridge relies on to safely pass messages across threads. */
     @Test fun jsonStringifyParseRoundTripProducesAnIndependentCopy() {
         val interpreter = Interpreter()

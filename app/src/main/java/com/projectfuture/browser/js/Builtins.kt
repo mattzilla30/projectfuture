@@ -16,6 +16,7 @@ fun installGlobals(env: Environment, interpreter: Interpreter) {
     env.declare("RegExp", makeRegExpCtor())
     env.declare("Map", makeMapCtor())
     env.declare("Set", makeSetCtor())
+    env.declare("Date", makeDateCtor())
     env.declare("NaN", JsNumber(Double.NaN))
     env.declare("Infinity", JsNumber(Double.POSITIVE_INFINITY))
 
