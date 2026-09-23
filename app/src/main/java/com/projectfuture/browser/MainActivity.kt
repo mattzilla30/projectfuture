@@ -8,6 +8,7 @@ import android.content.pm.ShortcutInfo
 import android.content.pm.ShortcutManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Color
 import android.graphics.drawable.Icon
 import android.net.Uri
 import android.os.Build
@@ -22,7 +23,10 @@ import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.BaseAdapter
 import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.GridView
 import android.widget.ImageButton
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.PopupMenu
@@ -381,53 +385,102 @@ class MainActivity : AppCompatActivity() {
         tabSessionStore.save(urls, activeIndex)
     }
 
+    /**
+     * Renders a tab's *actual* current page content into a small bitmap -
+     * not a placeholder icon - by reusing the exact same Canvas paint path
+     * as printing (BrowserView.paintFullPageForPrint), scaled to fit.
+     * Works for background tabs too, since it only needs a tab's own
+     * `displayList`/`contentHeight`, not for it to be the currently
+     * visible one. A discarded (memory-pressure-evicted) tab or one that
+     * hasn't finished its first layout yet just renders a blank thumbnail
+     * (contentHeight is 0) rather than crashing.
+     */
+    private fun renderTabThumbnail(tab: Tab, widthPx: Int, heightPx: Int): Bitmap {
+        val bitmap = Bitmap.createBitmap(widthPx, heightPx, Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(bitmap)
+        canvas.drawColor(Color.WHITE)
+        val contentWidth = lastViewportWidth.coerceAtLeast(1f)
+        val contentHeight = tab.contentHeight.coerceAtLeast(1f)
+        val scale = minOf(widthPx / contentWidth, heightPx / contentHeight)
+        if (scale.isFinite() && scale > 0f) {
+            canvas.save()
+            canvas.scale(scale, scale)
+            try {
+                binding.browserView.paintFullPageForPrint(canvas, tab.displayList)
+            } catch (_: Exception) {
+                // A thumbnail is a nice-to-have; a rendering hiccup shouldn't break the switcher.
+            }
+            canvas.restore()
+        }
+        return bitmap
+    }
+
     private fun showTabSwitcher() {
         lateinit var dialog: AlertDialog
         val tabs = tabManager.allTabs()
-        val listView = ListView(this)
-        listView.adapter = object : BaseAdapter() {
+        val thumbWidthPx = (resources.displayMetrics.density * 150).toInt()
+        val thumbHeightPx = (resources.displayMetrics.density * 110).toInt()
+        val gridView = GridView(this)
+        gridView.numColumns = 2
+        gridView.verticalSpacing = 16
+        gridView.horizontalSpacing = 16
+        gridView.setPadding(24, 24, 24, 24)
+        gridView.adapter = object : BaseAdapter() {
             override fun getCount() = tabs.size
             override fun getItem(position: Int): Any = tabs[position]
             override fun getItemId(position: Int) = position.toLong()
             override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                 val tab = tabs[position]
-                val row = LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    setPadding(32, 24, 16, 24)
-                }
-                val activeMarker = if (position == tabManager.activeIndex) "●  " else ""
                 val label = tabTitles[tab] ?: tab.currentUrl?.toString() ?: getString(R.string.untitled_tab)
-                row.addView(
-                    TextView(this@MainActivity).apply {
-                        text = activeMarker + label
-                        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                        textSize = 16f
-                        maxLines = 1
-                        ellipsize = TextUtils.TruncateAt.END
+
+                val cell = FrameLayout(this@MainActivity)
+                val isActive = position == tabManager.activeIndex
+                cell.setBackgroundColor(if (isActive) Color.parseColor("#D0E4FF") else Color.parseColor("#EEEEEE"))
+                cell.layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, thumbHeightPx + 80)
+
+                val thumbnail = ImageView(this@MainActivity).apply {
+                    setImageBitmap(renderTabThumbnail(tab, thumbWidthPx, thumbHeightPx))
+                    scaleType = ImageView.ScaleType.FIT_CENTER
+                    layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, thumbHeightPx).apply {
+                        setMargins(8, 8, 8, 0)
                     }
-                )
-                row.addView(
-                    ImageButton(this@MainActivity).apply {
-                        setImageResource(R.drawable.ic_close)
-                        background = null
-                        contentDescription = getString(R.string.action_close)
-                        setOnClickListener {
-                            closeTabAt(position)
-                            dialog.dismiss()
-                        }
+                }
+                cell.addView(thumbnail)
+
+                val title = TextView(this@MainActivity).apply {
+                    text = label
+                    maxLines = 1
+                    ellipsize = TextUtils.TruncateAt.END
+                    textSize = 13f
+                    setPadding(8, 4, 40, 4)
+                    layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM).apply {
+                        topMargin = thumbHeightPx + 8
                     }
-                )
-                return row
+                }
+                cell.addView(title)
+
+                val closeButton = ImageButton(this@MainActivity).apply {
+                    setImageResource(R.drawable.ic_close)
+                    background = null
+                    contentDescription = getString(R.string.action_close)
+                    layoutParams = FrameLayout.LayoutParams(64, 64, Gravity.TOP or Gravity.END)
+                    setOnClickListener {
+                        closeTabAt(position)
+                        dialog.dismiss()
+                    }
+                }
+                cell.addView(closeButton)
+
+                cell.setOnClickListener {
+                    switchToTab(position)
+                    dialog.dismiss()
+                }
+                return cell
             }
-        }
-        listView.setOnItemClickListener { _, _, position, _ ->
-            switchToTab(position)
-            dialog.dismiss()
         }
         dialog = AlertDialog.Builder(this)
             .setTitle(R.string.tabs_dialog_title)
-            .setView(listView)
+            .setView(gridView)
             .setPositiveButton(R.string.action_new_tab) { d, _ -> openNewTab(); d.dismiss() }
             .setNegativeButton(R.string.action_close, null)
             .create()
