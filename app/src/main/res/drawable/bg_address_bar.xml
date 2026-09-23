@@ -4,5 +4,5 @@
     <corners android:radius="20dp" />
     <stroke
         android:width="1dp"
-        android:color="#FFDADADA" />
+        android:color="@color/address_bar_stroke" />
 </shape>

@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="chrome_background">#FFF2F2F2</color>
-    <color name="chrome_background_dark">#FF1E1E1E</color>
     <color name="page_background">#FFFFFFFF</color>
     <color name="address_bar_background">#FFFFFFFF</color>
     <color name="link_color">#FF1A0DAB</color>
     <color name="text_color">#FF202020</color>
+    <color name="address_bar_stroke">#FFDADADA</color>
 </resources>
