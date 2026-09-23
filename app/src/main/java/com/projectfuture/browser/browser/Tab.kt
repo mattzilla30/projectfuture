@@ -16,12 +16,23 @@ import com.projectfuture.browser.html.HtmlParser
 import com.projectfuture.browser.html.TextNode
 import com.projectfuture.browser.html.walkElements
 import com.projectfuture.browser.js.Interpreter
+import com.projectfuture.browser.js.JsBoolean
+import com.projectfuture.browser.js.JsFunction
+import com.projectfuture.browser.js.JsNumber
+import com.projectfuture.browser.js.JsObject
+import com.projectfuture.browser.js.JsPromise
+import com.projectfuture.browser.js.JsString
+import com.projectfuture.browser.js.JsUndefined
 import com.projectfuture.browser.js.Lexer
+import com.projectfuture.browser.js.NativeFunction
 import com.projectfuture.browser.js.Parser
+import com.projectfuture.browser.js.parseJsonToJsValue
+import com.projectfuture.browser.js.toJsString
 import com.projectfuture.browser.layout.DisplayCommand
 import com.projectfuture.browser.layout.DocumentLayout
 import com.projectfuture.browser.layout.FontDecoder
 import com.projectfuture.browser.layout.customFonts
+import com.projectfuture.browser.net.HttpResponse
 import com.projectfuture.browser.net.Url
 import java.io.File
 import java.util.concurrent.Executors
@@ -63,6 +74,8 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
     private var currentInterpreter: Interpreter? = null
     private var currentDomBridge: DomBridge? = null
     private var currentAuthorRules: List<CssRule> = emptyList()
+    private var timerIdCounter = 0
+    private val canceledTimers = HashSet<Int>()
 
     fun canGoBack() = historyIndex > 0
     fun canGoForward() = historyIndex in 0 until (history.size - 1)
@@ -151,6 +164,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                     currentInterpreter = interpreter
                     currentDomBridge = bridge
                     currentAuthorRules = authorCss.rules
+                    canceledTimers.clear()
                     when (action) {
                         HistoryAction.PUSH -> {
                             while (history.size > historyIndex + 1) history.removeAt(history.size - 1)
@@ -237,6 +251,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         val interpreter = Interpreter()
         val bridge = DomBridge(root)
         bridge.install(interpreter.globalEnv)
+        installBrowserRuntime(interpreter, root, baseUrl)
 
         val scripts = ArrayList<ElementNode>()
         root.walkElements { if (it.tag == "script") scripts.add(it) }
@@ -258,6 +273,120 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
 
         bridge.fireDomContentLoaded(interpreter)
         return interpreter to bridge
+    }
+
+    /**
+     * Browser-runtime globals beyond pure DOM access: `fetch` (genuine
+     * background network I/O - raw sockets on the main thread throw
+     * NetworkOnMainThreadException on Android, so this can't be
+     * synchronous like the rest of this file's networking during load())
+     * and `setTimeout`/`setInterval` via the existing mainHandler. Both
+     * re-style/re-layout and report TabState.Updated after their callback
+     * runs, since it may have mutated the DOM - guarded by a reference
+     * check against the page's own root ([pageRoot]) so a timer or fetch
+     * that resolves after the user has navigated away is a no-op instead
+     * of corrupting whatever page is showing now.
+     *
+     * `clearTimeout`/`clearInterval` are tracked via a simple ID set
+     * rather than being no-ops, so a script that legitimately stops a
+     * repeating timer (e.g. a countdown) actually stops instead of
+     * running forever until the next navigation. `setInterval` also
+     * floors its delay at 16ms (~60fps) as a throttle against a
+     * pathological `setInterval(fn, 0)`.
+     */
+    private fun installBrowserRuntime(interpreter: Interpreter, pageRoot: ElementNode, baseUrl: Url) {
+        fun afterAsyncWork() {
+            if (currentDoc !== pageRoot) return
+            computeStyles(pageRoot, currentAuthorRules)
+            relayout()
+            currentUrl?.let { onStateChanged(TabState.Updated(it)) }
+        }
+
+        interpreter.globalEnv.declare("fetch", NativeFunction("fetch", 2) { _, _, args ->
+            val promise = JsPromise()
+            val requestUrl = try {
+                baseUrl.resolve(toJsString(args.getOrElse(0) { JsUndefined }))
+            } catch (e: Exception) {
+                null
+            }
+            if (requestUrl == null) {
+                promise.reject(JsString("Invalid URL"))
+            } else {
+                executor.execute {
+                    try {
+                        val response = requestUrl.fetch()
+                        mainHandler.post {
+                            promise.resolve(makeFetchResponse(response))
+                            afterAsyncWork()
+                        }
+                    } catch (e: Exception) {
+                        mainHandler.post {
+                            promise.reject(JsString(e.message ?: "Network request failed"))
+                            afterAsyncWork()
+                        }
+                    }
+                }
+            }
+            promise
+        })
+
+        interpreter.globalEnv.declare("setTimeout", NativeFunction("setTimeout", 2) { _, _, args ->
+            val fn = args.getOrNull(0) as? JsFunction
+            val delay = (args.getOrNull(1) as? JsNumber)?.value?.toLong()?.coerceAtLeast(0L) ?: 0L
+            val id = ++timerIdCounter
+            if (fn != null) {
+                mainHandler.postDelayed({
+                    if (id !in canceledTimers && currentDoc === pageRoot) {
+                        try { fn.call(interpreter, JsUndefined, emptyList()) } catch (_: Exception) { }
+                        afterAsyncWork()
+                    }
+                }, delay)
+            }
+            JsNumber(id.toDouble())
+        })
+        interpreter.globalEnv.declare("clearTimeout", NativeFunction("clearTimeout", 1) { _, _, args ->
+            (args.getOrNull(0) as? JsNumber)?.let { canceledTimers.add(it.value.toInt()) }
+            JsUndefined
+        })
+
+        interpreter.globalEnv.declare("setInterval", NativeFunction("setInterval", 2) { _, _, args ->
+            val fn = args.getOrNull(0) as? JsFunction
+            val delay = (args.getOrNull(1) as? JsNumber)?.value?.toLong()?.coerceAtLeast(16L) ?: 1000L
+            val id = ++timerIdCounter
+            if (fn != null) {
+                lateinit var tick: () -> Unit
+                tick = {
+                    if (id !in canceledTimers && currentDoc === pageRoot) {
+                        try { fn.call(interpreter, JsUndefined, emptyList()) } catch (_: Exception) { }
+                        afterAsyncWork()
+                        mainHandler.postDelayed(tick, delay)
+                    }
+                }
+                mainHandler.postDelayed(tick, delay)
+            }
+            JsNumber(id.toDouble())
+        })
+        interpreter.globalEnv.declare("clearInterval", NativeFunction("clearInterval", 1) { _, _, args ->
+            (args.getOrNull(0) as? JsNumber)?.let { canceledTimers.add(it.value.toInt()) }
+            JsUndefined
+        })
+    }
+
+    private fun makeFetchResponse(response: HttpResponse): JsObject {
+        val obj = JsObject()
+        obj.set("ok", JsBoolean(response.statusCode in 200..299))
+        obj.set("status", JsNumber(response.statusCode.toDouble()))
+        obj.set("text", NativeFunction("text", 0) { _, _, _ -> JsPromise().apply { resolve(JsString(response.body)) } })
+        obj.set("json", NativeFunction("json", 0) { _, _, _ ->
+            JsPromise().apply {
+                try {
+                    resolve(parseJsonToJsValue(response.body))
+                } catch (_: Exception) {
+                    reject(JsString("Invalid JSON"))
+                }
+            }
+        })
+        return obj
     }
 
     private class AuthorCss(val rules: List<CssRule>, val fontFaces: List<Pair<FontFaceRule, Url>>)

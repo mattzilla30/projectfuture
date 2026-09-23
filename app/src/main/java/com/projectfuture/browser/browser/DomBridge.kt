@@ -33,9 +33,11 @@ import com.projectfuture.browser.js.toJsString
  *   no `input`/`change`/`submit`), and `DOMContentLoaded` is the only
  *   thing that fires on its own, synchronously right after all
  *   `<script>` tags finish running on page load.
- * - No `setTimeout`/`setInterval`/`fetch`/`XMLHttpRequest`/`alert`-as-UI -
- *   `window.alert` just logs, since there's no dialog plumbing yet, and
- *   there's no task queue for deferred/async work at all.
+ * - `fetch`/`setTimeout`/`setInterval` are real but live in Tab
+ *   (installBrowserRuntime), not here, since they need Tab's background
+ *   executor/main-thread Handler - see that method's doc. No
+ *   `XMLHttpRequest`. `window.alert` just logs; there's no dialog
+ *   plumbing yet.
  * - `innerHTML` read isn't implemented (no HTML serializer); innerHTML
  *   write re-parses the assigned string via the existing HtmlParser and
  *   replaces the element's children.
