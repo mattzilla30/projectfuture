@@ -1,6 +1,7 @@
 package com.projectfuture.browser.view
 
 import android.content.Context
+import android.os.Build
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.ColorMatrix
@@ -16,6 +17,7 @@ import android.view.Gravity
 import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
+import android.view.View
 import android.widget.EditText
 import android.widget.FrameLayout
 import com.projectfuture.browser.html.ElementNode
@@ -270,6 +272,33 @@ class BrowserView @JvmOverloads constructor(
         for (view in textFieldViews.values) view.translationY = -scrollYPx
     }
 
+    /**
+     * Maps `<input>` type/name/autocomplete to Android's Autofill hint
+     * constants, so the platform's own Autofill framework (password
+     * managers, etc.) can recognize and fill these real EditText fields -
+     * this falls out almost for free given they're genuine platform
+     * widgets already (see class doc), needing only API 26+ (`minSdk` is
+     * 24, hence the version guard) and a plausible-hint heuristic rather
+     * than full HTML autocomplete-token parsing.
+     */
+    private fun autofillHintsFor(el: ElementNode?): Array<String>? {
+        if (el == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return null
+        val autocomplete = el.attr("autocomplete")?.lowercase() ?: ""
+        val type = el.attr("type")?.lowercase() ?: ""
+        val name = el.attr("name")?.lowercase() ?: ""
+        val hint = when {
+            type == "password" || "password" in autocomplete -> View.AUTOFILL_HINT_PASSWORD
+            type == "email" || "email" in autocomplete || "email" in name -> View.AUTOFILL_HINT_EMAIL_ADDRESS
+            type == "tel" || "tel" in autocomplete -> View.AUTOFILL_HINT_PHONE
+            "username" in autocomplete || "user" in name || "login" in name -> View.AUTOFILL_HINT_USERNAME
+            "cc-number" in autocomplete -> View.AUTOFILL_HINT_CREDIT_CARD_NUMBER
+            "postal-code" in autocomplete || "zip" in name -> View.AUTOFILL_HINT_POSTAL_CODE
+            "name" in autocomplete || "name" in name -> View.AUTOFILL_HINT_NAME
+            else -> return null
+        }
+        return arrayOf(hint)
+    }
+
     private fun createEditTextFor(cmd: DrawFormControl): EditText {
         val editText = EditText(context)
         editText.setPadding(8, 4, 8, 4)
@@ -288,6 +317,9 @@ class BrowserView @JvmOverloads constructor(
         }
         editText.hint = cmd.placeholder
         editText.setText(cmd.value)
+        autofillHintsFor(cmd.sourceElement)?.let { hints ->
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) editText.setAutofillHints(*hints)
+        }
         if (cmd.controlType == FormControlType.TEXTAREA) {
             editText.isSingleLine = false
             editText.gravity = Gravity.TOP or Gravity.START
