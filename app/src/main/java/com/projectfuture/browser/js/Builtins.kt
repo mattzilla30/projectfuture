@@ -13,6 +13,7 @@ fun installGlobals(env: Environment, interpreter: Interpreter) {
     env.declare("Object", makeObjectCtor())
     env.declare("Array", makeArrayCtor())
     env.declare("Promise", makePromiseCtor())
+    env.declare("RegExp", makeRegExpCtor())
     env.declare("NaN", JsNumber(Double.NaN))
     env.declare("Infinity", JsNumber(Double.POSITIVE_INFINITY))
 
@@ -126,7 +127,7 @@ private fun makeArrayCtor(): JsFunction = object : JsFunction("Array") {
 /** Resolves `obj.key(...)` for built-in Array/String methods; null means "not a built-in, fall back to normal property lookup". */
 fun builtinMethodCall(interpreter: Interpreter, obj: JsValue, key: String, args: List<JsValue>): JsValue? = when (obj) {
     is JsArray -> arrayMethod(interpreter, obj, key, args)
-    is JsString -> stringMethod(obj, key, args)
+    is JsString -> stringMethod(interpreter, obj, key, args)
     else -> null
 }
 
@@ -234,7 +235,7 @@ private fun arrayMethod(interpreter: Interpreter, arr: JsArray, key: String, arg
     else -> null
 }
 
-private fun stringMethod(s: JsString, key: String, args: List<JsValue>): JsValue? {
+private fun stringMethod(interpreter: Interpreter, s: JsString, key: String, args: List<JsValue>): JsValue? {
     val v = s.value
     return when (key) {
         "toUpperCase" -> JsString(v.uppercase())
@@ -263,16 +264,43 @@ private fun stringMethod(s: JsString, key: String, args: List<JsValue>): JsValue
         "charAt" -> JsString(v.getOrNull(toNumber(arg(args, 0)).toInt())?.toString() ?: "")
         "charCodeAt" -> v.getOrNull(toNumber(arg(args, 0)).toInt())?.let { JsNumber(it.code.toDouble()) } ?: JsNumber(Double.NaN)
         "split" -> {
-            if (args.isEmpty() || args[0] == JsUndefined) {
-                JsArray(mutableListOf(JsString(v)))
-            } else {
-                val sep = toJsString(args[0])
-                val parts = if (sep.isEmpty()) v.map { it.toString() } else v.split(sep)
-                JsArray(parts.map { JsString(it) as JsValue }.toMutableList())
+            val sep = args.getOrNull(0)
+            when {
+                args.isEmpty() || sep == JsUndefined -> JsArray(mutableListOf(JsString(v)))
+                sep is JsRegExp -> JsArray(sep.kotlinRegex.split(v).map { JsString(it) as JsValue }.toMutableList())
+                else -> {
+                    val sepStr = toJsString(sep!!)
+                    val parts = if (sepStr.isEmpty()) v.map { it.toString() } else v.split(sepStr)
+                    JsArray(parts.map { JsString(it) as JsValue }.toMutableList())
+                }
             }
         }
-        "replace" -> JsString(v.replaceFirst(toJsString(arg(args, 0)), toJsString(arg(args, 1))))
-        "replaceAll" -> JsString(v.replace(toJsString(arg(args, 0)), toJsString(arg(args, 1))))
+        "replace" -> {
+            val pattern = args.getOrNull(0)
+            if (pattern is JsRegExp) {
+                JsString(regexReplace(interpreter, v, pattern, arg(args, 1)))
+            } else {
+                JsString(v.replaceFirst(toJsString(arg(args, 0)), toJsString(arg(args, 1))))
+            }
+        }
+        "replaceAll" -> {
+            val pattern = args.getOrNull(0)
+            if (pattern is JsRegExp) {
+                JsString(regexReplace(interpreter, v, JsRegExp(pattern.source, pattern.flags + if (pattern.global) "" else "g"), arg(args, 1)))
+            } else {
+                JsString(v.replace(toJsString(arg(args, 0)), toJsString(arg(args, 1))))
+            }
+        }
+        "match" -> {
+            val re = args.getOrNull(0) as? JsRegExp ?: return null
+            if (re.global) {
+                val matches = re.kotlinRegex.findAll(v).map { JsString(it.value) as JsValue }.toMutableList()
+                if (matches.isEmpty()) JsNull else JsArray(matches)
+            } else {
+                val m = re.kotlinRegex.find(v) ?: return JsNull
+                JsArray(m.groupValues.map { JsString(it) as JsValue }.toMutableList())
+            }
+        }
         "repeat" -> JsString(v.repeat(toNumber(arg(args, 0)).toInt().coerceAtLeast(0)))
         "padStart" -> JsString(padStr(v, toNumber(arg(args, 0)).toInt(), if (args.size > 1) toJsString(args[1]) else " ", start = true))
         "padEnd" -> JsString(padStr(v, toNumber(arg(args, 0)).toInt(), if (args.size > 1) toJsString(args[1]) else " ", start = false))

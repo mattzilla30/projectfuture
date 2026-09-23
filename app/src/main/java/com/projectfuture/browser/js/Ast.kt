@@ -12,6 +12,7 @@ data class Identifier(val name: String) : Expr()
 data class ArrayLit(val elements: List<Expr>) : Expr()
 data class ObjectLit(val properties: List<Pair<Expr, Expr>>) : Expr() // key expr (StringLit or Identifier-as-name), value expr
 data class TemplateLit(val quasis: List<String>, val expressions: List<Expr>) : Expr()
+data class RegexLit(val pattern: String, val flags: String) : Expr()
 data class Unary(val op: String, val argument: Expr) : Expr()
 data class UpdateExpr(val op: String, val argument: Expr, val prefix: Boolean) : Expr() // ++/--
 data class Binary(val op: String, val left: Expr, val right: Expr) : Expr()

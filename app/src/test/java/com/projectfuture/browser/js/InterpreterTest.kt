@@ -231,4 +231,48 @@ class InterpreterTest {
             """.trimIndent()
         )
     }
+
+    @Test fun regexTestAndExec() {
+        assertTrue(bool("var result = /^[0-9]+${'$'}/.test('12345');"))
+        assertTrue(!bool("var result = /^[0-9]+${'$'}/.test('abc');"))
+        assertNum(3.0, "var m = /(\\d)-(\\d)/.exec('a5-9b'); var result = m.length;")
+        assertEquals("5", str("var m = /(\\d)-(\\d)/.exec('a5-9b'); var result = m[1];"))
+    }
+
+    @Test fun regexMatchGlobalVsFirst() {
+        assertNum(3.0, "var result = 'a1 b2 c3'.match(/[0-9]/g).length;")
+        assertEquals("1", str("var result = 'a1 b2 c3'.match(/[0-9]/)[0];"))
+    }
+
+    @Test fun regexReplaceWithFunctionCallback() {
+        assertEquals(
+            "A-B-C",
+            str("var result = 'a-b-c'.replace(/[a-z]/g, function(m) { return m.toUpperCase(); });")
+        )
+    }
+
+    @Test fun regexReplaceWithBackreferences() {
+        assertEquals(
+            "15/01/2023",
+            str(
+                """
+                var result = '2023-01-15'.replace(/(\d+)-(\d+)-(\d+)/, '${'$'}3/${'$'}2/${'$'}1');
+                """.trimIndent()
+            )
+        )
+    }
+
+    @Test fun regexSplit() {
+        assertNum(3.0, "var result = 'a1b22c'.split(/[0-9]+/).length;")
+    }
+
+    @Test fun regexConstructorForm() {
+        assertTrue(bool("var re = new RegExp('^abc${'$'}', 'i'); var result = re.test('ABC');"))
+    }
+
+    @Test fun divisionStillWorksAfterRegexSupportAdded() {
+        // Guards against the regex-vs-division lexer heuristic breaking ordinary division.
+        assertNum(2.0, "var a = 10; var b = 5; var result = a / b;")
+        assertNum(3.0, "var arr = [9]; var result = arr[0] / 3;")
+    }
 }

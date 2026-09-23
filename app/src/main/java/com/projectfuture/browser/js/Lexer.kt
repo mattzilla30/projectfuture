@@ -1,11 +1,13 @@
 package com.projectfuture.browser.js
 
-enum class TokenType { NUMBER, STRING, TEMPLATE, IDENT, KEYWORD, PUNCT, EOF }
+enum class TokenType { NUMBER, STRING, TEMPLATE, REGEX, IDENT, KEYWORD, PUNCT, EOF }
 
 /**
  * For TEMPLATE tokens: [templateParts] holds the literal string chunks and
  * [templateExprs] holds the raw (unparsed) source of each `${...}`
- * expression, parsed lazily by the parser via a nested Lexer+Parser.
+ * expression, parsed lazily by the parser via a nested Lexer+Parser. For
+ * REGEX tokens, [text] is the pattern body and [regexFlags] the trailing
+ * flag letters.
  */
 class Token(
     val type: TokenType,
@@ -13,6 +15,7 @@ class Token(
     val numberValue: Double = 0.0,
     val templateParts: List<String> = emptyList(),
     val templateExprs: List<String> = emptyList(),
+    val regexFlags: String = "",
     val newlineBefore: Boolean = false
 )
 
@@ -23,20 +26,23 @@ private val KEYWORDS = setOf(
 )
 
 /**
- * A hand-written tokenizer covering ES5-ish syntax plus template literals
- * and arrow functions. No regex literal support (`/pattern/`) - `/` is
- * always division, which is unambiguous for the statement/expression forms
- * this interpreter's parser accepts.
+ * A hand-written tokenizer covering ES5-ish syntax plus template literals,
+ * arrow functions, and regex literals. Regex-vs-division disambiguation
+ * ([regexAllowedHere]) is a heuristic based on the previous token, not full
+ * grammar context like the real spec requires - see that method's doc for
+ * the one known misparse case.
  */
 class Lexer(private val source: String) {
     private var pos = 0
     private val n = source.length
+    private var lastToken: Token? = null
 
     fun tokenize(): List<Token> {
         val tokens = ArrayList<Token>()
         while (true) {
             val tok = nextToken()
             tokens.add(tok)
+            lastToken = tok
             if (tok.type == TokenType.EOF) break
         }
         return tokens
@@ -69,9 +75,57 @@ class Lexer(private val source: String) {
         }
         if (c == '"' || c == '\'') return readString(c, sawNewline)
         if (c == '`') return readTemplate(sawNewline)
+        if (c == '/' && regexAllowedHere()) return readRegex(sawNewline)
         if (c.isLetter() || c == '_' || c == '$') return readIdentifier(sawNewline)
 
         return readPunct(sawNewline)
+    }
+
+    /**
+     * Real JS lexers need full grammar context to know whether `/` starts a
+     * regex literal or means division - this interpreter's lexer runs as a
+     * single flat pass with no parser feedback, so it approximates with
+     * "division only right after something that could end a value
+     * expression" (an identifier/number/string/`)`/`]`/postfix ++/--).
+     * Known misparse: `if (x) /re/.test(y)` reads as division after `)`,
+     * since closing a parenthesized *condition* looks the same to this
+     * heuristic as closing a parenthesized *value expression* like
+     * `(a + b) / c`. In practice this rarely bites, since code almost
+     * always uses braces after `if (...)` or assigns the regex to a
+     * variable first.
+     */
+    private fun regexAllowedHere(): Boolean {
+        val prev = lastToken ?: return true
+        return when (prev.type) {
+            TokenType.NUMBER, TokenType.STRING, TokenType.TEMPLATE, TokenType.IDENT, TokenType.REGEX -> false
+            TokenType.KEYWORD -> prev.text !in setOf("this", "true", "false", "null", "undefined")
+            TokenType.PUNCT -> prev.text !in setOf(")", "]", "++", "--")
+            else -> true
+        }
+    }
+
+    private fun readRegex(newlineBefore: Boolean): Token {
+        pos++ // opening '/'
+        val bodyStart = pos
+        var inClass = false
+        while (pos < n) {
+            val c = source[pos]
+            if (c == '\\' && pos + 1 < n) {
+                pos += 2
+                continue
+            }
+            if (c == '[') inClass = true
+            else if (c == ']') inClass = false
+            else if (c == '/' && !inClass) break
+            else if (c == '\n') break // unterminated; bail rather than consuming the rest of the file
+            pos++
+        }
+        val pattern = source.substring(bodyStart, pos.coerceAtMost(n))
+        if (pos < n && source[pos] == '/') pos++ // closing '/'
+        val flagsStart = pos
+        while (pos < n && source[pos].isLetter()) pos++
+        val flags = source.substring(flagsStart, pos)
+        return Token(TokenType.REGEX, pattern, regexFlags = flags, newlineBefore = newlineBefore)
     }
 
     private fun readNumber(newlineBefore: Boolean): Token {

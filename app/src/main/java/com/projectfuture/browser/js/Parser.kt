@@ -2,12 +2,13 @@ package com.projectfuture.browser.js
 
 /**
  * A recursive-descent parser for an ES5-ish subset plus arrow functions,
- * template literals, and `let`/`const`. Not implemented: classes,
+ * template literals, `let`/`const`, and regex literals (see Lexer.kt's
+ * doc for the regex-vs-division heuristic). Not implemented: classes,
  * destructuring, spread/rest, generators/async, default parameters,
- * bitwise operators (&|^~<<>>), regex literals, labeled statements,
- * switch statements. Each of those is a real gap for modern JS, chosen to
- * bound scope - see Interpreter.kt's class doc for the fuller picture of
- * what this engine covers.
+ * bitwise operators (&|^~<<>>), labeled statements, switch statements.
+ * Each of those is a real gap for modern JS, chosen to bound scope - see
+ * Interpreter.kt's class doc for the fuller picture of what this engine
+ * covers.
  */
 class Parser(private val tokens: List<Token>) {
     private var pos = 0
@@ -450,6 +451,7 @@ class Parser(private val tokens: List<Token>) {
                 val exprs = tok.templateExprs.map { src -> Parser(Lexer(src).tokenize()).parseExpression() }
                 return TemplateLit(tok.templateParts, exprs)
             }
+            TokenType.REGEX -> { advance(); return RegexLit(tok.text, tok.regexFlags) }
             TokenType.IDENT -> { advance(); return Identifier(tok.text) }
             TokenType.KEYWORD -> {
                 when (tok.text) {

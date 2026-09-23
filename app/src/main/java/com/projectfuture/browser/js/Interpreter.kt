@@ -193,6 +193,11 @@ class Interpreter {
             }
             JsString(sb.toString())
         }
+        is RegexLit -> try {
+            JsRegExp(expr.pattern, expr.flags)
+        } catch (e: Exception) {
+            throw jsError("Invalid regular expression: ${e.message}")
+        }
         is Unary -> evalUnary(expr, env)
         is UpdateExpr -> evalUpdate(expr, env)
         is Binary -> evalBinary(expr.op, evalExpr(expr.left, env), evalExpr(expr.right, env))
