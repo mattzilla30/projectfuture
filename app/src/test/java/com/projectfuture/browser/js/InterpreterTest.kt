@@ -182,4 +182,53 @@ class InterpreterTest {
         assertTrue(bool("var result = (null == undefined);"))
         assertTrue(!bool("var result = (null === undefined);"))
     }
+
+    @Test fun promiseResolveThenChain() {
+        assertNum(
+            6.0,
+            """
+            var result;
+            new Promise(function(resolve) { resolve(3); })
+                .then(function(v) { return v * 2; })
+                .then(function(v) { result = v; });
+            """.trimIndent()
+        )
+    }
+
+    @Test fun promiseRejectCatch() {
+        assertEquals(
+            "caught: nope",
+            str(
+                """
+                var result;
+                new Promise(function(resolve, reject) { reject('nope'); })
+                    .then(function(v) { result = 'should not run'; })
+                    .catch(function(e) { result = 'caught: ' + e; });
+                """.trimIndent()
+            )
+        )
+    }
+
+    @Test fun promiseAll() {
+        assertNum(
+            6.0,
+            """
+            var result;
+            Promise.all([Promise.resolve(1), Promise.resolve(2), Promise.resolve(3)])
+                .then(function(vals) { result = vals[0] + vals[1] + vals[2]; });
+            """.trimIndent()
+        )
+    }
+
+    @Test fun promiseAlreadySettledThenStillRuns() {
+        // .then() attached after the promise already settled should still fire (not silently dropped).
+        assertNum(
+            10.0,
+            """
+            var p = Promise.resolve(10);
+            var result;
+            p.then(function(v) { result = v; });
+            """.trimIndent()
+        )
+    }
 }

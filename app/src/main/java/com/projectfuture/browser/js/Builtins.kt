@@ -12,6 +12,7 @@ fun installGlobals(env: Environment, interpreter: Interpreter) {
     env.declare("JSON", makeJson())
     env.declare("Object", makeObjectCtor())
     env.declare("Array", makeArrayCtor())
+    env.declare("Promise", makePromiseCtor())
     env.declare("NaN", JsNumber(Double.NaN))
     env.declare("Infinity", JsNumber(Double.POSITIVE_INFINITY))
 
@@ -79,7 +80,7 @@ private fun makeJson(): JsObject {
     obj.set("stringify", NativeFunction("stringify", 1) { _, _, args -> JsString(jsonStringify(arg(args, 0))) })
     obj.set("parse", NativeFunction("parse", 1) { _, _, args ->
         try {
-            JsonParser(toJsString(arg(args, 0))).parse()
+            parseJsonToJsValue(toJsString(arg(args, 0)))
         } catch (_: Exception) {
             throw jsError("Unexpected token in JSON")
         }
@@ -287,6 +288,9 @@ private fun padStr(s: String, targetLen: Int, pad: String, start: Boolean): Stri
     val padding = sb.substring(0, targetLen - s.length)
     return if (start) padding + s else s + padding
 }
+
+/** Exposed for reuse outside JSON.parse itself - e.g. a fetch() Response's `.json()`. */
+fun parseJsonToJsValue(text: String): JsValue = JsonParser(text).parse()
 
 /** A small hand-written JSON parser backing `JSON.parse`. */
 private class JsonParser(private val s: String) {
