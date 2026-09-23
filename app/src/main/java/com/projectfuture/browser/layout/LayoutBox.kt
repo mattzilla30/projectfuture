@@ -215,9 +215,11 @@ class BlockLayout(
     private var rtlContext = false
     private var textAlign = "left"
 
-    private sealed class LineFragment(val trailingSpace: Boolean)
-    private class TextFragment(val text: String, val style: TextStyle, trailingSpace: Boolean) : LineFragment(trailingSpace)
-    private class ImageFragment(val bitmap: Bitmap, val imgWidth: Float, val imgHeight: Float) : LineFragment(false)
+    private sealed class LineFragment(val trailingSpace: Boolean, val sourceElement: ElementNode?)
+    private class TextFragment(val text: String, val style: TextStyle, trailingSpace: Boolean, sourceElement: ElementNode?) :
+        LineFragment(trailingSpace, sourceElement)
+    private class ImageFragment(val bitmap: Bitmap, val imgWidth: Float, val imgHeight: Float, sourceElement: ElementNode?) :
+        LineFragment(false, sourceElement)
 
     fun layout() {
         val currentColor = parseCssColor(node.style["color"]) ?: Color.BLACK
@@ -806,11 +808,12 @@ class BlockLayout(
     private fun recurse(n: Node, currentLinkHref: String?) {
         when (n) {
             is TextNode -> {
-                val style = textStyleForElement(n.parent ?: node, currentLinkHref)
+                val owner = n.parent ?: node
+                val style = textStyleForElement(owner, currentLinkHref)
                 for (word in n.text.split(Regex("\\s+")).filter { it.isNotEmpty() }) {
                     val tokens = tokenizeForLineBreaking(word)
                     for ((idx, token) in tokens.withIndex()) {
-                        addWord(token, style, trailingSpace = idx == tokens.size - 1)
+                        addWord(token, style, trailingSpace = idx == tokens.size - 1, sourceElement = owner)
                     }
                 }
             }
@@ -909,8 +912,8 @@ class BlockLayout(
         return leftInset.coerceAtLeast(0f) to rightInset.coerceAtLeast(0f)
     }
 
-    private fun addWord(word: String, style: TextStyle, trailingSpace: Boolean = true) {
-        addFragment(TextFragment(word, style, trailingSpace), FontCache.paintFor(style).measureText(word))
+    private fun addWord(word: String, style: TextStyle, trailingSpace: Boolean = true, sourceElement: ElementNode? = null) {
+        addFragment(TextFragment(word, style, trailingSpace, sourceElement), FontCache.paintFor(style).measureText(word))
     }
 
     /**
@@ -933,7 +936,7 @@ class BlockLayout(
             cssHeight != null -> (intrinsicW * (cssHeight / intrinsicH)) to cssHeight
             else -> intrinsicW to intrinsicH
         }
-        addFragment(ImageFragment(bitmap, imgW, imgH), imgW)
+        addFragment(ImageFragment(bitmap, imgW, imgH, node), imgW)
     }
 
     private fun addFragment(fragment: LineFragment, fragmentWidth: Float) {
@@ -1013,13 +1016,19 @@ class BlockLayout(
                             right = fragX + widths[i],
                             boxTop = y + baseline + fm.ascent,
                             boxBottom = y + baseline + fm.descent,
-                            fixed = fixedContext
+                            fixed = fixedContext,
+                            sourceElement = f.sourceElement
                         )
                     )
                 }
                 is ImageFragment -> {
                     val imgBottom = y + baseline
-                    inlineDisplay.add(DrawImage(fragX, imgBottom - f.imgHeight, fragX + widths[i], imgBottom, f.bitmap, fixed = fixedContext))
+                    inlineDisplay.add(
+                        DrawImage(
+                            fragX, imgBottom - f.imgHeight, fragX + widths[i], imgBottom, f.bitmap,
+                            fixed = fixedContext, sourceElement = f.sourceElement
+                        )
+                    )
                 }
             }
             runningX += widths[i]
@@ -1037,12 +1046,12 @@ class BlockLayout(
         val borderBoxBottom = y + height + paddingBottom + borderBottom
 
         parseCssColor(node.style["background-color"])?.let { bg ->
-            cmds.add(DrawRect(borderBoxLeft, borderBoxTop, borderBoxRight, borderBoxBottom, bg, fixed = fixedContext))
+            cmds.add(DrawRect(borderBoxLeft, borderBoxTop, borderBoxRight, borderBoxBottom, bg, fixed = fixedContext, sourceElement = node))
         }
-        if (borderTop > 0f) cmds.add(DrawRect(borderBoxLeft, borderBoxTop, borderBoxRight, borderBoxTop + borderTop, borderColorTop, fixed = fixedContext))
-        if (borderBottom > 0f) cmds.add(DrawRect(borderBoxLeft, borderBoxBottom - borderBottom, borderBoxRight, borderBoxBottom, borderColorBottom, fixed = fixedContext))
-        if (borderLeft > 0f) cmds.add(DrawRect(borderBoxLeft, borderBoxTop, borderBoxLeft + borderLeft, borderBoxBottom, borderColorLeft, fixed = fixedContext))
-        if (borderRight > 0f) cmds.add(DrawRect(borderBoxRight - borderRight, borderBoxTop, borderBoxRight, borderBoxBottom, borderColorRight, fixed = fixedContext))
+        if (borderTop > 0f) cmds.add(DrawRect(borderBoxLeft, borderBoxTop, borderBoxRight, borderBoxTop + borderTop, borderColorTop, fixed = fixedContext, sourceElement = node))
+        if (borderBottom > 0f) cmds.add(DrawRect(borderBoxLeft, borderBoxBottom - borderBottom, borderBoxRight, borderBoxBottom, borderColorBottom, fixed = fixedContext, sourceElement = node))
+        if (borderLeft > 0f) cmds.add(DrawRect(borderBoxLeft, borderBoxTop, borderBoxLeft + borderLeft, borderBoxBottom, borderColorLeft, fixed = fixedContext, sourceElement = node))
+        if (borderRight > 0f) cmds.add(DrawRect(borderBoxRight - borderRight, borderBoxTop, borderBoxRight, borderBoxBottom, borderColorRight, fixed = fixedContext, sourceElement = node))
 
         if (mode == LayoutMode.BLOCK || mode == LayoutMode.FLEX || mode == LayoutMode.GRID || mode == LayoutMode.TABLE) {
             for (c in normalChildren) c.paint(cmds)

@@ -31,6 +31,7 @@ class MainActivity : AppCompatActivity() {
             if (tab.onViewportSizeChanged(width, height)) refreshView()
         }
         binding.browserView.onLinkTapped = { href -> tab.followLink(href) }
+        binding.browserView.onElementTapped = { element -> tab.dispatchClick(element) }
 
         binding.buttonBack.setOnClickListener { tab.goBack() }
         binding.buttonForward.setOnClickListener { tab.goForward() }
@@ -81,6 +82,7 @@ class MainActivity : AppCompatActivity() {
                 refreshView()
                 updateNavButtons()
             }
+            is TabState.Updated -> refreshView()
             is TabState.Error -> {
                 binding.progressBar.visibility = View.GONE
                 Toast.makeText(

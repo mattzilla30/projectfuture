@@ -16,20 +16,23 @@ import com.projectfuture.browser.js.JsObject
 import com.projectfuture.browser.js.JsString
 import com.projectfuture.browser.js.JsUndefined
 import com.projectfuture.browser.js.JsValue
+import com.projectfuture.browser.js.Lexer
 import com.projectfuture.browser.js.NativeFunction
+import com.projectfuture.browser.js.Parser
 import com.projectfuture.browser.js.toJsString
 
 /**
- * Bridges the JS interpreter to this engine's own DOM (ElementNode tree) -
- * enough for scripts that read/generate page content on load to work.
- * Deliberately narrow for this first pass, documented here rather than
- * pretending otherwise:
- * - No event listeners wired to real user input yet: `addEventListener`
- *   is accepted and stored per element, but nothing ever fires a 'click'
- *   handler from a screen tap - that needs BrowserView's tap handling and
- *   the display list to carry a source-element reference, a separate,
- *   larger change left as follow-up. Only `DOMContentLoaded` actually
- *   fires, synchronously right after all `<script>` tags finish running.
+ * Bridges the JS interpreter to this engine's own DOM (ElementNode tree).
+ * Deliberately narrow, documented here rather than pretending otherwise:
+ * - Click dispatch ([dispatchClick]) is real: Tab calls it when
+ *   BrowserView hit-tests a tap to a source element, and it bubbles
+ *   through `addEventListener('click', ...)` listeners AND inline
+ *   `onclick="..."` attributes up the ancestor chain (real DOM bubbling,
+ *   with no way to `stopPropagation()` since that isn't modeled). No
+ *   other event types are dispatched from real input yet (no keyboard,
+ *   no `input`/`change`/`submit`), and `DOMContentLoaded` is the only
+ *   thing that fires on its own, synchronously right after all
+ *   `<script>` tags finish running on page load.
  * - No `setTimeout`/`setInterval`/`fetch`/`XMLHttpRequest`/`alert`-as-UI -
  *   `window.alert` just logs, since there's no dialog plumbing yet, and
  *   there's no task queue for deferred/async work at all.
@@ -44,6 +47,32 @@ class DomBridge(private val root: ElementNode) {
     private val domContentLoadedListeners = ArrayList<JsFunction>()
 
     fun wrap(node: ElementNode): DomElement = wrappers.getOrPut(node) { DomElement(node, this) }
+
+    /**
+     * Bubbles a click from [startNode] up through every ancestor
+     * (inclusive), running each one's inline `onclick="..."` attribute (if
+     * any) and any `addEventListener('click', ...)` listeners. Returns
+     * true if anything actually ran, so the caller knows whether a
+     * re-style/re-layout is worth doing.
+     */
+    fun dispatchClick(startNode: ElementNode, interpreter: Interpreter): Boolean {
+        var current: ElementNode? = startNode
+        var handled = false
+        while (current != null) {
+            val onclickAttr = current.attr("onclick")
+            if (!onclickAttr.isNullOrBlank()) {
+                try {
+                    interpreter.run(Parser(Lexer(onclickAttr).tokenize()).parseProgram())
+                    handled = true
+                } catch (_: Exception) {
+                    // A broken inline handler shouldn't block bubbling to ancestors.
+                }
+            }
+            if (wrappers[current]?.dispatchEvent("click", interpreter) == true) handled = true
+            current = current.parent
+        }
+        return handled
+    }
 
     fun install(env: Environment) {
         val document = JsObject()
@@ -101,6 +130,13 @@ class DomBridge(private val root: ElementNode) {
 
 class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObject() {
     private val listeners = HashMap<String, MutableList<JsFunction>>()
+
+    /** Invokes every listener registered for [type] (see DomBridge.dispatchClick), `this`-bound to this element. */
+    fun dispatchEvent(type: String, interpreter: Interpreter): Boolean {
+        val fns = listeners[type] ?: return false
+        for (fn in fns.toList()) fn.call(interpreter, this, emptyList())
+        return fns.isNotEmpty()
+    }
 
     override fun get(name: String): JsValue = when (name) {
         "tagName" -> JsString(node.tag.uppercase())

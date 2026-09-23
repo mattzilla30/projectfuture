@@ -29,6 +29,8 @@ import java.util.concurrent.Executors
 sealed class TabState {
     data class Loading(val url: Url) : TabState()
     data class Loaded(val url: Url, val title: String?) : TabState()
+    /** DOM was mutated by a click handler after load (not a navigation) - just repaint, don't touch scroll/address bar. */
+    data class Updated(val url: Url) : TabState()
     data class Error(val url: Url, val message: String) : TabState()
 }
 
@@ -58,6 +60,9 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
     private var viewportWidth: Float = 0f
     private var viewportHeight: Float = 0f
     private var currentImages: Map<ElementNode, Bitmap> = emptyMap()
+    private var currentInterpreter: Interpreter? = null
+    private var currentDomBridge: DomBridge? = null
+    private var currentAuthorRules: List<CssRule> = emptyList()
 
     fun canGoBack() = historyIndex > 0
     fun canGoForward() = historyIndex in 0 until (history.size - 1)
@@ -87,6 +92,31 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         load(base.resolve(href), HistoryAction.PUSH)
     }
 
+    /**
+     * Called by MainActivity when BrowserView hit-tests a tap to a source
+     * element. Bubbles the click through DomBridge; if anything actually
+     * handled it (an inline onclick or an addEventListener listener ran),
+     * re-styles and re-lays-out since the handler may have mutated the DOM,
+     * then reports TabState.Updated rather than Loaded so the UI just
+     * repaints without resetting scroll or the address bar.
+     */
+    fun dispatchClick(element: ElementNode) {
+        val interpreter = currentInterpreter ?: return
+        val bridge = currentDomBridge ?: return
+        val doc = currentDoc ?: return
+        val url = currentUrl ?: return
+        val handled = try {
+            bridge.dispatchClick(element, interpreter)
+        } catch (_: Exception) {
+            false
+        }
+        if (handled) {
+            computeStyles(doc, currentAuthorRules)
+            relayout()
+            onStateChanged(TabState.Updated(url))
+        }
+    }
+
     /** Called by the view when its size changes; re-runs layout without re-fetching. */
     fun onViewportSizeChanged(widthPx: Float, heightPx: Float): Boolean {
         if (widthPx <= 0f || heightPx <= 0f || (widthPx == viewportWidth && heightPx == viewportHeight)) return false
@@ -106,7 +136,8 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             try {
                 val response = url.fetch()
                 val root = HtmlParser(response.body).parse()
-                runScripts(root, response.url) // may mutate the DOM before CSS/images/fonts are collected below
+                // Scripts may mutate the DOM, so this runs before CSS/images/fonts are collected below.
+                val (interpreter, bridge) = runScripts(root, response.url)
                 val authorCss = collectAuthorCss(root, response.url, mediaViewportWidth)
                 computeStyles(root, authorCss.rules)
                 val title = extractTitle(root)
@@ -117,6 +148,9 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                     currentDoc = root
                     currentImages = images
                     customFonts = fonts
+                    currentInterpreter = interpreter
+                    currentDomBridge = bridge
+                    currentAuthorRules = authorCss.rules
                     when (action) {
                         HistoryAction.PUSH -> {
                             while (history.size > historyIndex + 1) history.removeAt(history.size - 1)
@@ -198,7 +232,8 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
      * class doc for what the script<->DOM/window bridge does and doesn't
      * cover yet (no real event dispatch from taps, no setTimeout/fetch).
      */
-    private fun runScripts(root: ElementNode, baseUrl: Url) {
+    /** Returns the Interpreter/DomBridge pair so Tab can keep them alive for later click dispatch (see dispatchClick). */
+    private fun runScripts(root: ElementNode, baseUrl: Url): Pair<Interpreter, DomBridge> {
         val interpreter = Interpreter()
         val bridge = DomBridge(root)
         bridge.install(interpreter.globalEnv)
@@ -222,6 +257,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         }
 
         bridge.fireDomContentLoaded(interpreter)
+        return interpreter to bridge
     }
 
     private class AuthorCss(val rules: List<CssRule>, val fontFaces: List<Pair<FontFaceRule, Url>>)

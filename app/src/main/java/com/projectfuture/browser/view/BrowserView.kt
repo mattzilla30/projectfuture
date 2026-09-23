@@ -8,6 +8,7 @@ import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.View
 import android.graphics.RectF
+import com.projectfuture.browser.html.ElementNode
 import com.projectfuture.browser.layout.DisplayCommand
 import com.projectfuture.browser.layout.DrawImage
 import com.projectfuture.browser.layout.DrawRect
@@ -30,6 +31,7 @@ class BrowserView @JvmOverloads constructor(
 ) : View(context, attrs) {
 
     var onLinkTapped: ((String) -> Unit)? = null
+    var onElementTapped: ((ElementNode) -> Unit)? = null
     var onSizeAvailable: ((Float, Float) -> Unit)? = null
 
     private var normalCommands: List<DisplayCommand> = emptyList()
@@ -50,18 +52,24 @@ class BrowserView @JvmOverloads constructor(
         }
 
         override fun onSingleTapUp(e: MotionEvent): Boolean {
-            val fixedHit = fixedCommands.asSequence()
-                .filterIsInstance<DrawText>()
-                .firstOrNull { it.style.linkHref != null && e.x in it.left..it.right && e.y in it.top..it.bottom }
-            if (fixedHit != null) {
-                fixedHit.style.linkHref?.let { onLinkTapped?.invoke(it) }
-                return true
-            }
+            // lastOrNull, not firstOrNull: commands are in paint order (back to front), so the
+            // last one under the tap is the topmost one visually and should win the hit test.
+            val fixedHit = fixedCommands.lastOrNull { e.x in it.left..it.right && e.y in it.top..it.bottom }
+            if (fixedHit != null) return dispatchHit(fixedHit)
+
             val py = e.y + scrollYPx
-            val hit = normalCommands.asSequence()
-                .filterIsInstance<DrawText>()
-                .firstOrNull { it.style.linkHref != null && e.x in it.left..it.right && py in it.top..it.bottom }
-            hit?.style?.linkHref?.let { onLinkTapped?.invoke(it) }
+            val hit = normalCommands.lastOrNull { e.x in it.left..it.right && py in it.top..it.bottom }
+            if (hit != null) return dispatchHit(hit)
+            return true
+        }
+
+        private fun dispatchHit(cmd: DisplayCommand): Boolean {
+            val linkHref = (cmd as? DrawText)?.style?.linkHref
+            if (linkHref != null) {
+                onLinkTapped?.invoke(linkHref)
+            } else {
+                cmd.sourceElement?.let { onElementTapped?.invoke(it) }
+            }
             return true
         }
     })
