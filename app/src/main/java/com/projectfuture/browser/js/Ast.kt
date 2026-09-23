@@ -10,7 +10,7 @@ object UndefinedLit : Expr()
 object ThisExpr : Expr()
 data class Identifier(val name: String) : Expr()
 data class ArrayLit(val elements: List<Expr>) : Expr()
-data class ObjectLit(val properties: List<Pair<Expr, Expr>>) : Expr() // key expr (StringLit or Identifier-as-name), value expr
+data class ObjectLit(val properties: List<Pair<Expr?, Expr>>) : Expr() // key expr (StringLit); null key = `...expr` spread
 data class TemplateLit(val quasis: List<String>, val expressions: List<Expr>) : Expr()
 data class RegexLit(val pattern: String, val flags: String) : Expr()
 data class Unary(val op: String, val argument: Expr) : Expr()
@@ -22,19 +22,38 @@ data class Conditional(val test: Expr, val consequent: Expr, val alternate: Expr
 data class Call(val callee: Expr, val args: List<Expr>) : Expr()
 data class New(val callee: Expr, val args: List<Expr>) : Expr()
 data class Member(val obj: Expr, val property: Expr, val computed: Boolean) : Expr()
-data class FunctionExpr(val name: String?, val params: List<String>, val body: List<Stmt>, val isArrow: Boolean) : Expr()
+data class FunctionExpr(val name: String?, val params: List<Param>, val body: List<Stmt>, val isArrow: Boolean) : Expr()
+data class SpreadElement(val argument: Expr) : Expr() // `...expr` inside an array/object literal or a call's argument list
+
+/**
+ * A binding target: a plain name, or an array/object destructuring shape.
+ * [default] is the value substituted when the thing being bound is
+ * `undefined` - used for both destructuring defaults (`{a = 1} = obj`) and
+ * default parameters (`function f(a = 1)`), which share this same type.
+ * Array-pattern rest (`[a, ...rest]`) and object-pattern rest
+ * (`{a, ...rest}`) both bind a plain name rather than a nested pattern - a
+ * spec-accurate restriction for object rest, and a deliberate
+ * simplification for array rest (real JS allows `[a, ...[b, c]]`).
+ */
+sealed class Pattern { abstract val default: Expr? }
+data class IdentifierPattern(val name: String, override val default: Expr? = null) : Pattern()
+data class ArrayPattern(val elements: List<Pattern?>, val restName: String? = null, override val default: Expr? = null) : Pattern()
+data class ObjectPattern(val props: List<Pair<String, Pattern>>, val restName: String? = null, override val default: Expr? = null) : Pattern()
+
+/** A single function parameter; [rest] marks a trailing `...name` that collects remaining arguments into an array. */
+data class Param(val pattern: Pattern, val rest: Boolean = false)
 
 sealed class Stmt
 
 data class ExprStmt(val expr: Expr) : Stmt()
-data class VarDecl(val kind: String, val declarations: List<Pair<String, Expr?>>) : Stmt()
+data class VarDecl(val kind: String, val declarations: List<Pair<Pattern, Expr?>>) : Stmt()
 data class Block(val body: List<Stmt>) : Stmt()
 data class If(val test: Expr, val consequent: Stmt, val alternate: Stmt?) : Stmt()
 data class While(val test: Expr, val body: Stmt) : Stmt()
 data class DoWhile(val body: Stmt, val test: Expr) : Stmt()
 data class For(val init: Stmt?, val test: Expr?, val update: Expr?, val body: Stmt) : Stmt()
-data class ForIn(val declKind: String?, val varName: String, val obj: Expr, val body: Stmt, val isOf: Boolean) : Stmt()
-data class FunctionDecl(val name: String, val params: List<String>, val body: List<Stmt>) : Stmt()
+data class ForIn(val declKind: String?, val pattern: Pattern, val obj: Expr, val body: Stmt, val isOf: Boolean) : Stmt()
+data class FunctionDecl(val name: String, val params: List<Param>, val body: List<Stmt>) : Stmt()
 data class Return(val argument: Expr?) : Stmt()
 object BreakStmt : Stmt()
 object ContinueStmt : Stmt()

@@ -16,6 +16,9 @@ class JsMap : JsObject() {
         map[key] = value
     }
 
+    /** Backs `for (const [k, v] of someMap)` - see Interpreter.execForIn. */
+    fun entryPairs(): List<JsValue> = map.entries.map { JsArray(mutableListOf(it.key, it.value)) }
+
     override fun get(name: String): JsValue = when (name) {
         "size" -> JsNumber(map.size.toDouble())
         "set" -> NativeFunction("set", 2) { _, thisArg, args ->
@@ -46,6 +49,9 @@ class JsSet : JsObject() {
     fun addValue(v: JsValue) {
         values.add(v)
     }
+
+    /** Backs `for (const v of someSet)` - see Interpreter.execForIn. */
+    fun valuesList(): List<JsValue> = values.toList()
 
     override fun get(name: String): JsValue = when (name) {
         "size" -> JsNumber(values.size.toDouble())

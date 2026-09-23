@@ -3,11 +3,12 @@ package com.projectfuture.browser.js
 /**
  * A recursive-descent parser for an ES5-ish subset plus arrow functions,
  * template literals, `let`/`const`, regex literals (see Lexer.kt's doc for
- * the regex-vs-division heuristic), bitwise operators, and switch
- * statements. Not implemented: classes, destructuring, spread/rest,
- * generators/async, default parameters, labeled statements. Each of those
- * is a real gap for modern JS, chosen to bound scope - see Interpreter.kt's
- * class doc for the fuller picture of what this engine covers.
+ * the regex-vs-division heuristic), bitwise operators, switch statements,
+ * array/object destructuring (in `var`/`let`/`const`, `for-of`, and
+ * function parameters), spread/rest, and default parameters. Not
+ * implemented: classes, generators/async, labeled statements. See
+ * Interpreter.kt's class doc for the fuller picture of what this engine
+ * covers.
  */
 class Parser(private val tokens: List<Token>) {
     private var pos = 0
@@ -83,16 +84,74 @@ class Parser(private val tokens: List<Token>) {
 
     private fun parseVarDecl(): VarDecl {
         val kind = advance().text
-        val decls = ArrayList<Pair<String, Expr?>>()
+        val decls = ArrayList<Pair<Pattern, Expr?>>()
         while (true) {
-            val name = advance().text
+            val pattern = parsePattern()
             var init: Expr? = null
             if (matchPunct("=")) init = parseAssignment()
-            decls.add(name to init)
+            decls.add(pattern to init)
             if (!matchPunct(",")) break
         }
         consumeSemicolon()
         return VarDecl(kind, decls)
+    }
+
+    /**
+     * A binding target with no trailing `= default` consumed here - callers
+     * that allow a default at this position (array/object pattern slots,
+     * function params) use [parsePatternWithDefault] instead. Keeping the
+     * two separate avoids `let x = 5;` misparsing its own initializer as a
+     * pattern-level default.
+     */
+    private fun parsePattern(): Pattern {
+        if (checkPunct("[")) return parseArrayPattern()
+        if (checkPunct("{")) return parseObjectPattern()
+        return IdentifierPattern(advance().text)
+    }
+
+    private fun parsePatternWithDefault(): Pattern {
+        val base = parsePattern()
+        if (!matchPunct("=")) return base
+        val def = parseAssignment()
+        return when (base) {
+            is IdentifierPattern -> base.copy(default = def)
+            is ArrayPattern -> base.copy(default = def)
+            is ObjectPattern -> base.copy(default = def)
+        }
+    }
+
+    private fun parseArrayPattern(): Pattern {
+        expectPunct("[")
+        val elements = ArrayList<Pattern?>()
+        var restName: String? = null
+        while (!checkPunct("]")) {
+            if (checkPunct(",")) { elements.add(null); advance(); continue }
+            if (matchPunct("...")) { restName = advance().text; break }
+            elements.add(parsePatternWithDefault())
+            if (!matchPunct(",")) break
+        }
+        expectPunct("]")
+        return ArrayPattern(elements, restName)
+    }
+
+    private fun parseObjectPattern(): Pattern {
+        expectPunct("{")
+        val props = ArrayList<Pair<String, Pattern>>()
+        var restName: String? = null
+        while (!checkPunct("}")) {
+            if (matchPunct("...")) { restName = advance().text; break }
+            val key = advance().text
+            val pattern = if (matchPunct(":")) {
+                parsePatternWithDefault()
+            } else {
+                val default = if (matchPunct("=")) parseAssignment() else null
+                IdentifierPattern(key, default)
+            }
+            props.add(key to pattern)
+            if (!matchPunct(",")) break
+        }
+        expectPunct("}")
+        return ObjectPattern(props, restName)
     }
 
     private fun parseIf(): Stmt {
@@ -130,41 +189,28 @@ class Parser(private val tokens: List<Token>) {
 
         var declKind: String? = null
         var initStmt: Stmt? = null
-        var singleVarName: String? = null
 
         if (!checkPunct(";")) {
             if (checkKeyword("var") || checkKeyword("let") || checkKeyword("const")) {
                 declKind = peek().text
                 advance()
-                singleVarName = advance().text
-                if (matchPunct("=")) {
-                    val init = parseAssignment()
-                    if (checkKeyword("in") || checkKeyword("of")) {
-                        return finishForInOf(declKind, singleVarName!!, init)
-                    }
-                    val decls = arrayListOf(singleVarName to init as Expr?)
-                    while (matchPunct(",")) {
-                        val n = advance().text
-                        val i = if (matchPunct("=")) parseAssignment() else null
-                        decls.add(n to i)
-                    }
-                    initStmt = VarDecl(declKind, decls)
-                } else if (checkKeyword("in") || checkKeyword("of")) {
-                    return finishForInOf(declKind, singleVarName!!, null)
-                } else {
-                    val decls = arrayListOf(singleVarName to null as Expr?)
-                    while (matchPunct(",")) {
-                        val n = advance().text
-                        val i = if (matchPunct("=")) parseAssignment() else null
-                        decls.add(n to i)
-                    }
-                    initStmt = VarDecl(declKind, decls)
+                val firstPattern = parsePattern()
+                if (checkKeyword("in") || checkKeyword("of")) {
+                    return finishForInOf(declKind, firstPattern)
                 }
+                val init = if (matchPunct("=")) parseAssignment() else null
+                val decls = arrayListOf(firstPattern to init)
+                while (matchPunct(",")) {
+                    val p = parsePattern()
+                    val i = if (matchPunct("=")) parseAssignment() else null
+                    decls.add(p to i)
+                }
+                initStmt = VarDecl(declKind, decls)
             } else {
                 val expr = parseExpression()
                 if (checkKeyword("in") || checkKeyword("of")) {
                     val name = (expr as? Identifier)?.name ?: throw jsError("Parse error: invalid for-in/of target")
-                    return finishForInOf(null, name, null)
+                    return finishForInOf(null, IdentifierPattern(name))
                 }
                 initStmt = ExprStmt(expr)
             }
@@ -177,12 +223,12 @@ class Parser(private val tokens: List<Token>) {
         return For(initStmt, test, update, parseStatement())
     }
 
-    private fun finishForInOf(declKind: String?, varName: String, ignoredInit: Expr?): Stmt {
+    private fun finishForInOf(declKind: String?, pattern: Pattern): Stmt {
         val isOf = checkKeyword("of")
         advance() // 'in' or 'of'
         val obj = parseExpression()
         expectPunct(")")
-        return ForIn(declKind, varName, obj, parseStatement(), isOf)
+        return ForIn(declKind, pattern, obj, parseStatement(), isOf)
     }
 
     private fun parseFunctionDecl(): Stmt {
@@ -193,12 +239,16 @@ class Parser(private val tokens: List<Token>) {
         return FunctionDecl(name, params, body)
     }
 
-    private fun parseParamList(): List<String> {
+    private fun parseParamList(): List<Param> {
         expectPunct("(")
-        val params = ArrayList<String>()
+        val params = ArrayList<Param>()
         if (!checkPunct(")")) {
             while (true) {
-                params.add(advance().text)
+                if (matchPunct("...")) {
+                    params.add(Param(IdentifierPattern(advance().text), rest = true))
+                    break // a rest parameter must be last
+                }
+                params.add(Param(parsePatternWithDefault()))
                 if (!matchPunct(",")) break
             }
         }
@@ -284,34 +334,43 @@ class Parser(private val tokens: List<Token>) {
         if (check(TokenType.IDENT) && peek(1).type == TokenType.PUNCT && peek(1).text == "=>") {
             val param = advance().text
             advance() // =>
-            return finishArrow(listOf(param))
+            return finishArrow(listOf(Param(IdentifierPattern(param))))
         }
         if (checkPunct("(")) {
             val saved = pos
-            advance()
-            val params = ArrayList<String>()
-            var valid = true
-            if (!checkPunct(")")) {
-                while (true) {
-                    if (!check(TokenType.IDENT)) { valid = false; break }
-                    params.add(advance().text)
-                    if (matchPunct(",")) continue
-                    break
-                }
-            }
-            if (valid && checkPunct(")")) {
+            // A speculative, possibly-destructuring-pattern parse of "(...)" - if it turns out
+            // not to be followed by "=>", this was some other parenthesized expression (e.g. a
+            // destructuring assignment `([a,b] = arr)`), so any parse error here just means
+            // "not an arrow function", not a real syntax error - caught and backtracked below.
+            try {
                 advance()
-                if (checkPunct("=>")) {
-                    advance()
-                    return finishArrow(params)
+                val params = ArrayList<Param>()
+                if (!checkPunct(")")) {
+                    while (true) {
+                        if (matchPunct("...")) {
+                            params.add(Param(IdentifierPattern(advance().text), rest = true))
+                            break
+                        }
+                        params.add(Param(parsePatternWithDefault()))
+                        if (!matchPunct(",")) break
+                    }
                 }
+                if (checkPunct(")")) {
+                    advance()
+                    if (checkPunct("=>")) {
+                        advance()
+                        return finishArrow(params)
+                    }
+                }
+            } catch (_: Exception) {
+                // Fall through to backtrack - wasn't an arrow function parameter list after all.
             }
             pos = saved
         }
         return null
     }
 
-    private fun finishArrow(params: List<String>): Expr {
+    private fun finishArrow(params: List<Param>): Expr {
         val body = if (checkPunct("{")) parseBlockStatements() else listOf(Return(parseAssignment()))
         return FunctionExpr(null, params, body, isArrow = true)
     }
@@ -490,7 +549,7 @@ class Parser(private val tokens: List<Token>) {
         val args = ArrayList<Expr>()
         if (!checkPunct(")")) {
             while (true) {
-                args.add(parseAssignment())
+                args.add(if (matchPunct("...")) SpreadElement(parseAssignment()) else parseAssignment())
                 if (!matchPunct(",")) break
             }
         }
@@ -549,7 +608,7 @@ class Parser(private val tokens: List<Token>) {
         expectPunct("[")
         val elements = ArrayList<Expr>()
         while (!checkPunct("]")) {
-            elements.add(parseAssignment())
+            elements.add(if (matchPunct("...")) SpreadElement(parseAssignment()) else parseAssignment())
             if (!matchPunct(",")) break
         }
         expectPunct("]")
@@ -558,12 +617,22 @@ class Parser(private val tokens: List<Token>) {
 
     private fun parseObjectLit(): Expr {
         expectPunct("{")
-        val props = ArrayList<Pair<Expr, Expr>>()
+        val props = ArrayList<Pair<Expr?, Expr>>()
         while (!checkPunct("}")) {
+            if (matchPunct("...")) {
+                props.add(null to parseAssignment())
+                if (!matchPunct(",")) break
+                continue
+            }
             val keyTok = advance()
-            val key: Expr = if (keyTok.type == TokenType.STRING) StringLit(keyTok.text) else StringLit(keyTok.text)
+            val key: Expr = StringLit(keyTok.text)
             if (matchPunct(":")) {
                 props.add(key to parseAssignment())
+            } else if (checkPunct("(")) {
+                // shorthand method syntax: { foo(a, b) { ... } } -> { foo: function(a, b) { ... } }
+                val params = parseParamList()
+                val body = parseBlockStatements()
+                props.add(key to FunctionExpr(keyTok.text, params, body, isArrow = false))
             } else {
                 // shorthand { x } -> { x: x }
                 props.add(key to Identifier(keyTok.text))

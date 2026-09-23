@@ -79,9 +79,9 @@ class Interpreter {
     fun execStmt(stmt: Stmt, env: Environment) {
         when (stmt) {
             is ExprStmt -> evalExpr(stmt.expr, env)
-            is VarDecl -> for ((name, initExpr) in stmt.declarations) {
+            is VarDecl -> for ((pattern, initExpr) in stmt.declarations) {
                 val value = initExpr?.let { evalExpr(it, env) } ?: JsUndefined
-                env.declare(name, value, isConst = stmt.kind == "const")
+                bindPattern(pattern, value, env, stmt.kind)
             }
             is Block -> execBlock(stmt.body, Environment(env))
             is If -> if (isTruthy(evalExpr(stmt.test, env))) execStmt(stmt.consequent, env) else stmt.alternate?.let { execStmt(it, env) }
@@ -165,6 +165,8 @@ class Interpreter {
             when (obj) {
                 is JsArray -> obj.elements.toList()
                 is JsString -> obj.value.map { JsString(it.toString()) }
+                is JsMap -> obj.entryPairs()
+                is JsSet -> obj.valuesList()
                 else -> emptyList()
             }
         } else {
@@ -172,7 +174,7 @@ class Interpreter {
         }
         for (v in iterationValues) {
             val loopEnv = Environment(env)
-            loopEnv.declare(stmt.varName, v)
+            bindPattern(stmt.pattern, v, loopEnv, stmt.declKind ?: "let")
             try {
                 execStmt(stmt.body, loopEnv)
             } catch (b: BreakException) {
@@ -206,15 +208,21 @@ class Interpreter {
         UndefinedLit -> JsUndefined
         ThisExpr -> if (env.has("this")) env.get("this") else JsUndefined
         is Identifier -> env.get(expr.name)
-        is ArrayLit -> JsArray(expr.elements.map { evalExpr(it, env) }.toMutableList())
+        is ArrayLit -> JsArray(evalArgs(expr.elements, env).toMutableList())
         is ObjectLit -> {
             val obj = JsObject()
             for ((k, v) in expr.properties) {
-                val key = if (k is StringLit) k.value else toJsString(evalExpr(k, env))
-                obj.set(key, evalExpr(v, env))
+                if (k == null) {
+                    // `...expr` spread: merge the spread object's own properties in.
+                    (evalExpr(v, env) as? JsObject)?.let { spread -> for (key in spread.ownKeys()) obj.set(key, spread.get(key)) }
+                } else {
+                    val key = if (k is StringLit) k.value else toJsString(evalExpr(k, env))
+                    obj.set(key, evalExpr(v, env))
+                }
             }
             obj
         }
+        is SpreadElement -> evalExpr(expr.argument, env) // only reached if spread appears somewhere evalArgs doesn't pre-expand it
         is TemplateLit -> {
             val sb = StringBuilder()
             for (i in expr.quasis.indices) {
@@ -259,25 +267,42 @@ class Interpreter {
         if (obj is JsObject) obj.set(key, value)
     }
 
+    /** Evaluates a list of expressions that may contain `...expr` spreads, flattening each spread array/string in. */
+    private fun evalArgs(exprs: List<Expr>, env: Environment): List<JsValue> {
+        val result = ArrayList<JsValue>()
+        for (e in exprs) {
+            if (e is SpreadElement) {
+                when (val v = evalExpr(e.argument, env)) {
+                    is JsArray -> result.addAll(v.elements)
+                    is JsString -> v.value.forEach { result.add(JsString(it.toString())) }
+                    else -> {}
+                }
+            } else {
+                result.add(evalExpr(e, env))
+            }
+        }
+        return result
+    }
+
     private fun evalCall(expr: Call, env: Environment): JsValue {
         if (expr.callee is Member) {
             val obj = evalExpr(expr.callee.obj, env)
             val key = memberKey(expr.callee, env)
-            val args = expr.args.map { evalExpr(it, env) }
+            val args = evalArgs(expr.args, env)
             builtinMethodCall(this, obj, key, args)?.let { return it }
             val fn = getProperty(obj, key)
             if (fn !is JsFunction) throw jsError("$key is not a function")
             return fn.call(this, obj, args)
         }
         val callee = evalExpr(expr.callee, env)
-        val args = expr.args.map { evalExpr(it, env) }
+        val args = evalArgs(expr.args, env)
         if (callee !is JsFunction) throw jsError("value is not a function")
         return callee.call(this, JsUndefined, args)
     }
 
     private fun evalNew(expr: New, env: Environment): JsValue {
         val callee = evalExpr(expr.callee, env)
-        val args = expr.args.map { evalExpr(it, env) }
+        val args = evalArgs(expr.args, env)
         if (callee !is JsFunction) throw jsError("not a constructor")
         val instance = JsObject()
         val result = callee.call(this, instance, args)
@@ -288,14 +313,64 @@ class Interpreter {
         val callEnv = Environment(closure.closureEnv)
         val effectiveThis = if (closure.isArrow) (closure.capturedThis ?: JsUndefined) else thisArg
         callEnv.declare("this", effectiveThis)
-        for (i in closure.params.indices) {
-            callEnv.declare(closure.params[i], args.getOrElse(i) { JsUndefined })
-        }
+        bindParams(closure.params, args, callEnv)
         return try {
             execBlock(closure.body, callEnv)
             JsUndefined
         } catch (r: ReturnSignal) {
             r.value
+        }
+    }
+
+    private fun bindParams(params: List<Param>, args: List<JsValue>, env: Environment) {
+        var argIdx = 0
+        for (param in params) {
+            if (param.rest) {
+                val restItems = if (argIdx < args.size) ArrayList(args.subList(argIdx, args.size)) else ArrayList()
+                env.declare((param.pattern as IdentifierPattern).name, JsArray(restItems))
+            } else {
+                bindPattern(param.pattern, args.getOrElse(argIdx) { JsUndefined }, env, "let")
+                argIdx++
+            }
+        }
+    }
+
+    /**
+     * Binds a value to a pattern (a plain name, or a destructured array/
+     * object shape) by declaring into [env] - shared by `var`/`let`/`const`
+     * declarations, `for-of`/`for-in` loop targets, and function parameter
+     * binding. [pattern]'s own `default` is substituted only when the
+     * incoming value is `undefined`, matching real JS default-value
+     * semantics (an explicit `null` does NOT trigger the default).
+     */
+    private fun bindPattern(pattern: Pattern, valueIn: JsValue, env: Environment, kind: String) {
+        val value = if (valueIn == JsUndefined && pattern.default != null) evalExpr(pattern.default!!, env) else valueIn
+        when (pattern) {
+            is IdentifierPattern -> env.declare(pattern.name, value, isConst = kind == "const")
+            is ArrayPattern -> {
+                val arr = (value as? JsArray)?.elements ?: emptyList()
+                for ((i, p) in pattern.elements.withIndex()) {
+                    if (p == null) continue // elision - e.g. `[, b] = arr`
+                    bindPattern(p, arr.getOrElse(i) { JsUndefined }, env, kind)
+                }
+                pattern.restName?.let { restName ->
+                    val restItems = if (arr.size > pattern.elements.size) ArrayList(arr.subList(pattern.elements.size, arr.size)) else ArrayList()
+                    env.declare(restName, JsArray(restItems), isConst = kind == "const")
+                }
+            }
+            is ObjectPattern -> {
+                val obj = value as? JsObject
+                val used = HashSet<String>()
+                for ((key, p) in pattern.props) {
+                    used.add(key)
+                    bindPattern(p, obj?.get(key) ?: JsUndefined, env, kind)
+                }
+                pattern.restName?.let { restName ->
+                    val restObj = JsObject()
+                    obj?.ownKeys()?.forEach { k -> if (k !in used) restObj.set(k, obj.get(k)) }
+                    env.declare(restName, restObj, isConst = kind == "const")
+                }
+            }
         }
     }
 

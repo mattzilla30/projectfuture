@@ -73,7 +73,7 @@ class NativeFunction(name: String, private val arity: Int = 0, private val impl:
 
 class Closure(
     name: String,
-    val params: List<String>,
+    val params: List<Param>,
     val body: List<Stmt>,
     val closureEnv: Environment,
     val isArrow: Boolean,

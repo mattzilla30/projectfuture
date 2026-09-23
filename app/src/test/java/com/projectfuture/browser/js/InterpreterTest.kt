@@ -357,4 +357,39 @@ class InterpreterTest {
             """.trimIndent()
         )
     }
+
+    @Test fun arrayDestructuring() {
+        assertNum(3.0, "var [a, b] = [1, 2]; var result = a + b;")
+        assertNum(1.0, "var [a, , c] = [1, 2, 3]; var result = a - (c - 3);") // elision skips index 1
+        assertNum(7.0, "var [a, ...rest] = [2, 1, 2]; var result = a + rest.length + rest[0] + rest[1];") // 2 + 2 + 1 + 2
+        assertNum(9.0, "var [a = 9] = []; var result = a;") // default used only when the slot is missing/undefined
+    }
+
+    @Test fun objectDestructuring() {
+        assertNum(3.0, "var {x, y} = {x: 1, y: 2}; var result = x + y;")
+        assertNum(5.0, "var {x: renamed = 5} = {}; var result = renamed;")
+        assertNum(1.0, "var {a, ...rest} = {a: 1, b: 2, c: 3}; var result = Object.keys(rest).length - 1;")
+    }
+
+    @Test fun spreadInCallsArraysAndObjects() {
+        assertNum(6.0, "function sum(a,b,c) { return a+b+c; } var result = sum(...[1,2,3]);")
+        assertNum(4.0, "var result = [...[1,2], ...[3,4]].length;")
+        assertNum(2.0, "var result = Object.keys({...{a:1}, ...{b:2}}).length;")
+    }
+
+    @Test fun defaultAndRestParameters() {
+        assertNum(9.0, "function f(a, b = 4) { return a + b; } var result = f(5);")
+        assertNum(4.0, "function f(a, b = 4) { return a + b; } var result = f(1, 3);")
+        assertNum(6.0, "function sum(...nums) { var t = 0; for (var i=0;i<nums.length;i++) t += nums[i]; return t; } var result = sum(1,2,3);")
+    }
+
+    @Test fun destructuringInForOfAndArrowParams() {
+        assertNum(3.0, """
+            var m = new Map(); m.set('a', 1); m.set('b', 2);
+            var result = 0;
+            for (var [k, v] of m) { result += v; }
+            """.trimIndent()
+        )
+        assertNum(3.0, "var f = ({a, b}) => a + b; var result = f({a: 1, b: 2});")
+    }
 }
