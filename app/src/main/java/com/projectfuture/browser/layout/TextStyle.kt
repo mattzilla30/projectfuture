@@ -25,7 +25,7 @@ private val GENERIC_FONT_FAMILIES = setOf("sans-serif", "serif", "monospace", "c
 
 fun textStyleForElement(node: ElementNode, linkHref: String?): TextStyle {
     val style = node.style
-    val sizePx = parsePx(style["font-size"]) ?: 16f
+    val sizePx = (parsePx(style["font-size"]) ?: 16f) * textScaleFactor
     val weight = style["font-weight"] ?: "normal"
     val bold = weight == "bold" || (weight.toIntOrNull() ?: 0) >= 700
     val italic = (style["font-style"] ?: "normal").let { it == "italic" || it == "oblique" }
@@ -55,6 +55,17 @@ fun textStyleForElement(node: ElementNode, linkHref: String?): TextStyle {
  * parameter through every call site) is safe here.
  */
 var customFonts: Map<String, Typeface> = emptyMap()
+
+/**
+ * A user-controlled text-size multiplier (accessibility "text scaling" /
+ * the practical effect of pinch-to-zoom on this engine - see BrowserView's
+ * pinch handling, which adjusts this and re-lays-out on release rather
+ * than applying a live Canvas scale transform). Applied once, in
+ * [textStyleForElement], so it automatically affects line-breaking,
+ * element sizing, and everything downstream of a resolved font size -
+ * same module-level-var pattern as [customFonts] and `currentImages`.
+ */
+var textScaleFactor: Float = 1f
 
 /** Caches Paint objects by their resolved style so we're not allocating one per glyph run. */
 object FontCache {

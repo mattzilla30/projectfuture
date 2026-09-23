@@ -3,6 +3,8 @@ package com.projectfuture.browser.view
 import android.content.Context
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.ColorMatrix
+import android.graphics.ColorMatrixColorFilter
 import android.graphics.Paint
 import android.graphics.RectF
 import android.text.Editable
@@ -13,6 +15,7 @@ import android.util.TypedValue
 import android.view.Gravity
 import android.view.GestureDetector
 import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.widget.EditText
 import android.widget.FrameLayout
 import com.projectfuture.browser.html.ElementNode
@@ -56,6 +59,20 @@ class BrowserView @JvmOverloads constructor(
     var onElementTapped: ((ElementNode) -> Unit)? = null
     var onFormInput: ((ElementNode, String) -> Unit)? = null
     var onSizeAvailable: ((Float, Float) -> Unit)? = null
+
+    /**
+     * Fired once, when a pinch gesture ends, with the cumulative scale
+     * factor to apply (e.g. 1.2 for "20% bigger"). This engine maps pinch-
+     * to-zoom onto a text-size multiplier and a full re-layout rather than
+     * a live Canvas scale transform - see TextStyle.kt's textScaleFactor
+     * doc for why (mainly: the overlaid form-control EditText views would
+     * otherwise need their own independent scale/position math kept in
+     * sync with the Canvas transform on every frame, real complexity for a
+     * feature with no emulator available to verify smoothness on).
+     * Snapping only on release (not live during the gesture) is a
+     * deliberate, bounded trade-off: correct end state, no live preview.
+     */
+    var onPinchZoomEnded: ((Float) -> Unit)? = null
 
     private var normalCommands: List<DisplayCommand> = emptyList()
     private var fixedCommands: List<DisplayCommand> = emptyList()
@@ -130,8 +147,28 @@ class BrowserView @JvmOverloads constructor(
         return true
     }
 
+    private var pinchAccumulatedScale = 1f
+    private val scaleGestureDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+            pinchAccumulatedScale = 1f
+            return true
+        }
+
+        override fun onScale(detector: ScaleGestureDetector): Boolean {
+            pinchAccumulatedScale *= detector.scaleFactor
+            return true
+        }
+
+        override fun onScaleEnd(detector: ScaleGestureDetector) {
+            if (pinchAccumulatedScale != 1f) onPinchZoomEnded?.invoke(pinchAccumulatedScale)
+        }
+    })
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        gestureDetector.onTouchEvent(event)
+        scaleGestureDetector.onTouchEvent(event)
+        // A pinch (2+ fingers) shouldn't also register as a scroll/tap - GestureDetector only ever
+        // sees single-pointer semantics, so gate it on the scale detector not currently mid-gesture.
+        if (!scaleGestureDetector.isInProgress) gestureDetector.onTouchEvent(event)
         return true
     }
 
@@ -238,8 +275,17 @@ class BrowserView @JvmOverloads constructor(
         editText.setPadding(8, 4, 8, 4)
         editText.setBackgroundResource(android.R.drawable.edit_text)
         editText.setTextSize(TypedValue.COMPLEX_UNIT_PX, cmd.style.sizePx)
-        editText.setTextColor(cmd.style.color)
-        editText.setHintTextColor(Color.GRAY)
+        if (darkModeEnabled) {
+            // The page's own Canvas-painted content gets its colors inverted wholesale (see onDraw's
+            // doc); this real EditText isn't part of that layer, so it needs manually dark-aware colors.
+            editText.setBackgroundColor(Color.DKGRAY)
+            editText.setTextColor(Color.WHITE)
+            editText.setHintTextColor(Color.LTGRAY)
+        } else {
+            editText.setBackgroundResource(android.R.drawable.edit_text)
+            editText.setTextColor(cmd.style.color)
+            editText.setHintTextColor(Color.GRAY)
+        }
         editText.hint = cmd.placeholder
         editText.setText(cmd.value)
         if (cmd.controlType == FormControlType.TEXTAREA) {
@@ -263,9 +309,47 @@ class BrowserView @JvmOverloads constructor(
         return editText
     }
 
+    /**
+     * "Dark mode" here is a full-color inversion of everything this View
+     * paints (`saveLayer` with a negating `ColorMatrixColorFilter`), the
+     * same technique as Android's own accessibility "Invert colors" -
+     * not a per-element light/dark re-theming like a real browser's
+     * "force dark" heuristic (which selectively inverts backgrounds/text
+     * while leaving images alone). The trade-off: images and anything
+     * already-colorful invert too (a photo looks like a photo negative),
+     * but it's correct and simple for arbitrary pages, and overlaid
+     * EditText fields are separately re-colored in [createEditTextFor]
+     * (real Views aren't part of this Canvas layer, so they need their own
+     * dark-aware colors).
+     */
+    private var darkModeEnabled = false
+    private val invertColorMatrix = ColorMatrix(
+        floatArrayOf(
+            -1f, 0f, 0f, 0f, 255f,
+            0f, -1f, 0f, 0f, 255f,
+            0f, 0f, -1f, 0f, 255f,
+            0f, 0f, 0f, 1f, 0f
+        )
+    )
+    private val invertLayerPaint = Paint().apply { colorFilter = ColorMatrixColorFilter(invertColorMatrix) }
+
+    fun setDarkMode(enabled: Boolean) {
+        darkModeEnabled = enabled
+        invalidate()
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
+        if (darkModeEnabled) {
+            val layer = canvas.saveLayer(0f, 0f, width.toFloat(), height.toFloat(), invertLayerPaint)
+            drawPageContent(canvas)
+            canvas.restoreToCount(layer)
+        } else {
+            drawPageContent(canvas)
+        }
+    }
 
+    private fun drawPageContent(canvas: Canvas) {
         canvas.save()
         canvas.translate(0f, -scrollYPx)
         drawCommands(canvas, normalCommands, scrollYPx, scrollYPx + height)

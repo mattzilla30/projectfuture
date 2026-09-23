@@ -34,4 +34,5 @@
     <string name="menu_desktop_site">Desktop site</string>
     <string name="download_started">Downloading %1$s</string>
     <string name="download_failed">Couldn\'t start download</string>
+    <string name="menu_dark_mode">Dark mode</string>
 </resources>

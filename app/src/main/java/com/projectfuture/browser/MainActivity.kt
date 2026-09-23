@@ -44,6 +44,7 @@ class MainActivity : AppCompatActivity() {
     private val tabTitles = HashMap<Tab, String>()
     private var lastViewportWidth = 0f
     private var lastViewportHeight = 0f
+    private var darkModeEnabled = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -63,6 +64,12 @@ class MainActivity : AppCompatActivity() {
         binding.browserView.onLinkTapped = { href -> tabManager.activeTab?.followLink(href) }
         binding.browserView.onElementTapped = { element -> tabManager.activeTab?.dispatchClick(element) }
         binding.browserView.onFormInput = { element, value -> tabManager.activeTab?.dispatchInputEvent(element, value) }
+        binding.browserView.onPinchZoomEnded = { factor ->
+            tabManager.activeTab?.let { tab ->
+                tab.setTextScale(tab.textScale * factor)
+                refreshView()
+            }
+        }
 
         binding.buttonBack.setOnClickListener { tabManager.activeTab?.goBack() }
         binding.buttonForward.setOnClickListener { tabManager.activeTab?.goForward() }
@@ -325,6 +332,10 @@ class MainActivity : AppCompatActivity() {
             isChecked = tabManager.activeTab?.desktopMode == true
             isEnabled = currentUrl != null
         }
+        popup.menu.add(0, 7, 6, R.string.menu_dark_mode).apply {
+            isCheckable = true
+            isChecked = darkModeEnabled
+        }
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> {
@@ -348,6 +359,13 @@ class MainActivity : AppCompatActivity() {
                     true
                 }
                 6 -> { tabManager.activeTab?.toggleDesktopMode(); true }
+                7 -> {
+                    darkModeEnabled = !darkModeEnabled
+                    binding.browserView.setDarkMode(darkModeEnabled)
+                    binding.browserView.clearOverlayViews()
+                    refreshView()
+                    true
+                }
                 else -> false
             }
         }

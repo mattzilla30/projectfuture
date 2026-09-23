@@ -34,6 +34,7 @@ import com.projectfuture.browser.layout.DisplayCommand
 import com.projectfuture.browser.layout.DocumentLayout
 import com.projectfuture.browser.layout.FontDecoder
 import com.projectfuture.browser.layout.customFonts
+import com.projectfuture.browser.layout.textScaleFactor
 import com.projectfuture.browser.net.HttpResponse
 import com.projectfuture.browser.net.Url
 import com.projectfuture.browser.net.corsAllows
@@ -103,6 +104,20 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
 
     /** Fired for `<a download href="...">` taps; MainActivity hands the URL off to Android's own DownloadManager (a platform primitive, not "browser engine" logic). */
     var onDownloadRequested: ((url: String, suggestedFilename: String?) -> Unit)? = null
+
+    /**
+     * A per-tab text-size multiplier - see [textScaleFactor]'s doc for why
+     * this is the practical stand-in for "pinch-to-zoom" on this engine.
+     * Applying it re-lays-out immediately (cheap enough on a single-page
+     * document; the module-level var is only read during layout).
+     */
+    var textScale: Float = 1f
+        private set
+
+    fun setTextScale(scale: Float) {
+        textScale = scale.coerceIn(0.5f, 2.5f)
+        relayout()
+    }
 
     fun canGoBack() = historyIndex > 0
     fun canGoForward() = historyIndex in 0 until (history.size - 1)
@@ -366,6 +381,11 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
     private fun relayout() {
         val doc = currentDoc ?: return
         if (viewportWidth <= 0f || viewportHeight <= 0f) return
+        // textScaleFactor is a module-level var (see its doc), so it's set from this tab's own
+        // state on every relayout - not just when setTextScale() is called - since a different
+        // tab's relayout (e.g. from a rotation) could otherwise run against a stale value another
+        // tab left behind.
+        textScaleFactor = textScale
         val docLayout = DocumentLayout(doc)
         displayList = docLayout.layout(viewportWidth, viewportHeight, currentImages)
         contentHeight = docLayout.height
