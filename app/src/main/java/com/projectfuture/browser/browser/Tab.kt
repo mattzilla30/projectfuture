@@ -65,7 +65,12 @@ private const val DESKTOP_MEDIA_VIEWPORT_WIDTH = 1024f
  * history. This is the only place that talks to the network and DOM/CSS/
  * layout modules together.
  */
-class Tab(private val context: Context, private val onStateChanged: (TabState) -> Unit) {
+class Tab(
+    private val context: Context,
+    private val onStateChanged: (TabState) -> Unit,
+    /** A private/incognito tab: no cookies sent or stored (real isolation, not just skipped history - see Url.fetch's allowCookies), no HTTP cache reuse. History recording is skipped by MainActivity checking this flag. */
+    val isPrivate: Boolean = false
+) {
 
     private val history = ArrayList<Url>()
     private var historyIndex = -1
@@ -380,7 +385,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         if (body != null) requestHeaders["Content-Type"] = "application/x-www-form-urlencoded"
         executor.execute {
             try {
-                val response = url.fetch(method, body, requestHeaders)
+                val response = url.fetch(method, body, requestHeaders, allowCookies = !isPrivate)
                 val csp = ContentSecurityPolicy.parse(response.headers["content-security-policy"])
                 val root = HtmlParser(response.body).parse()
                 // Scripts may mutate the DOM, so this runs before CSS/images/fonts are collected below.
@@ -454,7 +459,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                     if (!csp.allowsImgSrc(baseUrl, imgUrl)) return@walkElements
                     if (TrackingProtection.isBlocked(baseUrl, imgUrl)) return@walkElements
                     try {
-                        val bytes = imgUrl.fetchBytes().body
+                        val bytes = imgUrl.fetchBytes(allowCookies = !isPrivate).body
                         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { result[el] = it }
                     } catch (_: Exception) {
                         // Broken/unreachable image: skip it rather than failing the whole page load.
@@ -504,7 +509,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             val code = if (!src.isNullOrBlank()) {
                 val scriptUrl = baseUrl.resolve(src)
                 if (isMixedContent(baseUrl, scriptUrl) || !csp.allowsScriptSrc(baseUrl, scriptUrl) || TrackingProtection.isBlocked(baseUrl, scriptUrl)) null
-                else try { scriptUrl.fetch().body } catch (_: Exception) { null }
+                else try { scriptUrl.fetch(allowCookies = !isPrivate).body } catch (_: Exception) { null }
             } else if (csp.allowsInlineScript()) {
                 scriptEl.children.filterIsInstance<TextNode>().joinToString("") { it.text }
             } else {
@@ -572,7 +577,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                 (options?.get("headers") as? JsObject)?.let { h -> for (k in h.ownKeys()) headers[k] = toJsString(h.get(k)) }
                 executor.execute {
                     try {
-                        val response = requestUrl.fetch(method, bodyText?.toByteArray(Charsets.UTF_8), headers)
+                        val response = requestUrl.fetch(method, bodyText?.toByteArray(Charsets.UTF_8), headers, allowCookies = !isPrivate)
                         mainHandler.post {
                             if (isSameOrigin(baseUrl, response.url) || corsAllows(baseUrl, response.headers)) {
                                 promise.resolve(makeFetchResponse(response))
@@ -706,7 +711,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                 val bodyText = args.getOrNull(0)?.let { if (it != JsUndefined) toJsString(it) else null }
                 executor.execute {
                     try {
-                        val response = url.fetch(method, bodyText?.toByteArray(Charsets.UTF_8), requestHeaders)
+                        val response = url.fetch(method, bodyText?.toByteArray(Charsets.UTF_8), requestHeaders, allowCookies = !isPrivate)
                         mainHandler.post {
                             if (isSameOrigin(baseUrl, response.url) || corsAllows(baseUrl, response.headers)) {
                                 xhr.set("status", JsNumber(response.statusCode.toDouble()))
@@ -761,7 +766,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                         val styleSheetUrl = baseUrl.resolve(href)
                         if (!isMixedContent(baseUrl, styleSheetUrl) && csp.allowsStyleSrc(baseUrl, styleSheetUrl) && !TrackingProtection.isBlocked(baseUrl, styleSheetUrl)) {
                             try {
-                                val response = styleSheetUrl.fetch()
+                                val response = styleSheetUrl.fetch(allowCookies = !isPrivate)
                                 // url()s inside an external stylesheet resolve against ITS location, not the page's.
                                 harvest(CssParser(response.body, viewportWidth), styleSheetUrl)
                             } catch (_: Exception) {
@@ -792,7 +797,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             val fontUrl = styleSheetBase.resolve(rule.srcUrl)
             if (isMixedContent(pageUrl, fontUrl) || !csp.allowsFontSrc(pageUrl, fontUrl) || TrackingProtection.isBlocked(pageUrl, fontUrl)) continue
             try {
-                val bytes = fontUrl.fetchBytes().body
+                val bytes = fontUrl.fetchBytes(allowCookies = !isPrivate).body
                 val sfnt = FontDecoder.toSfnt(bytes) ?: continue
                 val tempFile = File.createTempFile("font", ".ttf", context.cacheDir)
                 try {

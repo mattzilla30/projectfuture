@@ -197,7 +197,7 @@ class MainActivity : AppCompatActivity() {
             is TabState.Loaded -> {
                 val label = state.title ?: state.url.toString()
                 tabTitles[tab] = label
-                historyStore.record(state.url.toString(), label)
+                if (!tab.isPrivate) historyStore.record(state.url.toString(), label)
             }
             else -> {}
         }
@@ -215,14 +215,14 @@ class MainActivity : AppCompatActivity() {
             is TabState.Loaded -> {
                 binding.progressBar.visibility = View.GONE
                 binding.editAddress.setText(state.url.toString())
-                title = state.title ?: state.url.toString()
+                applyWindowTitle(tab, state.title ?: state.url.toString())
                 binding.browserView.clearOverlayViews()
                 binding.browserView.resetScroll()
                 refreshView()
                 updateNavButtons()
             }
             is TabState.Updated -> {
-                state.title?.let { tabTitles[tab] = it; title = it }
+                state.title?.let { tabTitles[tab] = it; applyWindowTitle(tab, it) }
                 refreshView()
             }
             is TabState.Error -> {
@@ -244,7 +244,7 @@ class MainActivity : AppCompatActivity() {
             tab.onViewportSizeChanged(lastViewportWidth, lastViewportHeight)
         }
         binding.editAddress.setText(tab.currentUrl?.toString() ?: "")
-        title = tabTitles[tab] ?: tab.currentUrl?.toString() ?: getString(R.string.untitled_tab)
+        applyWindowTitle(tab, tabTitles[tab] ?: tab.currentUrl?.toString() ?: getString(R.string.untitled_tab))
         binding.browserView.clearOverlayViews()
         binding.browserView.resetScroll()
         refreshView()
@@ -286,8 +286,12 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun openNewTab() {
-        tabManager.newTab()
+    private fun applyWindowTitle(tab: Tab, text: String) {
+        title = if (tab.isPrivate) getString(R.string.private_tab_title_prefix, text) else text
+    }
+
+    private fun openNewTab(private: Boolean = false) {
+        tabManager.newTab(private)
         switchToTab(tabManager.count() - 1)
         binding.editAddress.requestFocus()
     }
@@ -385,6 +389,7 @@ class MainActivity : AppCompatActivity() {
             isCheckable = true
             isChecked = TrackingProtection.enabled
         }
+        popup.menu.add(0, 12, 11, R.string.menu_new_private_tab)
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> {
@@ -423,6 +428,7 @@ class MainActivity : AppCompatActivity() {
                     settings.trackingProtectionEnabled = TrackingProtection.enabled
                     true
                 }
+                12 -> { openNewTab(private = true); true }
                 else -> false
             }
         }

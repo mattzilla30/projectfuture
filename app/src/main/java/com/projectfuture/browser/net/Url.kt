@@ -72,13 +72,19 @@ data class Url(
      * and `XMLHttpRequest`, in addition to the plain GETs used elsewhere
      * (page loads, images, stylesheets).
      */
-    fun fetch(method: String = "GET", body: ByteArray? = null, extraHeaders: Map<String, String> = emptyMap(), redirectsLeft: Int = 10): HttpResponse {
-        hstsUpgrade()?.let { return it.fetch(method, body, extraHeaders, redirectsLeft) }
+    /**
+     * [allowCookies] gates both sending the `Cookie` header and storing any
+     * `Set-Cookie` response (also skips the shared HttpCache) - Tab passes
+     * `false` for private/incognito tabs, giving them real cookie
+     * isolation rather than just skipping history recording.
+     */
+    fun fetch(method: String = "GET", body: ByteArray? = null, extraHeaders: Map<String, String> = emptyMap(), redirectsLeft: Int = 10, allowCookies: Boolean = true): HttpResponse {
+        hstsUpgrade()?.let { return it.fetch(method, body, extraHeaders, redirectsLeft, allowCookies) }
         // Only cacheable requests (see HttpCache's class doc) even attempt a cache lookup - a
         // GET with no body, matching this project's bounded RFC 7234 subset.
-        val cacheable = method.equals("GET", ignoreCase = true) && body == null
+        val cacheable = allowCookies && method.equals("GET", ignoreCase = true) && body == null
         if (cacheable) HttpCache.get(this)?.let { return it }
-        val raw = fetchRaw(method, body, extraHeaders, redirectsLeft)
+        val raw = fetchRaw(method, body, extraHeaders, redirectsLeft, allowCookies)
         val charset = charsetFromContentType(raw.headers["content-type"])
         val response = HttpResponse(raw.statusCode, raw.headers, String(raw.body, charset), raw.url)
         if (cacheable) HttpCache.store(this, response)
@@ -86,9 +92,9 @@ data class Url(
     }
 
     /** Same request as [fetch], but returns the raw body bytes undecoded - for binary resources like images. */
-    fun fetchBytes(redirectsLeft: Int = 10): HttpBytesResponse {
-        hstsUpgrade()?.let { return it.fetchBytes(redirectsLeft) }
-        val raw = fetchRaw("GET", null, emptyMap(), redirectsLeft)
+    fun fetchBytes(redirectsLeft: Int = 10, allowCookies: Boolean = true): HttpBytesResponse {
+        hstsUpgrade()?.let { return it.fetchBytes(redirectsLeft, allowCookies) }
+        val raw = fetchRaw("GET", null, emptyMap(), redirectsLeft, allowCookies)
         return HttpBytesResponse(raw.statusCode, raw.headers, raw.body, raw.url)
     }
 
@@ -109,8 +115,8 @@ data class Url(
         Socket().also { it.connect(InetSocketAddress(host, port), 15000) }
     }
 
-    private fun buildRequestHead(method: String, body: ByteArray?, extraHeaders: Map<String, String>): String {
-        val cookieHeader = sharedCookieJar?.cookieHeaderFor(this)
+    private fun buildRequestHead(method: String, body: ByteArray?, extraHeaders: Map<String, String>, allowCookies: Boolean): String {
+        val cookieHeader = if (allowCookies) sharedCookieJar?.cookieHeaderFor(this) else null
         // A caller (Tab's "desktop site" toggle) can override the User-Agent via extraHeaders;
         // it's handled specially here rather than just appended, so there's never a duplicate header.
         val userAgent = extraHeaders.entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }?.value
@@ -148,7 +154,7 @@ data class Url(
      * body we don't consume) closes the socket instead, since reusing it
      * would hand the next request a stream with stale bytes still in it.
      */
-    private fun fetchRaw(method: String, body: ByteArray?, extraHeaders: Map<String, String>, redirectsLeft: Int): RawHttpResponse {
+    private fun fetchRaw(method: String, body: ByteArray?, extraHeaders: Map<String, String>, redirectsLeft: Int, allowCookies: Boolean = true): RawHttpResponse {
         if (scheme != "http" && scheme != "https") {
             throw IOException("Unsupported scheme: $scheme")
         }
@@ -159,7 +165,7 @@ data class Url(
         if (socket == null) socket = openSocket()
         socket.soTimeout = 20000
 
-        val requestHead = buildRequestHead(method, body, extraHeaders)
+        val requestHead = buildRequestHead(method, body, extraHeaders, allowCookies)
         try {
             try {
                 writeRequest(socket, requestHead, body)
@@ -179,7 +185,7 @@ data class Url(
                 // The pooled socket was closed by the server between requests with nothing
                 // written back yet; retry once on a fresh connection rather than failing outright.
                 try { socket.close() } catch (_: Exception) {}
-                return fetchRaw(method, body, extraHeaders, redirectsLeft)
+                return fetchRaw(method, body, extraHeaders, redirectsLeft, allowCookies)
             }
             val statusParts = statusLine.split(" ", limit = 3)
             if (statusParts.size < 2) throw IOException("Malformed status line: $statusLine")
@@ -198,7 +204,7 @@ data class Url(
                 val value = line.substring(idx + 1).trim()
                 if (key == "set-cookie") setCookieHeaders.add(value) else headers[key] = value
             }
-            if (setCookieHeaders.isNotEmpty()) sharedCookieJar?.store(this, setCookieHeaders)
+            if (allowCookies && setCookieHeaders.isNotEmpty()) sharedCookieJar?.store(this, setCookieHeaders)
             // Only trust Strict-Transport-Security when it arrives over a connection we've actually
             // verified is HTTPS - honoring it over plain HTTP would let a network attacker forge it.
             if (isHttps) headers["strict-transport-security"]?.let { HstsStore.record(host, it) }
@@ -217,7 +223,7 @@ data class Url(
                     } else {
                         method to body
                     }
-                    return next.fetchRaw(nextMethod, nextBody, extraHeaders, redirectsLeft - 1)
+                    return next.fetchRaw(nextMethod, nextBody, extraHeaders, redirectsLeft - 1, allowCookies)
                 }
             }
 

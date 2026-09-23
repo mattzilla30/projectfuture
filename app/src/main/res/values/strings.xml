@@ -42,4 +42,6 @@
     <string name="menu_print">Print</string>
     <string name="menu_reader_mode">Reader mode</string>
     <string name="menu_tracking_protection">Tracking protection</string>
+    <string name="menu_new_private_tab">New private tab</string>
+    <string name="private_tab_title_prefix">(Private) %1$s</string>
 </resources>

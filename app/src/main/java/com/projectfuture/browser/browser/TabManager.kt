@@ -22,9 +22,9 @@ class TabManager(private val context: Context, private val onStateChanged: (Tab,
     fun allTabs(): List<Tab> = tabs
     fun count() = tabs.size
 
-    fun newTab(): Tab {
+    fun newTab(private: Boolean = false): Tab {
         lateinit var tab: Tab
-        tab = Tab(context) { state -> onStateChanged(tab, state) }
+        tab = Tab(context, { state -> onStateChanged(tab, state) }, private)
         tabs.add(tab)
         activeIndex = tabs.size - 1
         return tab
