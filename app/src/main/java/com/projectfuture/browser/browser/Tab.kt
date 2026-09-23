@@ -40,6 +40,7 @@ import com.projectfuture.browser.layout.DocumentLayout
 import com.projectfuture.browser.layout.FontDecoder
 import com.projectfuture.browser.layout.customFonts
 import com.projectfuture.browser.layout.textScaleFactor
+import com.projectfuture.browser.net.CertificateExceptions
 import com.projectfuture.browser.net.HttpResponse
 import com.projectfuture.browser.net.TrackingProtection
 import com.projectfuture.browser.net.Url
@@ -49,6 +50,7 @@ import com.projectfuture.browser.net.isMixedContent
 import com.projectfuture.browser.net.isSameOrigin
 import java.io.File
 import java.util.concurrent.Executors
+import javax.net.ssl.SSLException
 
 sealed class TabState {
     data class Loading(val url: Url) : TabState()
@@ -56,6 +58,8 @@ sealed class TabState {
     /** DOM was mutated by a click handler after load (not a navigation) - just repaint, don't touch scroll/address bar. */
     data class Updated(val url: Url, val title: String?) : TabState()
     data class Error(val url: Url, val message: String) : TabState()
+    /** A TLS certificate validation failure specifically - MainActivity shows a "proceed anyway?" interstitial instead of a plain error toast. */
+    data class CertificateError(val url: Url, val message: String) : TabState()
 }
 
 private enum class HistoryAction { PUSH, NONE }
@@ -523,9 +527,21 @@ class Tab(
                     onStateChanged(TabState.Loaded(response.url, title))
                 }
             } catch (e: Exception) {
-                mainHandler.post { onStateChanged(TabState.Error(url, e.message ?: e.toString())) }
+                mainHandler.post {
+                    if (e is SSLException) {
+                        onStateChanged(TabState.CertificateError(url, e.message ?: e.toString()))
+                    } else {
+                        onStateChanged(TabState.Error(url, e.message ?: e.toString()))
+                    }
+                }
             }
         }
+    }
+
+    /** Called by MainActivity when the user clicks through a certificate warning for [url]'s host. */
+    fun trustCertificateAndReload(url: Url) {
+        CertificateExceptions.allow(url.host)
+        load(url, HistoryAction.NONE)
     }
 
     private fun relayout() {

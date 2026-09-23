@@ -157,6 +157,13 @@ class CookieJarTest {
         }
     }
 
+    @Test fun certificateExceptionsAreScopedPerHost() {
+        assertTrue(!CertificateExceptions.isAllowed("bad-cert.example.com"))
+        CertificateExceptions.allow("bad-cert.example.com")
+        assertTrue(CertificateExceptions.isAllowed("bad-cert.example.com"))
+        assertTrue(!CertificateExceptions.isAllowed("other.example.com"))
+    }
+
     @Test fun httpCacheServesFreshEntryAndDropsExpiredOne() {
         HttpCache.clear()
         val url = Url.parse("https://example.com/cached")

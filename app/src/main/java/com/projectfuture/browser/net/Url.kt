@@ -6,8 +6,12 @@ import java.io.IOException
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.charset.Charset
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
 import java.util.zip.GZIPInputStream
+import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocketFactory
+import javax.net.ssl.X509TrustManager
 
 /**
  * A URL, parsed by hand, and the raw-socket HTTP/1.1 client used to fetch it.
@@ -127,13 +131,29 @@ data class Url(
 
     /** Shared socket/request/response-header/body-bytes plumbing for [fetch] and [fetchBytes]. Follows redirects itself. */
     private fun openSocket(): Socket = if (isHttps) {
-        (SSLSocketFactory.getDefault().createSocket() as Socket).also {
+        // A host the user has explicitly clicked through a certificate warning for (see
+        // CertificateExceptions/the TabState.CertificateError interstitial) gets a non-validating
+        // SSLContext instead of the platform default - scoped to just that host, so accepting one
+        // bad certificate never weakens validation for any other site.
+        val factory = if (CertificateExceptions.isAllowed(host)) trustAllSocketFactory() else SSLSocketFactory.getDefault()
+        (factory.createSocket() as Socket).also {
             it.connect(InetSocketAddress(host, port), 15000)
             // SNI + hostname verification happen automatically for SSLSocket
             // created against a host/port pair on modern Android.
         }
     } else {
         Socket().also { it.connect(InetSocketAddress(host, port), 15000) }
+    }
+
+    private fun trustAllSocketFactory(): SSLSocketFactory {
+        val trustAllManager = object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<X509Certificate>?, authType: String?) {}
+            override fun checkServerTrusted(chain: Array<X509Certificate>?, authType: String?) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        }
+        return SSLContext.getInstance("TLS").apply {
+            init(null, arrayOf(trustAllManager), SecureRandom())
+        }.socketFactory
     }
 
     private fun buildRequestHead(method: String, body: ByteArray?, extraHeaders: Map<String, String>, allowCookies: Boolean): String {

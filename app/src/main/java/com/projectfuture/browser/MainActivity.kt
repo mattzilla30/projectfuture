@@ -38,6 +38,7 @@ import com.projectfuture.browser.layout.DrawText
 import com.projectfuture.browser.net.CookieJar
 import com.projectfuture.browser.net.HttpCache
 import com.projectfuture.browser.net.TrackingProtection
+import com.projectfuture.browser.net.Url
 import com.projectfuture.browser.net.sharedCookieJar
 import com.projectfuture.browser.databinding.ActivityMainBinding
 
@@ -269,6 +270,11 @@ class MainActivity : AppCompatActivity() {
                     Toast.LENGTH_LONG
                 ).show()
                 updateNavButtons()
+            }
+            is TabState.CertificateError -> {
+                binding.progressBar.visibility = View.GONE
+                updateNavButtons()
+                showCertificateErrorDialog(tab, state.url, state.message)
             }
         }
         updateTabCountButton()
@@ -664,6 +670,25 @@ class MainActivity : AppCompatActivity() {
             }
         }
         printManager.print(jobName, adapter, android.print.PrintAttributes.Builder().build())
+    }
+
+    /**
+     * The certificate-error interstitial: a real "proceed anyway" flow,
+     * not a cosmetic warning that does nothing - accepting scopes a
+     * non-validating TLS trust to just this host for the rest of the
+     * session (see CertificateExceptions/Url.trustAllSocketFactory), never
+     * weakening validation anywhere else.
+     */
+    private fun showCertificateErrorDialog(tab: Tab, url: Url, message: String) {
+        AlertDialog.Builder(this)
+            .setTitle(R.string.certificate_error_title)
+            .setMessage(getString(R.string.certificate_error_message, url.host, message))
+            .setPositiveButton(R.string.certificate_error_proceed) { d, _ ->
+                tab.trustCertificateAndReload(url)
+                d.dismiss()
+            }
+            .setNegativeButton(R.string.action_close, null)
+            .show()
     }
 
     /** Hands the URL off to Android's own DownloadManager - a platform primitive (like BitmapFactory for images), not "browser engine" logic. */
