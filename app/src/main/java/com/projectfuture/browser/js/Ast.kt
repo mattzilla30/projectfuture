@@ -40,3 +40,5 @@ object BreakStmt : Stmt()
 object ContinueStmt : Stmt()
 data class TryStmt(val block: Block, val catchParam: String?, val catchBlock: Block?, val finallyBlock: Block?) : Stmt()
 data class ThrowStmt(val argument: Expr) : Stmt()
+data class SwitchCase(val test: Expr?, val body: List<Stmt>) // test == null is the `default:` clause
+data class SwitchStmt(val discriminant: Expr, val cases: List<SwitchCase>) : Stmt()

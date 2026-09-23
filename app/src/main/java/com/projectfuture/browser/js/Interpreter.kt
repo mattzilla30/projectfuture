@@ -126,6 +126,36 @@ class Interpreter {
             ContinueStmt -> throw ContinueException()
             is TryStmt -> execTry(stmt, env)
             is ThrowStmt -> throw JsException(evalExpr(stmt.argument, env))
+            is SwitchStmt -> execSwitch(stmt, env)
+        }
+    }
+
+    /**
+     * Fallthrough matches real JS: once a `case` matches (or, if none do,
+     * once `default` is reached), every subsequent clause's body runs in
+     * source order regardless of its own test, until `break` or the end of
+     * the switch. There's no separate scope per case, just one shared block
+     * scope for the whole switch (matching `{}`-less `case` bodies in real
+     * JS, where `let`s across cases share a single lexical environment).
+     */
+    private fun execSwitch(stmt: SwitchStmt, env: Environment) {
+        val discVal = evalExpr(stmt.discriminant, env)
+        val switchEnv = Environment(env)
+        try {
+            var matched = false
+            for (case in stmt.cases) {
+                if (!matched && case.test != null && strictEquals(discVal, evalExpr(case.test, switchEnv))) matched = true
+                if (matched) execBlock(case.body, switchEnv)
+            }
+            if (!matched) {
+                var afterDefault = false
+                for (case in stmt.cases) {
+                    if (case.test == null) afterDefault = true
+                    if (afterDefault) execBlock(case.body, switchEnv)
+                }
+            }
+        } catch (b: BreakException) {
+            // break exits the switch
         }
     }
 
@@ -306,6 +336,7 @@ class Interpreter {
             JsString(typeOf(evalExpr(expr.argument, env)))
         }
         "void" -> { evalExpr(expr.argument, env); JsUndefined }
+        "~" -> JsNumber(toInt32(toNumber(evalExpr(expr.argument, env))).inv().toDouble())
         "delete" -> {
             if (expr.argument is Member) {
                 val obj = evalExpr(expr.argument.obj, env)
@@ -333,8 +364,18 @@ class Interpreter {
         ">=" -> compareValues(l, r) { a, b -> a >= b }
         "instanceof" -> JsBoolean(false) // no prototype chain - see class doc
         "in" -> JsBoolean(r is JsObject && r.has(toJsString(l)))
+        "&" -> JsNumber((toInt32(toNumber(l)) and toInt32(toNumber(r))).toDouble())
+        "|" -> JsNumber((toInt32(toNumber(l)) or toInt32(toNumber(r))).toDouble())
+        "^" -> JsNumber((toInt32(toNumber(l)) xor toInt32(toNumber(r))).toDouble())
+        "<<" -> JsNumber((toInt32(toNumber(l)) shl (toInt32(toNumber(r)) and 31)).toDouble())
+        ">>" -> JsNumber((toInt32(toNumber(l)) shr (toInt32(toNumber(r)) and 31)).toDouble())
+        ">>>" -> JsNumber((toUInt32(toNumber(l)) ushr (toInt32(toNumber(r)) and 31)).toDouble())
         else -> JsUndefined
     }
+
+    /** JS's ToInt32/ToUint32 abstract operations, simplified: NaN/Infinity map to 0 rather than going through the full spec algorithm. */
+    private fun toInt32(d: Double): Int = if (d.isNaN() || d.isInfinite()) 0 else d.toLong().toInt()
+    private fun toUInt32(d: Double): Long = if (d.isNaN() || d.isInfinite()) 0L else d.toLong() and 0xFFFFFFFFL
 
     private fun compareValues(l: JsValue, r: JsValue, cmp: (Double, Double) -> Boolean): JsValue {
         if (l is JsString && r is JsString) return JsBoolean(cmp(l.value.compareTo(r.value).toDouble(), 0.0))

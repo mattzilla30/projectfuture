@@ -316,4 +316,45 @@ class InterpreterTest {
         assertTrue(bool("var result = Number.isInteger(5);"))
         assertTrue(!bool("var result = Number.isInteger(5.5);"))
     }
+
+    @Test fun bitwiseOperators() {
+        assertNum(4.0, "var result = 12 & 5;")
+        assertNum(13.0, "var result = 12 | 1;")
+        assertNum(9.0, "var result = 12 ^ 5;")
+        assertNum(-13.0, "var result = ~12;")
+        assertNum(48.0, "var result = 12 << 2;")
+        assertNum(3.0, "var result = 12 >> 2;")
+        assertNum(1073741821.0, "var result = -12 >>> 2;") // unsigned shift of a negative ToInt32 value
+    }
+
+    @Test fun switchStatementFallthroughAndBreak() {
+        assertNum(2.0, """
+            var x = 2, result = 0;
+            switch (x) {
+                case 1: result = 1; break;
+                case 2: result = 2; break;
+                default: result = -1;
+            }
+            """.trimIndent()
+        )
+        // no break after case 1: falls through into case 2's body too
+        assertNum(12.0, """
+            var result = 0;
+            switch (1) {
+                case 1: result += 10;
+                case 2: result += 2; break;
+                case 3: result += 100;
+            }
+            """.trimIndent()
+        )
+        // no matching case: runs from default onward
+        assertNum(-1.0, """
+            var result = 0;
+            switch (99) {
+                case 1: result = 1; break;
+                default: result = -1;
+            }
+            """.trimIndent()
+        )
+    }
 }

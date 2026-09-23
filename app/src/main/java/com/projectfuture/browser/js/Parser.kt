@@ -2,13 +2,12 @@ package com.projectfuture.browser.js
 
 /**
  * A recursive-descent parser for an ES5-ish subset plus arrow functions,
- * template literals, `let`/`const`, and regex literals (see Lexer.kt's
- * doc for the regex-vs-division heuristic). Not implemented: classes,
- * destructuring, spread/rest, generators/async, default parameters,
- * bitwise operators (&|^~<<>>), labeled statements, switch statements.
- * Each of those is a real gap for modern JS, chosen to bound scope - see
- * Interpreter.kt's class doc for the fuller picture of what this engine
- * covers.
+ * template literals, `let`/`const`, regex literals (see Lexer.kt's doc for
+ * the regex-vs-division heuristic), bitwise operators, and switch
+ * statements. Not implemented: classes, destructuring, spread/rest,
+ * generators/async, default parameters, labeled statements. Each of those
+ * is a real gap for modern JS, chosen to bound scope - see Interpreter.kt's
+ * class doc for the fuller picture of what this engine covers.
  */
 class Parser(private val tokens: List<Token>) {
     private var pos = 0
@@ -37,6 +36,10 @@ class Parser(private val tokens: List<Token>) {
     private fun matchPunct(text: String) = match(TokenType.PUNCT, text)
     private fun matchKeyword(text: String) = match(TokenType.KEYWORD, text)
 
+    /** `switch`/`case`/`default` aren't in the lexer's KEYWORDS set (kept that way to avoid touching regex-vs-division heuristics for a niche win) - checked by IDENT text instead. */
+    private fun checkIdentText(text: String) = check(TokenType.IDENT) && peek().text == text
+    private fun matchIdentText(text: String): Boolean { if (checkIdentText(text)) { advance(); return true }; return false }
+
     private fun expectPunct(text: String): Token {
         if (!checkPunct(text)) throw jsError("Parse error: expected '$text' but found '${peek().text}'")
         return advance()
@@ -61,6 +64,7 @@ class Parser(private val tokens: List<Token>) {
         if (checkKeyword("continue")) { advance(); consumeSemicolon(); return ContinueStmt }
         if (checkKeyword("try")) return parseTry()
         if (checkKeyword("throw")) return parseThrow()
+        if (checkIdentText("switch")) return parseSwitch()
         if (matchPunct(";")) return Block(emptyList()) // empty statement
         val expr = parseExpression()
         consumeSemicolon()
@@ -233,6 +237,32 @@ class Parser(private val tokens: List<Token>) {
         return ThrowStmt(arg)
     }
 
+    private fun parseSwitch(): Stmt {
+        advance() // 'switch'
+        expectPunct("(")
+        val disc = parseExpression()
+        expectPunct(")")
+        expectPunct("{")
+        val cases = ArrayList<SwitchCase>()
+        while (!checkPunct("}")) {
+            val test: Expr?
+            if (matchIdentText("case")) {
+                test = parseExpression()
+                expectPunct(":")
+            } else if (matchIdentText("default")) {
+                test = null
+                expectPunct(":")
+            } else {
+                throw jsError("Parse error: expected 'case' or 'default' in switch body, found '${peek().text}'")
+            }
+            val body = ArrayList<Stmt>()
+            while (!checkIdentText("case") && !checkIdentText("default") && !checkPunct("}")) body.add(parseStatement())
+            cases.add(SwitchCase(test, body))
+        }
+        expectPunct("}")
+        return SwitchStmt(disc, cases)
+    }
+
     // ---- expressions (precedence climbing, low to high) ----
 
     private fun parseExpression(): Expr = parseAssignment()
@@ -310,8 +340,26 @@ class Parser(private val tokens: List<Token>) {
     }
 
     private fun parseLogicalAnd(): Expr {
+        var left = parseBitwiseOr()
+        while (checkPunct("&&")) { advance(); left = Logical("&&", left, parseBitwiseOr()) }
+        return left
+    }
+
+    private fun parseBitwiseOr(): Expr {
+        var left = parseBitwiseXor()
+        while (checkPunct("|")) { advance(); left = Binary("|", left, parseBitwiseXor()) }
+        return left
+    }
+
+    private fun parseBitwiseXor(): Expr {
+        var left = parseBitwiseAnd()
+        while (checkPunct("^")) { advance(); left = Binary("^", left, parseBitwiseAnd()) }
+        return left
+    }
+
+    private fun parseBitwiseAnd(): Expr {
         var left = parseEquality()
-        while (checkPunct("&&")) { advance(); left = Logical("&&", left, parseEquality()) }
+        while (checkPunct("&")) { advance(); left = Binary("&", left, parseEquality()) }
         return left
     }
 
@@ -327,11 +375,20 @@ class Parser(private val tokens: List<Token>) {
     }
 
     private fun parseRelational(): Expr {
-        var left = parseAdditive()
+        var left = parseShift()
         while (true) {
             val isPunct = peek().type == TokenType.PUNCT && peek().text in setOf("<", ">", "<=", ">=")
             val isKeywordOp = checkKeyword("instanceof") || checkKeyword("in")
             if (!isPunct && !isKeywordOp) break
+            val op = advance().text
+            left = Binary(op, left, parseShift())
+        }
+        return left
+    }
+
+    private fun parseShift(): Expr {
+        var left = parseAdditive()
+        while (peek().type == TokenType.PUNCT && peek().text in setOf("<<", ">>", ">>>")) {
             val op = advance().text
             left = Binary(op, left, parseAdditive())
         }
@@ -362,7 +419,7 @@ class Parser(private val tokens: List<Token>) {
         return left
     }
 
-    private val unaryOps = setOf("!", "-", "+")
+    private val unaryOps = setOf("!", "-", "+", "~")
 
     private fun parseUnary(): Expr {
         if (peek().type == TokenType.PUNCT && peek().text in unaryOps) {
