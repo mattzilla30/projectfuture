@@ -30,6 +30,7 @@ import com.projectfuture.browser.browser.HistoryStore
 import com.projectfuture.browser.browser.Settings
 import com.projectfuture.browser.browser.Tab
 import com.projectfuture.browser.browser.TabManager
+import com.projectfuture.browser.browser.TabSessionStore
 import com.projectfuture.browser.browser.TabState
 import com.projectfuture.browser.layout.DrawText
 import com.projectfuture.browser.net.CookieJar
@@ -45,6 +46,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var bookmarkStore: BookmarkStore
     private lateinit var historyStore: HistoryStore
     private lateinit var settings: Settings
+    private lateinit var tabSessionStore: TabSessionStore
     private val tabTitles = HashMap<Tab, String>()
     private var lastViewportWidth = 0f
     private var lastViewportHeight = 0f
@@ -59,6 +61,7 @@ class MainActivity : AppCompatActivity() {
         bookmarkStore = BookmarkStore(this)
         historyStore = HistoryStore(this)
         settings = Settings(this)
+        tabSessionStore = TabSessionStore(this)
         TrackingProtection.enabled = settings.trackingProtectionEnabled
         if (sharedCookieJar == null) sharedCookieJar = CookieJar(applicationContext)
 
@@ -111,10 +114,25 @@ class MainActivity : AppCompatActivity() {
             }
         })
 
-        tabManager.newTab()
-        val startUrl = intent?.dataString?.takeIf { intent?.action == Intent.ACTION_VIEW } ?: settings.homePage
-        binding.editAddress.setText(startUrl)
-        tabManager.activeTab?.navigate(startUrl, settings.searchTemplate)
+        val viewIntentUrl = intent?.dataString?.takeIf { intent?.action == Intent.ACTION_VIEW }
+        val (savedUrls, savedActiveIndex) = tabSessionStore.load()
+        if (savedUrls.isEmpty()) {
+            tabManager.newTab()
+            tabManager.activeTab?.navigate(viewIntentUrl ?: settings.homePage, settings.searchTemplate)
+        } else {
+            for (url in savedUrls) {
+                tabManager.newTab()
+                tabManager.activeTab?.navigate(url, settings.searchTemplate)
+            }
+            if (viewIntentUrl != null) {
+                // A link opened this app fresh alongside a restored session - add it as one more tab.
+                tabManager.newTab()
+                tabManager.activeTab?.navigate(viewIntentUrl, settings.searchTemplate)
+            } else {
+                switchToTab(savedActiveIndex)
+            }
+        }
+        binding.editAddress.setText(tabManager.activeTab?.currentUrl?.toString() ?: "")
         updateTabCountButton()
 
         setUpFindBar()
@@ -203,6 +221,7 @@ class MainActivity : AppCompatActivity() {
             }
             else -> {}
         }
+        if (state is TabState.Loaded || state is TabState.Updated) saveSession()
 
         if (tab !== tabManager.activeTab) {
             updateTabCountButton()
@@ -285,6 +304,7 @@ class MainActivity : AppCompatActivity() {
         refreshView()
         updateNavButtons()
         updateTabCountButton()
+        saveSession()
     }
 
     /** The whole "settings screen": two fields, no PreferenceScreen framework - see Settings.kt's doc. */
@@ -336,6 +356,14 @@ class MainActivity : AppCompatActivity() {
         val newActiveTab = tabManager.closeTab(index)
         tabTitles.remove(closedTab)
         switchToTab(tabManager.allTabs().indexOf(newActiveTab))
+    }
+
+    /** Never includes private tabs - see TabSessionStore's doc. */
+    private fun saveSession() {
+        val nonPrivateTabs = tabManager.allTabs().filter { !it.isPrivate }
+        val urls = nonPrivateTabs.mapNotNull { it.currentUrl?.toString() }
+        val activeIndex = nonPrivateTabs.indexOf(tabManager.activeTab).coerceAtLeast(0)
+        tabSessionStore.save(urls, activeIndex)
     }
 
     private fun showTabSwitcher() {
