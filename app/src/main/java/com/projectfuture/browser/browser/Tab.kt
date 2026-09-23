@@ -95,6 +95,30 @@ class Tab(
     private val canceledTimers = HashSet<Int>()
 
     /**
+     * True once this (background) tab's heavy in-memory state has been
+     * dropped under memory pressure - see [discardForMemoryPressure]. The
+     * tab still "exists" (its URL and history survive), it just isn't
+     * rendered until something (MainActivity, on switching to it) calls
+     * [reload]. This is this engine's bounded stand-in for real browsers'
+     * multi-process renderer discarding: no separate process to kill here,
+     * just the same single-process state a discarded renderer would hold.
+     */
+    var isDiscarded: Boolean = false
+        private set
+
+    fun discardForMemoryPressure() {
+        if (isDiscarded || currentUrl == null) return
+        currentDoc = null
+        displayList = emptyList()
+        contentHeight = 0f
+        currentImages = emptyMap()
+        currentInterpreter = null
+        currentDomBridge = null
+        currentAuthorRules = emptyList()
+        isDiscarded = true
+    }
+
+    /**
      * "Desktop site" mode: widens the layout viewport (so media queries and
      * any width-dependent CSS pick a desktop-ish layout) and sends a
      * desktop-claiming `User-Agent`, since many real sites branch their
@@ -388,6 +412,7 @@ class Tab(
                 val response = url.fetch(method, body, requestHeaders, allowCookies = !isPrivate)
                 val csp = ContentSecurityPolicy.parse(response.headers["content-security-policy"])
                 val root = HtmlParser(response.body).parse()
+                warmPreconnectHints(root, response.url)
                 // Scripts may mutate the DOM, so this runs before CSS/images/fonts are collected below.
                 val (interpreter, bridge) = runScripts(root, response.url, csp)
                 val authorCss = collectAuthorCss(root, response.url, mediaViewportWidth, csp)
@@ -404,6 +429,7 @@ class Tab(
                     currentDomBridge = bridge
                     currentAuthorRules = authorCss.rules
                     canceledTimers.clear()
+                    isDiscarded = false
                     when (action) {
                         HistoryAction.PUSH -> {
                             while (history.size > historyIndex + 1) history.removeAt(history.size - 1)
@@ -448,6 +474,23 @@ class Tab(
      * skipped, matching how the reference build already treats a failed
      * stylesheet fetch - no broken-image icon or alt-text fallback yet.
      */
+    /**
+     * `<link rel="preconnect" href="...">`: warms a connection to that
+     * host on its own throwaway thread (not this Tab's serial [executor],
+     * whose whole point is finishing the actual page load - a preconnect
+     * blocking that queue would defeat its own purpose of overlapping with
+     * other work instead of adding to the critical path).
+     */
+    private fun warmPreconnectHints(root: ElementNode, baseUrl: Url) {
+        root.walkElements { el ->
+            if (el.tag == "link" && el.attr("rel")?.lowercase() == "preconnect") {
+                val href = el.attr("href") ?: return@walkElements
+                val target = try { baseUrl.resolve(href) } catch (_: Exception) { return@walkElements }
+                Thread { target.preconnect() }.apply { isDaemon = true }.start()
+            }
+        }
+    }
+
     private fun collectAndDecodeImages(root: ElementNode, baseUrl: Url, csp: ContentSecurityPolicy): Map<ElementNode, Bitmap> {
         val result = HashMap<ElementNode, Bitmap>()
         root.walkElements { el ->

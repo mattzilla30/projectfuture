@@ -104,6 +104,27 @@ data class Url(
         return copy(scheme = "https", port = if (port == 80) 443 else port)
     }
 
+    /**
+     * Warms a TCP (+ TLS handshake, for https) connection ahead of an
+     * actual request and parks it in [ConnectionPool] - what `<link
+     * rel="preconnect">` asks for. Best-effort: any failure (unreachable
+     * host, bad scheme) is swallowed, since a failed preconnect just means
+     * the real request later pays the connection cost itself instead.
+     * Callers should run this off the main thread, and separately from
+     * any serial per-page request queue, since its entire value is
+     * happening concurrently with other work rather than blocking it.
+     */
+    fun preconnect() {
+        if (scheme != "http" && scheme != "https") return
+        try {
+            val socket = openSocket()
+            socket.soTimeout = 20000
+            ConnectionPool.release("$scheme://$host:$port", socket)
+        } catch (_: Exception) {
+            // Best-effort - see doc above.
+        }
+    }
+
     /** Shared socket/request/response-header/body-bytes plumbing for [fetch] and [fetchBytes]. Follows redirects itself. */
     private fun openSocket(): Socket = if (isHttps) {
         (SSLSocketFactory.getDefault().createSocket() as Socket).also {

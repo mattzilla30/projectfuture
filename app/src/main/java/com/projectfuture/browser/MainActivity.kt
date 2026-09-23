@@ -1,6 +1,7 @@
 package com.projectfuture.browser
 
 import android.app.DownloadManager
+import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -32,6 +33,7 @@ import com.projectfuture.browser.browser.TabManager
 import com.projectfuture.browser.browser.TabState
 import com.projectfuture.browser.layout.DrawText
 import com.projectfuture.browser.net.CookieJar
+import com.projectfuture.browser.net.HttpCache
 import com.projectfuture.browser.net.TrackingProtection
 import com.projectfuture.browser.net.sharedCookieJar
 import com.projectfuture.browser.databinding.ActivityMainBinding
@@ -238,8 +240,29 @@ class MainActivity : AppCompatActivity() {
         updateTabCountButton()
     }
 
+    /**
+     * Discards non-active tabs' rendered state (DOM, layout, images,
+     * interpreter) under memory pressure - this engine's single-process
+     * stand-in for how a real multi-process browser kills background tab
+     * renderers to reclaim memory. A discarded tab is transparently
+     * reloaded (re-fetched) the next time the user switches to it - see
+     * Tab.discardForMemoryPressure's doc.
+     */
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (level < ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE) return
+        val active = tabManager.activeTab
+        for (tab in tabManager.allTabs()) {
+            if (tab !== active) tab.discardForMemoryPressure()
+        }
+        if (level >= ComponentCallbacks2.TRIM_MEMORY_COMPLETE) {
+            HttpCache.clear()
+        }
+    }
+
     private fun switchToTab(index: Int) {
         val tab = tabManager.switchTo(index) ?: return
+        if (tab.isDiscarded) tab.reload()
         if (lastViewportWidth > 0f && lastViewportHeight > 0f) {
             tab.onViewportSizeChanged(lastViewportWidth, lastViewportHeight)
         }
