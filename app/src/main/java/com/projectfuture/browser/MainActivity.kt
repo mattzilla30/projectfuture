@@ -1,7 +1,11 @@
 package com.projectfuture.browser
 
+import android.app.DownloadManager
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
+import android.os.Environment
 import android.text.TextUtils
 import android.view.Gravity
 import android.view.KeyEvent
@@ -24,6 +28,7 @@ import com.projectfuture.browser.browser.HistoryStore
 import com.projectfuture.browser.browser.Tab
 import com.projectfuture.browser.browser.TabManager
 import com.projectfuture.browser.browser.TabState
+import com.projectfuture.browser.layout.DrawText
 import com.projectfuture.browser.net.CookieJar
 import com.projectfuture.browser.net.sharedCookieJar
 import com.projectfuture.browser.databinding.ActivityMainBinding
@@ -94,9 +99,83 @@ class MainActivity : AppCompatActivity() {
         })
 
         tabManager.newTab()
-        binding.editAddress.setText(START_URL)
-        tabManager.activeTab?.navigate(START_URL)
+        val startUrl = intent?.dataString?.takeIf { intent?.action == Intent.ACTION_VIEW } ?: START_URL
+        binding.editAddress.setText(startUrl)
+        tabManager.activeTab?.navigate(startUrl)
         updateTabCountButton()
+
+        setUpFindBar()
+    }
+
+    /** A link opened from another app (e.g. tapping an http(s) link while this is the default browser) while already running. */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        if (intent.action == Intent.ACTION_VIEW) {
+            intent.dataString?.let { url ->
+                openNewTab()
+                binding.editAddress.setText(url)
+                tabManager.activeTab?.navigate(url)
+            }
+        }
+    }
+
+    private fun setUpFindBar() {
+        binding.editFindQuery.setOnEditorActionListener { _, actionId, _ ->
+            if (actionId == EditorInfo.IME_ACTION_SEARCH) {
+                performFind(binding.editFindQuery.text.toString())
+                true
+            } else {
+                false
+            }
+        }
+        binding.buttonFindNext.setOnClickListener { stepFind(1) }
+        binding.buttonFindPrev.setOnClickListener { stepFind(-1) }
+        binding.buttonFindClose.setOnClickListener { hideFindBar() }
+    }
+
+    private var findMatches: List<DrawText> = emptyList()
+    private var findIndex: Int = -1
+
+    private fun showFindBar() {
+        binding.findBar.visibility = View.VISIBLE
+        binding.editFindQuery.requestFocus()
+        val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+        imm.showSoftInput(binding.editFindQuery, InputMethodManager.SHOW_IMPLICIT)
+    }
+
+    private fun hideFindBar() {
+        binding.findBar.visibility = View.GONE
+        findMatches = emptyList()
+        findIndex = -1
+        binding.browserView.clearFindMatches()
+        hideKeyboard()
+        binding.browserView.requestFocus()
+    }
+
+    /** Per-token substring matching only (see BrowserView.setFindMatches's doc) - a query spanning two rendered words/tokens won't match. */
+    private fun performFind(query: String) {
+        if (query.isBlank()) {
+            findMatches = emptyList()
+            findIndex = -1
+            binding.browserView.clearFindMatches()
+            binding.textFindCount.text = "0/0"
+            return
+        }
+        findMatches = (tabManager.activeTab?.displayList ?: emptyList()).filterIsInstance<DrawText>()
+            .filter { it.text.contains(query, ignoreCase = true) }
+        findIndex = if (findMatches.isEmpty()) -1 else 0
+        updateFindUi()
+    }
+
+    private fun stepFind(direction: Int) {
+        if (findMatches.isEmpty()) return
+        findIndex = (findIndex + direction + findMatches.size) % findMatches.size
+        updateFindUi()
+    }
+
+    private fun updateFindUi() {
+        binding.textFindCount.text = if (findMatches.isEmpty()) "0/0" else "${findIndex + 1}/${findMatches.size}"
+        binding.browserView.setFindMatches(findMatches, findIndex)
     }
 
     private fun onTabStateChanged(tab: Tab, state: TabState) {
@@ -239,6 +318,13 @@ class MainActivity : AppCompatActivity() {
         popup.menu.add(0, 1, 0, bookmarkItemTitle).isEnabled = currentUrl != null
         popup.menu.add(0, 2, 1, R.string.menu_bookmarks)
         popup.menu.add(0, 3, 2, R.string.menu_history)
+        popup.menu.add(0, 4, 3, R.string.menu_find_in_page).isEnabled = currentUrl != null
+        popup.menu.add(0, 5, 4, R.string.menu_share).isEnabled = currentUrl != null
+        popup.menu.add(0, 6, 5, R.string.menu_desktop_site).apply {
+            isCheckable = true
+            isChecked = tabManager.activeTab?.desktopMode == true
+            isEnabled = currentUrl != null
+        }
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> {
@@ -251,6 +337,17 @@ class MainActivity : AppCompatActivity() {
                 }
                 2 -> { showBookmarksDialog(); true }
                 3 -> { showHistoryDialog(); true }
+                4 -> { showFindBar(); true }
+                5 -> {
+                    val url = currentUrl ?: return@setOnMenuItemClickListener true
+                    val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                        type = "text/plain"
+                        putExtra(Intent.EXTRA_TEXT, url)
+                    }
+                    startActivity(Intent.createChooser(shareIntent, getString(R.string.menu_share)))
+                    true
+                }
+                6 -> { tabManager.activeTab?.toggleDesktopMode(); true }
                 else -> false
             }
         }
@@ -344,7 +441,28 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshView() {
         val tab = tabManager.activeTab ?: return
+        // Re-set on every refresh (cheap, idempotent) rather than only once per Tab, since Tab
+        // instances come and go (new tabs, tab-switching) and this is the one place guaranteed to
+        // run before the active tab could plausibly have a download triggered against it.
+        tab.onDownloadRequested = { url, filename -> startDownload(url, filename) }
         binding.browserView.setContent(tab.displayList, tab.contentHeight)
+    }
+
+    /** Hands the URL off to Android's own DownloadManager - a platform primitive (like BitmapFactory for images), not "browser engine" logic. */
+    private fun startDownload(url: String, suggestedFilename: String?) {
+        try {
+            val uri = Uri.parse(url)
+            val filename = suggestedFilename ?: uri.lastPathSegment?.takeIf { it.isNotBlank() } ?: "download"
+            val request = DownloadManager.Request(uri)
+                .setTitle(filename)
+                .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename)
+            val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+            manager.enqueue(request)
+            Toast.makeText(this, getString(R.string.download_started, filename), Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, getString(R.string.download_failed), Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun updateNavButtons() {

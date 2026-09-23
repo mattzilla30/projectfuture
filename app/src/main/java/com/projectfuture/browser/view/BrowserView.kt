@@ -61,6 +61,10 @@ class BrowserView @JvmOverloads constructor(
     private var fixedCommands: List<DisplayCommand> = emptyList()
     private var contentHeight = 0f
     private var scrollYPx = 0f
+    private var findMatches: List<DrawText> = emptyList()
+    private var findCurrentIndex: Int = -1
+    private val findMatchPaint = Paint().apply { color = Color.argb(110, 255, 235, 59) } // translucent yellow
+    private val findCurrentMatchPaint = Paint().apply { color = Color.argb(180, 255, 152, 0) } // translucent orange
     private val rectPaint = Paint()
     private val strokePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 3f; color = Color.DKGRAY }
     private val controlBgPaint = Paint().apply { color = Color.parseColor("#E0E0E0") }
@@ -153,6 +157,31 @@ class BrowserView @JvmOverloads constructor(
         textFieldViews.clear()
     }
 
+    /**
+     * Find-in-page: [matches] are highlighted with a translucent overlay
+     * (drawn in the same page-space coordinates as the underlying
+     * DrawText, so they scroll with the page), and [currentIndex] gets a
+     * stronger highlight and is scrolled into view. Matching itself is
+     * done by the caller (MainActivity) against the current DisplayCommand
+     * list - see its class doc for the per-token-only matching limitation.
+     */
+    fun setFindMatches(matches: List<DrawText>, currentIndex: Int) {
+        findMatches = matches
+        findCurrentIndex = currentIndex
+        val current = matches.getOrNull(currentIndex)
+        if (current != null && !current.fixed) {
+            scrollYPx = (current.top - height / 3f).coerceIn(0f, maxScroll())
+            repositionOverlayViews()
+        }
+        invalidate()
+    }
+
+    fun clearFindMatches() {
+        findMatches = emptyList()
+        findCurrentIndex = -1
+        invalidate()
+    }
+
     private fun maxScroll(): Float = (contentHeight - height).coerceAtLeast(0f)
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -240,6 +269,10 @@ class BrowserView @JvmOverloads constructor(
         canvas.save()
         canvas.translate(0f, -scrollYPx)
         drawCommands(canvas, normalCommands, scrollYPx, scrollYPx + height)
+        for ((i, cmd) in findMatches.withIndex()) {
+            if (cmd.fixed) continue
+            canvas.drawRect(cmd.left, cmd.top, cmd.right, cmd.bottom, if (i == findCurrentIndex) findCurrentMatchPaint else findMatchPaint)
+        }
         canvas.restore()
 
         drawCommands(canvas, fixedCommands, 0f, height.toFloat())

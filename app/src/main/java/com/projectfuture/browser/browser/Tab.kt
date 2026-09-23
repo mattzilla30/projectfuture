@@ -52,6 +52,10 @@ sealed class TabState {
 
 private enum class HistoryAction { PUSH, NONE }
 
+private const val MOBILE_USER_AGENT = "ProjectFutureBrowser/0.1 (Android; from-scratch)"
+private const val DESKTOP_USER_AGENT = "ProjectFutureBrowser/0.1 (X11; Linux x86_64; from-scratch) Desktop"
+private const val DESKTOP_MEDIA_VIEWPORT_WIDTH = 1024f
+
 /**
  * Owns one page's lifecycle: fetch -> parse -> style -> layout, all off the
  * main thread except the final layout/paint handoff, plus back/forward
@@ -81,6 +85,24 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
     private var currentAuthorRules: List<CssRule> = emptyList()
     private var timerIdCounter = 0
     private val canceledTimers = HashSet<Int>()
+
+    /**
+     * "Desktop site" mode: widens the layout viewport (so media queries and
+     * any width-dependent CSS pick a desktop-ish layout) and sends a
+     * desktop-claiming `User-Agent`, since many real sites branch their
+     * served markup/CSS on UA sniffing rather than (or in addition to)
+     * responsive media queries. Toggling reloads the current page.
+     */
+    var desktopMode: Boolean = false
+        private set
+
+    fun toggleDesktopMode() {
+        desktopMode = !desktopMode
+        reload()
+    }
+
+    /** Fired for `<a download href="...">` taps; MainActivity hands the URL off to Android's own DownloadManager (a platform primitive, not "browser engine" logic). */
+    var onDownloadRequested: ((url: String, suggestedFilename: String?) -> Unit)? = null
 
     fun canGoBack() = historyIndex > 0
     fun canGoForward() = historyIndex in 0 until (history.size - 1)
@@ -142,8 +164,14 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         }
 
         if (event?.defaultPrevented != true) {
-            findAncestorHref(element)?.let { href ->
-                followLink(href)
+            findAncestorAnchor(element)?.let { anchor ->
+                val href = anchor.attr("href") ?: return@let
+                if (anchor.attributes.containsKey("download")) {
+                    val suggestedName = anchor.attr("download")?.takeIf { it.isNotBlank() }
+                    onDownloadRequested?.invoke(url.resolve(href).toString(), suggestedName)
+                } else {
+                    followLink(href)
+                }
                 return
             }
             findSubmitForm(element)?.let { form ->
@@ -213,10 +241,10 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         return null
     }
 
-    private fun findAncestorHref(element: ElementNode): String? {
+    private fun findAncestorAnchor(element: ElementNode): ElementNode? {
         var current: ElementNode? = element
         while (current != null) {
-            if (current.tag == "a") current.attr("href")?.let { return it }
+            if (current.tag == "a" && current.attr("href") != null) return current
             current = current.parent
         }
         return null
@@ -286,11 +314,18 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         onStateChanged(TabState.Loading(url))
         // Read on the main thread (load() is always called from one) before
         // handing off to the background executor, rather than reading the
-        // mutable viewportWidth field from that other thread later.
-        val mediaViewportWidth = if (viewportWidth > 0f) viewportWidth else 360f
+        // mutable viewportWidth/desktopMode fields from that other thread later.
+        // The real device width still drives actual box layout (no horizontal
+        // scroll/pinch-zoom exists to pan a wider one), so "desktop site" only
+        // widens what CSS media queries see, plus the User-Agent - a bounded
+        // but real subset of what the toggle does in a real browser.
+        val mediaViewportWidth = if (desktopMode) DESKTOP_MEDIA_VIEWPORT_WIDTH else (if (viewportWidth > 0f) viewportWidth else 360f)
+        val requestHeaders = HashMap<String, String>()
+        requestHeaders["User-Agent"] = if (desktopMode) DESKTOP_USER_AGENT else MOBILE_USER_AGENT
+        if (body != null) requestHeaders["Content-Type"] = "application/x-www-form-urlencoded"
         executor.execute {
             try {
-                val response = url.fetch(method, body, if (body != null) mapOf("Content-Type" to "application/x-www-form-urlencoded") else emptyMap())
+                val response = url.fetch(method, body, requestHeaders)
                 val root = HtmlParser(response.body).parse()
                 // Scripts may mutate the DOM, so this runs before CSS/images/fonts are collected below.
                 val (interpreter, bridge) = runScripts(root, response.url)

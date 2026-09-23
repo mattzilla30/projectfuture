@@ -111,16 +111,20 @@ data class Url(
 
     private fun buildRequestHead(method: String, body: ByteArray?, extraHeaders: Map<String, String>): String {
         val cookieHeader = sharedCookieJar?.cookieHeaderFor(this)
+        // A caller (Tab's "desktop site" toggle) can override the User-Agent via extraHeaders;
+        // it's handled specially here rather than just appended, so there's never a duplicate header.
+        val userAgent = extraHeaders.entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }?.value
+            ?: "ProjectFutureBrowser/0.1 (Android; from-scratch)"
         return buildString {
             append("${method.uppercase()} $path HTTP/1.1\r\n")
             append("Host: $host\r\n")
             append("Connection: keep-alive\r\n")
-            append("User-Agent: ProjectFutureBrowser/0.1 (Android; from-scratch)\r\n")
+            append("User-Agent: $userAgent\r\n")
             append("Accept: text/html,text/css,*/*\r\n")
             append("Accept-Encoding: gzip\r\n")
             if (cookieHeader != null) append("Cookie: $cookieHeader\r\n")
             if (body != null) append("Content-Length: ${body.size}\r\n")
-            for ((k, v) in extraHeaders) append("$k: $v\r\n")
+            for ((k, v) in extraHeaders) if (!k.equals("User-Agent", ignoreCase = true)) append("$k: $v\r\n")
             append("\r\n")
         }
     }

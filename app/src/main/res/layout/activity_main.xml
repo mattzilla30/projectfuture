@@ -92,6 +92,70 @@
         android:max="100"
         android:visibility="gone" />
 
+    <LinearLayout
+        android:id="@+id/findBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:background="@color/chrome_background"
+        android:gravity="center_vertical"
+        android:paddingHorizontal="4dp"
+        android:paddingVertical="6dp"
+        android:visibility="gone">
+
+        <EditText
+            android:id="@+id/editFindQuery"
+            android:layout_width="0dp"
+            android:layout_height="40dp"
+            android:layout_weight="1"
+            android:layout_marginEnd="4dp"
+            android:background="@drawable/bg_address_bar"
+            android:paddingHorizontal="12dp"
+            android:hint="@string/find_in_page_hint"
+            android:imeOptions="actionSearch"
+            android:maxLines="1"
+            android:singleLine="true" />
+
+        <TextView
+            android:id="@+id/textFindCount"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginEnd="4dp"
+            android:minWidth="48dp"
+            android:gravity="center"
+            android:text="0/0"
+            android:textColor="@color/text_color"
+            android:textSize="13sp" />
+
+        <ImageButton
+            android:id="@+id/buttonFindPrev"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/find_previous"
+            android:src="@drawable/ic_arrow_back"
+            app:tint="@color/text_color" />
+
+        <ImageButton
+            android:id="@+id/buttonFindNext"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/find_next"
+            android:src="@drawable/ic_arrow_forward"
+            app:tint="@color/text_color" />
+
+        <ImageButton
+            android:id="@+id/buttonFindClose"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="?attr/selectableItemBackgroundBorderless"
+            android:contentDescription="@string/find_close"
+            android:src="@drawable/ic_close"
+            app:tint="@color/text_color" />
+
+    </LinearLayout>
+
     <com.projectfuture.browser.view.BrowserView
         android:id="@+id/browserView"
         android:layout_width="match_parent"
