@@ -27,6 +27,8 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.projectfuture.browser.browser.BookmarkStore
 import com.projectfuture.browser.browser.HistoryStore
+import com.projectfuture.browser.browser.LocalStorageStore
+import com.projectfuture.browser.browser.sharedLocalStorage
 import com.projectfuture.browser.browser.Settings
 import com.projectfuture.browser.browser.Tab
 import com.projectfuture.browser.browser.TabManager
@@ -64,6 +66,7 @@ class MainActivity : AppCompatActivity() {
         tabSessionStore = TabSessionStore(this)
         TrackingProtection.enabled = settings.trackingProtectionEnabled
         if (sharedCookieJar == null) sharedCookieJar = CookieJar(applicationContext)
+        if (sharedLocalStorage == null) sharedLocalStorage = LocalStorageStore(applicationContext)
 
         binding.browserView.onSizeAvailable = { width, height ->
             lastViewportWidth = width

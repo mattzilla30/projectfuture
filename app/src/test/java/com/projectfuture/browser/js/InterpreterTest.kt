@@ -434,6 +434,24 @@ class InterpreterTest {
         ))
     }
 
+    @Test fun localStorageStyleMethodsAndPropertyAccess() {
+        val interpreter = Interpreter()
+        val backing = InMemoryStorageBacking()
+        interpreter.globalEnv.declare("storage", JsStorage("https://example.com:443", backing))
+        runScript(
+            """
+            storage.setItem('a', '1');
+            storage.b = 'two';
+            var result = storage.getItem('a') + '-' + storage.b + '-' + storage.length;
+            """.trimIndent(),
+            interpreter
+        )
+        assertEquals("1-two-2", (interpreter.globalEnv.get("result") as JsString).value)
+
+        runScript("storage.removeItem('a'); var result2 = storage.getItem('a');", interpreter)
+        assertEquals(JsNull, interpreter.globalEnv.get("result2"))
+    }
+
     @Test fun classStaticMethod() {
         assertNum(9.0, """
             class MathHelper {

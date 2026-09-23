@@ -15,12 +15,14 @@ import com.projectfuture.browser.html.ElementNode
 import com.projectfuture.browser.html.HtmlParser
 import com.projectfuture.browser.html.TextNode
 import com.projectfuture.browser.html.walkElements
+import com.projectfuture.browser.js.InMemoryStorageBacking
 import com.projectfuture.browser.js.Interpreter
 import com.projectfuture.browser.js.JsBoolean
 import com.projectfuture.browser.js.JsFunction
 import com.projectfuture.browser.js.JsNumber
 import com.projectfuture.browser.js.JsObject
 import com.projectfuture.browser.js.JsPromise
+import com.projectfuture.browser.js.JsStorage
 import com.projectfuture.browser.js.JsString
 import com.projectfuture.browser.js.JsUndefined
 import com.projectfuture.browser.js.JsValue
@@ -93,6 +95,8 @@ class Tab(
     private var currentAuthorRules: List<CssRule> = emptyList()
     private var timerIdCounter = 0
     private val canceledTimers = HashSet<Int>()
+    /** `sessionStorage` is per-tab (unlike `localStorage`, which is shared via [sharedLocalStorage]) - see JsStorage's doc. */
+    private val sessionStorageBacking = InMemoryStorageBacking()
 
     /**
      * True once this (background) tab's heavy in-memory state has been
@@ -595,6 +599,18 @@ class Tab(
             computeStyles(pageRoot, currentAuthorRules)
             relayout()
             currentUrl?.let { onStateChanged(TabState.Updated(it, extractTitle(pageRoot))) }
+        }
+
+        // localStorage is shared across every tab (via the module-level sharedLocalStorage); sessionStorage
+        // is this tab's own InMemoryStorageBacking - both keyed by the page's own origin, matching the spec.
+        val origin = "${baseUrl.scheme}://${baseUrl.host}:${baseUrl.port}"
+        val localStorageObj = JsStorage(origin, sharedLocalStorage ?: InMemoryStorageBacking())
+        val sessionStorageObj = JsStorage(origin, sessionStorageBacking)
+        interpreter.globalEnv.declare("localStorage", localStorageObj)
+        interpreter.globalEnv.declare("sessionStorage", sessionStorageObj)
+        (interpreter.globalEnv.get("window") as? JsObject)?.let { window ->
+            window.set("localStorage", localStorageObj)
+            window.set("sessionStorage", sessionStorageObj)
         }
 
         interpreter.globalEnv.declare("fetch", NativeFunction("fetch", 2) { _, _, args ->
