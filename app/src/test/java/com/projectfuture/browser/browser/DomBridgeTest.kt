@@ -147,6 +147,53 @@ class DomBridgeTest {
         assertTrue("preventDefault() called from a listener should set defaultPrevented", event.defaultPrevented)
     }
 
+    @Test fun mutationObserverFiresOnSetAttributeAndAppendChild() {
+        val f = Fixture("<html><body><div id='parent'><span id='child'></span></div></body></html>")
+        f.run(
+            """
+            var log = [];
+            var observer = new MutationObserver(function(records) {
+                log.push(records[0].type + ':' + (records[0].attributeName || ''));
+            });
+            observer.observe(document.getElementById('child'));
+            """.trimIndent()
+        )
+        f.run("document.getElementById('child').setAttribute('data-x', '1');")
+        assertEquals(1.0, (f.eval("log.length") as JsNumber).value, 0.0)
+        assertEquals("attributes:data-x", f.str("log[0]"))
+
+        f.run("document.getElementById('child').removeAttribute('data-x');")
+        assertEquals(2.0, (f.eval("log.length") as JsNumber).value, 0.0)
+        assertEquals("attributes:data-x", f.str("log[1]"))
+    }
+
+    @Test fun mutationObserverSubtreeCatchesDescendantMutations() {
+        val f = Fixture("<html><body><div id='parent'><span id='child'></span></div></body></html>")
+        f.run(
+            """
+            var count = 0;
+            var observer = new MutationObserver(function(records) { count = count + 1; });
+            observer.observe(document.getElementById('parent'), { subtree: true });
+            """.trimIndent()
+        )
+        f.run("document.getElementById('child').setAttribute('data-x', '1');")
+        assertEquals(1.0, (f.eval("count") as JsNumber).value, 0.0)
+    }
+
+    @Test fun mutationObserverDisconnectStopsNotifications() {
+        val f = Fixture("<html><body><div id='child'></div></body></html>")
+        f.run(
+            """
+            var count = 0;
+            var observer = new MutationObserver(function(records) { count = count + 1; });
+            observer.observe(document.getElementById('child'));
+            observer.disconnect();
+            """.trimIndent()
+        )
+        f.run("document.getElementById('child').setAttribute('data-x', '1');")
+        assertEquals(0.0, (f.eval("count") as JsNumber).value, 0.0)
+    }
+
     @Test fun inlineOnclickSeesImplicitEventVariable() {
         val f = Fixture("<html><body><button id='btn' onclick='event.preventDefault();'>go</button></body></html>")
         var button: ElementNode? = null

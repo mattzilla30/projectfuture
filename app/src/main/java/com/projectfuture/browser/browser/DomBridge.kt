@@ -51,6 +51,9 @@ class DomBridge(private val root: ElementNode) {
     private val domContentLoadedListeners = ArrayList<JsFunction>()
     private val canvasContexts = HashMap<ElementNode, CanvasContext2D>()
     private val windowListeners = HashMap<String, MutableList<JsFunction>>()
+    private val mutationObservers = ArrayList<ObserverRegistration>()
+
+    private class ObserverRegistration(val callback: JsFunction, val target: ElementNode, val subtree: Boolean)
 
     fun wrap(node: ElementNode): DomElement = wrappers.getOrPut(node) { DomElement(node, this) }
 
@@ -100,6 +103,7 @@ class DomBridge(private val root: ElementNode) {
     }
 
     fun install(env: Environment) {
+        installMutationObserver(env)
         val document = DomDocument(root)
         document.set("documentElement", wrap(root))
         document.set("body", findFirst(root, "body")?.let { wrap(it) } ?: JsNull)
@@ -147,6 +151,74 @@ class DomBridge(private val root: ElementNode) {
 
     fun fireDomContentLoaded(interpreter: Interpreter) {
         for (fn in domContentLoadedListeners) fn.call(interpreter, JsUndefined, emptyList())
+    }
+
+    /**
+     * `new MutationObserver(callback)` / `.observe(target, options)` /
+     * `.disconnect()`. A real, working subset: every mutation is reported
+     * the instant it happens, as a single-record callback call, rather
+     * than the spec's microtask-batched multi-record delivery - consistent
+     * with this interpreter's Promises also resolving synchronously rather
+     * than through a real microtask queue. `options` is accepted but not
+     * used to filter mutation types (any observed target reports
+     * attribute/childList/characterData changes alike) - only
+     * `subtree` is honored. Only the method-style mutations
+     * (`setAttribute`/`removeAttribute`/`appendChild`/`remove`) notify -
+     * those run as NativeFunction calls, which receive an Interpreter to
+     * invoke the observer callback with. Property-style mutations
+     * (`el.textContent = x`, `el.innerHTML = x`, `el.className = x`,
+     * `classList.add(...)`) go through `DomElement.set()`, a plain
+     * property setter with no Interpreter parameter to call an observer
+     * callback with at all - a real, accepted gap rather than
+     * restructuring JsObject's base `set()` signature project-wide for
+     * this one caller's benefit.
+     */
+    fun installMutationObserver(env: Environment) {
+        val ctor = NativeFunction("MutationObserver", 1) { _, thisArg, args ->
+            val callback = args.getOrNull(0) as? JsFunction
+            val obj = thisArg as? JsObject ?: JsObject()
+            obj.set("observe", NativeFunction("observe", 2) { _, _, observeArgs ->
+                val target = (observeArgs.getOrNull(0) as? DomElement)?.node
+                val options = observeArgs.getOrNull(1) as? JsObject
+                if (target != null && callback != null) {
+                    val subtree = options?.get("subtree")?.let { isTruthy(it) } ?: false
+                    mutationObservers.add(ObserverRegistration(callback, target, subtree))
+                }
+                JsUndefined
+            })
+            obj.set("disconnect", NativeFunction("disconnect", 0) { _, _, _ ->
+                mutationObservers.removeAll { it.callback === callback }
+                JsUndefined
+            })
+            obj
+        }
+        env.declare("MutationObserver", ctor)
+    }
+
+    private fun isDescendantOf(node: ElementNode, ancestor: ElementNode): Boolean {
+        var current: ElementNode? = node.parent
+        while (current != null) {
+            if (current === ancestor) return true
+            current = current.parent
+        }
+        return false
+    }
+
+    fun notifyMutation(interpreter: Interpreter, target: ElementNode, type: String, attributeName: String? = null) {
+        if (mutationObservers.isEmpty()) return
+        for (reg in mutationObservers.toList()) {
+            val matches = reg.target === target || (reg.subtree && isDescendantOf(target, reg.target))
+            if (!matches) continue
+            val record = JsObject()
+            record.set("type", JsString(type))
+            record.set("target", wrap(target))
+            record.set("attributeName", attributeName?.let { JsString(it) } ?: JsNull)
+            try {
+                reg.callback.call(interpreter, JsUndefined, listOf(JsArray(mutableListOf(record))))
+            } catch (_: Exception) {
+                // A broken observer callback shouldn't block the mutation that triggered it.
+            }
+        }
     }
 
     private fun findFirst(node: ElementNode, tag: String): ElementNode? {
@@ -205,27 +277,34 @@ class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObjec
             }
             result
         }
-        "setAttribute" -> NativeFunction("setAttribute", 2) { _, _, args ->
-            node.attributes[toJsString(args.getOrElse(0) { JsUndefined })] = toJsString(args.getOrElse(1) { JsUndefined })
+        "setAttribute" -> NativeFunction("setAttribute", 2) { interp, _, args ->
+            val attrName = toJsString(args.getOrElse(0) { JsUndefined })
+            node.attributes[attrName] = toJsString(args.getOrElse(1) { JsUndefined })
+            bridge.notifyMutation(interp, node, "attributes", attrName)
             JsUndefined
         }
         "getAttribute" -> NativeFunction("getAttribute", 1) { _, _, args ->
             node.attr(toJsString(args.getOrElse(0) { JsUndefined }))?.let { JsString(it) } ?: JsNull
         }
-        "removeAttribute" -> NativeFunction("removeAttribute", 1) { _, _, args ->
-            node.attributes.remove(toJsString(args.getOrElse(0) { JsUndefined }))
+        "removeAttribute" -> NativeFunction("removeAttribute", 1) { interp, _, args ->
+            val attrName = toJsString(args.getOrElse(0) { JsUndefined })
+            node.attributes.remove(attrName)
+            bridge.notifyMutation(interp, node, "attributes", attrName)
             JsUndefined
         }
-        "appendChild" -> NativeFunction("appendChild", 1) { _, _, args ->
+        "appendChild" -> NativeFunction("appendChild", 1) { interp, _, args ->
             val child = args.getOrNull(0) as? DomElement
             if (child != null) {
                 child.node.parent = node
                 node.children.add(child.node)
+                bridge.notifyMutation(interp, node, "childList")
             }
             args.getOrElse(0) { JsUndefined }
         }
-        "remove" -> NativeFunction("remove", 0) { _, _, _ ->
-            node.parent?.children?.remove(node)
+        "remove" -> NativeFunction("remove", 0) { interp, _, _ ->
+            val parent = node.parent
+            parent?.children?.remove(node)
+            if (parent != null) bridge.notifyMutation(interp, parent, "childList")
             JsUndefined
         }
         "addEventListener" -> NativeFunction("addEventListener", 2) { _, _, args ->
