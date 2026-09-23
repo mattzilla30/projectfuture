@@ -20,6 +20,7 @@ import com.projectfuture.browser.css.resolveFlexMainSizes
 import com.projectfuture.browser.css.resolveGridColumnWidths
 import com.projectfuture.browser.css.resolveGridContainerProps
 import com.projectfuture.browser.css.resolvePositionOffsets
+import com.projectfuture.browser.css.resolveTranslate
 import com.projectfuture.browser.html.ElementNode
 import com.projectfuture.browser.html.HtmlParser
 import com.projectfuture.browser.html.Node
@@ -75,6 +76,11 @@ import com.projectfuture.browser.html.TextNode
  * come from Tab's collectAndDecodeImages via the module-level
  * [currentImages] map. `data:` URIs and `srcset`/`sizes` aren't handled;
  * a broken/missing image is just skipped (no alt-text or broken-image icon).
+ *
+ * `transform: translate()`/`translateX()`/`translateY()` folds into an
+ * element's position the same way `position: relative`'s offset does.
+ * `scale`/`rotate`/`skew` and animated `transition`/`@keyframes` are not
+ * implemented - see Transform.kt for why.
  *
  * Text direction and line-breaking are approximated, not spec-complete:
  * CJK characters (which don't use spaces) each get their own break
@@ -267,6 +273,13 @@ class BlockLayout(
                 y += offsets.top ?: offsets.bottom?.let { -it } ?: 0f
             }
         }
+
+        // transform: translate() applies to any box, not just positioned
+        // ones, and folds in the same way relative offsets do above -
+        // see Transform.kt for what's (deliberately) not supported here.
+        val translate = resolveTranslate(node.style["transform"], width, metrics.explicitContentHeight, fontSizePx)
+        x += translate.dx
+        y += translate.dy
 
         // Containing block passed to descendants when this box establishes one.
         // Height is approximated from the nearest known height when this box's
