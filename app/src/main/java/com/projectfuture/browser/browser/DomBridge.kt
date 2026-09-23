@@ -50,6 +50,7 @@ class DomBridge(private val root: ElementNode) {
     private val wrappers = HashMap<ElementNode, DomElement>()
     private val domContentLoadedListeners = ArrayList<JsFunction>()
     private val canvasContexts = HashMap<ElementNode, CanvasContext2D>()
+    private val windowListeners = HashMap<String, MutableList<JsFunction>>()
 
     fun wrap(node: ElementNode): DomElement = wrappers.getOrPut(node) { DomElement(node, this) }
 
@@ -131,7 +132,17 @@ class DomBridge(private val root: ElementNode) {
             println("[alert] " + toJsString(args.getOrElse(0) { JsUndefined }))
             JsUndefined
         })
+        window.set("addEventListener", NativeFunction("addEventListener", 2) { _, _, args ->
+            val type = toJsString(args.getOrElse(0) { JsUndefined })
+            (args.getOrNull(1) as? JsFunction)?.let { windowListeners.getOrPut(type) { ArrayList() }.add(it) }
+            JsUndefined
+        })
         env.declare("window", window)
+    }
+
+    /** Fires a `window`-level event (currently just `popstate`, from Tab's pushState/back-forward handling) with no bubbling concept - there's only one window. */
+    fun dispatchWindowEvent(type: String, interpreter: Interpreter, event: JsEvent) {
+        for (fn in (windowListeners[type] ?: emptyList()).toList()) fn.call(interpreter, JsUndefined, listOf(event))
     }
 
     fun fireDomContentLoaded(interpreter: Interpreter) {

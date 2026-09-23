@@ -18,7 +18,9 @@ import com.projectfuture.browser.html.walkElements
 import com.projectfuture.browser.js.InMemoryStorageBacking
 import com.projectfuture.browser.js.Interpreter
 import com.projectfuture.browser.js.JsBoolean
+import com.projectfuture.browser.js.JsEvent
 import com.projectfuture.browser.js.JsFunction
+import com.projectfuture.browser.js.JsNull
 import com.projectfuture.browser.js.JsNumber
 import com.projectfuture.browser.js.JsObject
 import com.projectfuture.browser.js.JsPromise
@@ -32,6 +34,7 @@ import com.projectfuture.browser.js.Parser
 import com.projectfuture.browser.js.jsError
 import com.projectfuture.browser.js.parseJsonToJsValue
 import com.projectfuture.browser.js.toJsString
+import com.projectfuture.browser.js.toNumber
 import com.projectfuture.browser.layout.DisplayCommand
 import com.projectfuture.browser.layout.DocumentLayout
 import com.projectfuture.browser.layout.FontDecoder
@@ -75,6 +78,18 @@ class Tab(
 ) {
 
     private val history = ArrayList<Url>()
+    /**
+     * Parallel to [history]: which "document generation" each entry
+     * belongs to. `pushState`/`replaceState` add/update entries in the
+     * *current* generation (no real navigation happened - see
+     * [pushState]'s doc), while an ordinary page load bumps the
+     * generation. `goBack`/`goForward` compare the target entry's
+     * generation against the current one to decide whether landing on it
+     * needs a real re-fetch or just a `popstate` fire against the
+     * still-loaded document.
+     */
+    private val historyGenerations = ArrayList<Int>()
+    private var documentGeneration = 0
     private var historyIndex = -1
     private val executor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -192,6 +207,39 @@ class Tab(
         onStateChanged(TabState.Updated(url, extractTitle(currentDoc!!)))
     }
 
+    /**
+     * `history.pushState`/`replaceState`: no navigation happens at all -
+     * no fetch, no re-parse, the currently loaded document just gets a new
+     * URL recorded against it. `pushState` adds a new same-generation
+     * history entry (truncating any forward entries, like a real
+     * navigation would); `replaceState` overwrites the current one. Both
+     * report TabState.Updated so the address bar follows along.
+     */
+    fun pushState(newUrlString: String) {
+        val base = currentUrl ?: return
+        val newUrl = try { base.resolve(newUrlString) } catch (_: Exception) { return }
+        while (history.size > historyIndex + 1) {
+            history.removeAt(history.size - 1)
+            historyGenerations.removeAt(historyGenerations.size - 1)
+        }
+        history.add(newUrl)
+        historyGenerations.add(documentGeneration)
+        historyIndex = history.size - 1
+        currentUrl = newUrl
+        onStateChanged(TabState.Updated(newUrl, currentDoc?.let { extractTitle(it) }))
+    }
+
+    fun replaceState(newUrlString: String) {
+        val base = currentUrl ?: return
+        val newUrl = try { base.resolve(newUrlString) } catch (_: Exception) { return }
+        if (historyIndex in history.indices) {
+            history[historyIndex] = newUrl
+            historyGenerations[historyIndex] = documentGeneration
+        }
+        currentUrl = newUrl
+        onStateChanged(TabState.Updated(newUrl, currentDoc?.let { extractTitle(it) }))
+    }
+
     fun canGoBack() = historyIndex > 0
     fun canGoForward() = historyIndex in 0 until (history.size - 1)
 
@@ -201,14 +249,30 @@ class Tab(
 
     fun goBack() {
         if (!canGoBack()) return
-        historyIndex--
-        load(history[historyIndex], HistoryAction.NONE)
+        stepHistory(historyIndex - 1)
     }
 
     fun goForward() {
         if (!canGoForward()) return
-        historyIndex++
-        load(history[historyIndex], HistoryAction.NONE)
+        stepHistory(historyIndex + 1)
+    }
+
+    /** Shared by goBack/goForward/history.go(n): reload only if the target entry belongs to a different document generation - see [historyGenerations]'s doc. */
+    private fun stepHistory(targetIndex: Int) {
+        if (targetIndex !in history.indices) return
+        val sameDocument = historyGenerations.getOrNull(targetIndex) == documentGeneration
+        historyIndex = targetIndex
+        if (sameDocument) {
+            currentUrl = history[targetIndex]
+            val interpreter = currentInterpreter
+            val bridge = currentDomBridge
+            if (interpreter != null && bridge != null) {
+                try { bridge.dispatchWindowEvent("popstate", interpreter, JsEvent("popstate", JsNull)) } catch (_: Exception) {}
+            }
+            onStateChanged(TabState.Updated(history[targetIndex], currentDoc?.let { extractTitle(it) }))
+        } else {
+            load(history[targetIndex], HistoryAction.NONE)
+        }
     }
 
     fun reload() {
@@ -434,15 +498,25 @@ class Tab(
                     currentAuthorRules = authorCss.rules
                     canceledTimers.clear()
                     isDiscarded = false
+                    documentGeneration++
                     when (action) {
                         HistoryAction.PUSH -> {
-                            while (history.size > historyIndex + 1) history.removeAt(history.size - 1)
+                            while (history.size > historyIndex + 1) {
+                                history.removeAt(history.size - 1)
+                                historyGenerations.removeAt(historyGenerations.size - 1)
+                            }
                             history.add(response.url)
+                            historyGenerations.add(documentGeneration)
                             historyIndex = history.size - 1
                         }
                         HistoryAction.NONE -> if (history.isEmpty()) {
                             history.add(response.url)
+                            historyGenerations.add(documentGeneration)
                             historyIndex = 0
+                        } else {
+                            // Re-fetched an existing entry (goBack/goForward crossing into a different
+                            // document generation, or reload()) - it's now this fresh generation.
+                            historyGenerations[historyIndex] = documentGeneration
                         }
                     }
                     relayout()
@@ -608,9 +682,27 @@ class Tab(
         val sessionStorageObj = JsStorage(origin, sessionStorageBacking)
         interpreter.globalEnv.declare("localStorage", localStorageObj)
         interpreter.globalEnv.declare("sessionStorage", sessionStorageObj)
+        val historyObj = JsObject()
+        historyObj.set("pushState", NativeFunction("pushState", 3) { _, _, args ->
+            pushState(toJsString(args.getOrElse(2) { JsUndefined }))
+            JsUndefined
+        })
+        historyObj.set("replaceState", NativeFunction("replaceState", 3) { _, _, args ->
+            replaceState(toJsString(args.getOrElse(2) { JsUndefined }))
+            JsUndefined
+        })
+        historyObj.set("back", NativeFunction("back", 0) { _, _, _ -> goBack(); JsUndefined })
+        historyObj.set("forward", NativeFunction("forward", 0) { _, _, _ -> goForward(); JsUndefined })
+        historyObj.set("go", NativeFunction("go", 1) { _, _, args ->
+            val delta = toNumber(args.getOrElse(0) { JsNumber(0.0) }).toInt()
+            stepHistory(historyIndex + delta)
+            JsUndefined
+        })
+        interpreter.globalEnv.declare("history", historyObj)
         (interpreter.globalEnv.get("window") as? JsObject)?.let { window ->
             window.set("localStorage", localStorageObj)
             window.set("sessionStorage", sessionStorageObj)
+            window.set("history", historyObj)
         }
 
         interpreter.globalEnv.declare("fetch", NativeFunction("fetch", 2) { _, _, args ->
