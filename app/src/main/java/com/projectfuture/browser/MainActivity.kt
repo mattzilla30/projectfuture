@@ -374,6 +374,11 @@ class MainActivity : AppCompatActivity() {
         }
         popup.menu.add(0, 8, 7, R.string.menu_settings)
         popup.menu.add(0, 9, 8, R.string.menu_print).isEnabled = currentUrl != null
+        popup.menu.add(0, 10, 9, R.string.menu_reader_mode).apply {
+            isCheckable = true
+            isChecked = tabManager.activeTab?.readerModeActive == true
+            isEnabled = currentUrl != null
+        }
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> {
@@ -406,6 +411,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 8 -> { showSettingsDialog(); true }
                 9 -> { printCurrentPage(); true }
+                10 -> { tabManager.activeTab?.toggleReaderMode(); true }
                 else -> false
             }
         }

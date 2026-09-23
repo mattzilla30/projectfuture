@@ -119,6 +119,44 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         relayout()
     }
 
+    var readerModeActive: Boolean = false
+        private set
+    private var docBeforeReaderMode: ElementNode? = null
+    private var authorRulesBeforeReaderMode: List<CssRule> = emptyList()
+    private val readerModeRules: List<CssRule> by lazy { CssParser(READER_MODE_CSS).parseRules() }
+
+    /**
+     * Swaps the live document for one built by [extractReaderContent] and
+     * a plain typographic stylesheet, or restores the original if already
+     * active. Purely a presentation swap on the already-loaded page - no
+     * re-fetch, no history entry, no interaction with scripts (a reader-
+     * mode document has no JS bridge; the original interpreter/DomBridge
+     * stay untouched underneath so toggling back is exact). Images don't
+     * render in reader mode: [currentImages] is keyed by the original
+     * page's own `<img>` ElementNode identity, and the extracted document
+     * is built from fresh clones (see extractReaderContent) that were
+     * never decoded against - a real, accepted gap rather than rebuilding
+     * that map by matching `src` strings across both trees.
+     */
+    fun toggleReaderMode() {
+        val doc = currentDoc ?: return
+        val url = currentUrl ?: return
+        if (readerModeActive) {
+            currentDoc = docBeforeReaderMode ?: doc
+            computeStyles(currentDoc!!, authorRulesBeforeReaderMode)
+            readerModeActive = false
+        } else {
+            val extracted = extractReaderContent(doc) ?: return
+            docBeforeReaderMode = doc
+            authorRulesBeforeReaderMode = currentAuthorRules
+            currentDoc = extracted
+            computeStyles(extracted, readerModeRules)
+            readerModeActive = true
+        }
+        relayout()
+        onStateChanged(TabState.Updated(url, extractTitle(currentDoc!!)))
+    }
+
     fun canGoBack() = historyIndex > 0
     fun canGoForward() = historyIndex in 0 until (history.size - 1)
 
