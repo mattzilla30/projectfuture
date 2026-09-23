@@ -6,6 +6,11 @@
     <string name="action_back">Back</string>
     <string name="action_forward">Forward</string>
     <string name="action_reload">Reload</string>
+    <string name="action_tabs">Open tabs</string>
+    <string name="action_new_tab">New tab</string>
+    <string name="action_close">Close</string>
+    <string name="tabs_dialog_title">Tabs</string>
+    <string name="untitled_tab">New tab</string>
     <string name="loading">Loading…</string>
     <string name="error_load_failed">Couldn\'t load %1$s: %2$s</string>
 </resources>
