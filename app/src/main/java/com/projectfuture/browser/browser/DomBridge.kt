@@ -1,5 +1,6 @@
 package com.projectfuture.browser.browser
 
+import android.graphics.Bitmap
 import com.projectfuture.browser.css.CssParser
 import com.projectfuture.browser.html.ElementNode
 import com.projectfuture.browser.html.HtmlParser
@@ -47,8 +48,19 @@ import com.projectfuture.browser.js.toJsString
 class DomBridge(private val root: ElementNode) {
     private val wrappers = HashMap<ElementNode, DomElement>()
     private val domContentLoadedListeners = ArrayList<JsFunction>()
+    private val canvasContexts = HashMap<ElementNode, CanvasContext2D>()
 
     fun wrap(node: ElementNode): DomElement = wrappers.getOrPut(node) { DomElement(node, this) }
+
+    /** `<canvas>` uses width/height HTML attributes for its bitmap resolution (default 300x150 per spec), not CSS. */
+    fun getOrCreateCanvasContext(node: ElementNode): CanvasContext2D = canvasContexts.getOrPut(node) {
+        val w = (node.attr("width")?.toIntOrNull() ?: 300).coerceAtLeast(1)
+        val h = (node.attr("height")?.toIntOrNull() ?: 150).coerceAtLeast(1)
+        CanvasContext2D(Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888))
+    }
+
+    /** For Tab to merge into its image map, since canvases render via the same inline-image path as `<img>`/`<svg>`. */
+    fun canvasBitmaps(): Map<ElementNode, Bitmap> = canvasContexts.mapValues { it.value.bitmap }
 
     /**
      * Bubbles a click from [startNode] up through every ancestor
@@ -177,6 +189,9 @@ class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObjec
             val type = toJsString(args.getOrElse(0) { JsUndefined })
             (args.getOrNull(1) as? JsFunction)?.let { listeners.getOrPut(type) { ArrayList() }.add(it) }
             JsUndefined
+        }
+        "getContext" -> NativeFunction("getContext", 1) { _, _, args ->
+            if (toJsString(args.getOrElse(0) { JsUndefined }) == "2d") bridge.getOrCreateCanvasContext(node) else JsNull
         }
         else -> super.get(name)
     }

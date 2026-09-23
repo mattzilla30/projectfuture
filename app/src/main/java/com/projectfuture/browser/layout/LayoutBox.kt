@@ -79,7 +79,11 @@ import com.projectfuture.browser.html.TextNode
  *
  * `<svg>` is rasterized to a bitmap up front by SvgRenderer (see its class
  * doc for the bounded shape/path support) and then flows through this
- * exact same `<img>` inline-image path.
+ * exact same `<img>` inline-image path. `<canvas>` works the same way:
+ * `getContext('2d')` (CanvasContext2D) draws onto a Bitmap that a script
+ * mutates directly, and since that Bitmap is the same mutable object the
+ * display list already points to, a later re-layout (e.g. a setInterval
+ * tick) picks up newly-drawn pixels automatically.
  *
  * `transform: translate()`/`translateX()`/`translateY()` folds into an
  * element's position the same way `position: relative`'s offset does.
@@ -793,7 +797,7 @@ class BlockLayout(
                     }
                 }
                 is ElementNode -> {
-                    if (isSkipped(n) || n.tag == "br" || n.tag == "img" || n.tag == "svg") return
+                    if (isSkipped(n) || n.tag == "br" || n.tag == "img" || n.tag == "svg" || n.tag == "canvas") return
                     val href = if (n.tag == "a") n.attr("href") else linkHref
                     for (c in n.children) walk(c, href)
                 }
@@ -823,7 +827,7 @@ class BlockLayout(
                     flushLine()
                     return
                 }
-                if (n.tag == "img" || n.tag == "svg") {
+                if (n.tag == "img" || n.tag == "svg" || n.tag == "canvas") {
                     currentImages[n]?.let { addImage(it, n) }
                     return
                 }

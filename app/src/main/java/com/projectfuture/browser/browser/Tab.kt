@@ -154,7 +154,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                 val authorCss = collectAuthorCss(root, response.url, mediaViewportWidth)
                 computeStyles(root, authorCss.rules)
                 val title = extractTitle(root)
-                val images = collectAndDecodeImages(root, response.url) + collectAndRenderSvgs(root)
+                val images = collectAndDecodeImages(root, response.url) + collectAndRenderSvgs(root) + bridge.canvasBitmaps()
                 val fonts = loadFontFaces(authorCss.fontFaces)
                 mainHandler.post {
                     currentUrl = response.url
