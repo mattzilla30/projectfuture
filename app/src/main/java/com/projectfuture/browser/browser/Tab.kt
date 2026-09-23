@@ -122,8 +122,8 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
     fun canGoBack() = historyIndex > 0
     fun canGoForward() = historyIndex in 0 until (history.size - 1)
 
-    fun navigate(addressBarInput: String) {
-        load(Url.fromAddressBar(addressBarInput), HistoryAction.PUSH)
+    fun navigate(addressBarInput: String, searchTemplate: String = Settings.DEFAULT_SEARCH_TEMPLATE) {
+        load(Url.fromAddressBar(addressBarInput, searchTemplate), HistoryAction.PUSH)
     }
 
     fun goBack() {

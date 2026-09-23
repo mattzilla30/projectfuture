@@ -14,6 +14,7 @@ import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.BaseAdapter
+import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ListView
@@ -25,6 +26,7 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.projectfuture.browser.browser.BookmarkStore
 import com.projectfuture.browser.browser.HistoryStore
+import com.projectfuture.browser.browser.Settings
 import com.projectfuture.browser.browser.Tab
 import com.projectfuture.browser.browser.TabManager
 import com.projectfuture.browser.browser.TabState
@@ -33,14 +35,13 @@ import com.projectfuture.browser.net.CookieJar
 import com.projectfuture.browser.net.sharedCookieJar
 import com.projectfuture.browser.databinding.ActivityMainBinding
 
-private const val START_URL = "https://example.com/"
-
 class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var tabManager: TabManager
     private lateinit var bookmarkStore: BookmarkStore
     private lateinit var historyStore: HistoryStore
+    private lateinit var settings: Settings
     private val tabTitles = HashMap<Tab, String>()
     private var lastViewportWidth = 0f
     private var lastViewportHeight = 0f
@@ -54,6 +55,7 @@ class MainActivity : AppCompatActivity() {
         tabManager = TabManager(this, ::onTabStateChanged)
         bookmarkStore = BookmarkStore(this)
         historyStore = HistoryStore(this)
+        settings = Settings(this)
         if (sharedCookieJar == null) sharedCookieJar = CookieJar(applicationContext)
 
         binding.browserView.onSizeAvailable = { width, height ->
@@ -83,7 +85,7 @@ class MainActivity : AppCompatActivity() {
             if (committed) {
                 val input = binding.editAddress.text.toString()
                 if (input.isNotBlank()) {
-                    tabManager.activeTab?.navigate(input)
+                    tabManager.activeTab?.navigate(input, settings.searchTemplate)
                     hideKeyboard()
                     binding.browserView.requestFocus()
                 }
@@ -106,9 +108,9 @@ class MainActivity : AppCompatActivity() {
         })
 
         tabManager.newTab()
-        val startUrl = intent?.dataString?.takeIf { intent?.action == Intent.ACTION_VIEW } ?: START_URL
+        val startUrl = intent?.dataString?.takeIf { intent?.action == Intent.ACTION_VIEW } ?: settings.homePage
         binding.editAddress.setText(startUrl)
-        tabManager.activeTab?.navigate(startUrl)
+        tabManager.activeTab?.navigate(startUrl, settings.searchTemplate)
         updateTabCountButton()
 
         setUpFindBar()
@@ -121,7 +123,7 @@ class MainActivity : AppCompatActivity() {
             intent.dataString?.let { url ->
                 openNewTab()
                 binding.editAddress.setText(url)
-                tabManager.activeTab?.navigate(url)
+                tabManager.activeTab?.navigate(url, settings.searchTemplate)
             }
         }
     }
@@ -248,6 +250,40 @@ class MainActivity : AppCompatActivity() {
         updateTabCountButton()
     }
 
+    /** The whole "settings screen": two fields, no PreferenceScreen framework - see Settings.kt's doc. */
+    private fun showSettingsDialog() {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 24, 48, 0)
+        }
+        val homePageLabel = TextView(this).apply { text = getString(R.string.settings_home_page) }
+        val homePageInput = EditText(this).apply {
+            setText(settings.homePage)
+            inputType = android.text.InputType.TYPE_TEXT_VARIATION_URI
+            maxLines = 1
+        }
+        val searchLabel = TextView(this).apply { text = getString(R.string.settings_search_template) }
+        val searchInput = EditText(this).apply {
+            setText(settings.searchTemplate)
+            maxLines = 1
+        }
+        container.addView(homePageLabel)
+        container.addView(homePageInput)
+        container.addView(searchLabel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = 32 })
+        container.addView(searchInput)
+
+        AlertDialog.Builder(this)
+            .setTitle(R.string.menu_settings)
+            .setView(container)
+            .setPositiveButton(R.string.action_save) { d, _ ->
+                settings.homePage = homePageInput.text.toString().trim()
+                settings.searchTemplate = searchInput.text.toString().trim()
+                d.dismiss()
+            }
+            .setNegativeButton(R.string.action_close, null)
+            .show()
+    }
+
     private fun openNewTab() {
         tabManager.newTab()
         switchToTab(tabManager.count() - 1)
@@ -336,6 +372,7 @@ class MainActivity : AppCompatActivity() {
             isCheckable = true
             isChecked = darkModeEnabled
         }
+        popup.menu.add(0, 8, 7, R.string.menu_settings)
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> {
@@ -366,6 +403,7 @@ class MainActivity : AppCompatActivity() {
                     refreshView()
                     true
                 }
+                8 -> { showSettingsDialog(); true }
                 else -> false
             }
         }
