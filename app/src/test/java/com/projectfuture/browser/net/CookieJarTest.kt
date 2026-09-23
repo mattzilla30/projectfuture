@@ -55,4 +55,66 @@ class CookieJarTest {
         assertTrue(!corsAllows(page, mapOf("access-control-allow-origin" to "https://other.com")))
         assertTrue(!corsAllows(page, emptyMap()))
     }
+
+    private fun response(status: Int = 200, cacheControl: String? = null) =
+        HttpResponse(status, cacheControl?.let { mapOf("cache-control" to it) } ?: emptyMap(), "body", Url.parse("https://example.com/x"))
+
+    @Test fun cacheableExpiryHonorsMaxAge() {
+        val now = 1_000_000L
+        assertEquals(now + 60_000L, cacheableExpiryMillis(response(cacheControl = "max-age=60"), now))
+    }
+
+    @Test fun cacheableExpiryRejectsNoStoreNoCacheAndPrivate() {
+        val now = 1_000_000L
+        assertEquals(null, cacheableExpiryMillis(response(cacheControl = "no-store, max-age=60"), now))
+        assertEquals(null, cacheableExpiryMillis(response(cacheControl = "no-cache, max-age=60"), now))
+        assertEquals(null, cacheableExpiryMillis(response(cacheControl = "private, max-age=60"), now))
+    }
+
+    @Test fun cacheableExpiryRejectsNonOkAndMissingMaxAge() {
+        val now = 1_000_000L
+        assertEquals(null, cacheableExpiryMillis(response(status = 404, cacheControl = "max-age=60"), now))
+        assertEquals(null, cacheableExpiryMillis(response(cacheControl = null), now))
+    }
+
+    @Test fun mixedContentOnlyBlocksHttpsPageLoadingHttpResource() {
+        assertTrue(isMixedContent(Url.parse("https://example.com/"), Url.parse("http://cdn.example.com/x.js")))
+        assertTrue(!isMixedContent(Url.parse("https://example.com/"), Url.parse("https://cdn.example.com/x.js")))
+        assertTrue(!isMixedContent(Url.parse("http://example.com/"), Url.parse("http://cdn.example.com/x.js")))
+        assertTrue(!isMixedContent(Url.parse("http://example.com/"), Url.parse("https://cdn.example.com/x.js")))
+    }
+
+    @Test fun parseMaxAgeExtractsSecondsFromHeaderValue() {
+        assertEquals(31536000L, parseMaxAge("max-age=31536000; includeSubDomains"))
+        assertEquals(0L, parseMaxAge("max-age=0"))
+        assertEquals(null, parseMaxAge("includeSubDomains"))
+    }
+
+    @Test fun hstsStoreEnforcesThenExpires() {
+        HstsStore.clear()
+        val now = 1_000_000L
+        HstsStore.record("example.com", "max-age=100", now)
+        assertTrue(HstsStore.isEnforced("example.com", now + 50_000L))
+        assertTrue(!HstsStore.isEnforced("example.com", now + 150_000L)) // past max-age, in seconds*1000
+        assertTrue(!HstsStore.isEnforced("never-seen.com", now))
+    }
+
+    @Test fun hstsMaxAgeZeroForgetsTheHost() {
+        HstsStore.clear()
+        val now = 1_000_000L
+        HstsStore.record("example.com", "max-age=100", now)
+        HstsStore.record("example.com", "max-age=0", now)
+        assertTrue(!HstsStore.isEnforced("example.com", now))
+    }
+
+    @Test fun httpCacheServesFreshEntryAndDropsExpiredOne() {
+        HttpCache.clear()
+        val url = Url.parse("https://example.com/cached")
+        val resp = HttpResponse(200, mapOf("cache-control" to "max-age=60"), "cached-body", url)
+        val storedAt = 1_000_000L
+        HttpCache.store(url, resp, storedAt)
+
+        assertEquals("cached-body", HttpCache.get(url, storedAt + 30_000L)?.body)
+        assertEquals(null, HttpCache.get(url, storedAt + 61_000L)) // past max-age
+    }
 }

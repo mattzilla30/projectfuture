@@ -37,6 +37,7 @@ import com.projectfuture.browser.layout.customFonts
 import com.projectfuture.browser.net.HttpResponse
 import com.projectfuture.browser.net.Url
 import com.projectfuture.browser.net.corsAllows
+import com.projectfuture.browser.net.isMixedContent
 import com.projectfuture.browser.net.isSameOrigin
 import java.io.File
 import java.util.concurrent.Executors
@@ -297,7 +298,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                 computeStyles(root, authorCss.rules)
                 val title = extractTitle(root)
                 val images = collectAndDecodeImages(root, response.url) + collectAndRenderSvgs(root) + bridge.canvasBitmaps()
-                val fonts = loadFontFaces(authorCss.fontFaces)
+                val fonts = loadFontFaces(authorCss.fontFaces, response.url)
                 mainHandler.post {
                     currentUrl = response.url
                     currentDoc = root
@@ -352,8 +353,10 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             if (el.tag == "img") {
                 val src = el.attr("src")
                 if (!src.isNullOrBlank()) {
+                    val imgUrl = baseUrl.resolve(src)
+                    if (isMixedContent(baseUrl, imgUrl)) return@walkElements
                     try {
-                        val bytes = baseUrl.resolve(src).fetchBytes().body
+                        val bytes = imgUrl.fetchBytes().body
                         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { result[el] = it }
                     } catch (_: Exception) {
                         // Broken/unreachable image: skip it rather than failing the whole page load.
@@ -401,7 +404,9 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         for (scriptEl in scripts) {
             val src = scriptEl.attr("src")
             val code = if (!src.isNullOrBlank()) {
-                try { baseUrl.resolve(src).fetch().body } catch (_: Exception) { null }
+                val scriptUrl = baseUrl.resolve(src)
+                if (isMixedContent(baseUrl, scriptUrl)) null
+                else try { scriptUrl.fetch().body } catch (_: Exception) { null }
             } else {
                 scriptEl.children.filterIsInstance<TextNode>().joinToString("") { it.text }
             }
@@ -453,6 +458,8 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             }
             if (requestUrl == null) {
                 promise.reject(JsString("Invalid URL"))
+            } else if (isMixedContent(baseUrl, requestUrl)) {
+                promise.reject(makeError("Mixed Content: the page at '$baseUrl' was loaded over HTTPS, but requested an insecure resource '$requestUrl'. This request has been blocked."))
             } else {
                 val options = args.getOrNull(1) as? JsObject
                 val method = options?.get("method")?.let { if (it != JsUndefined) toJsString(it) else null } ?: "GET"
@@ -586,7 +593,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                     (xhr.get("on$type") as? JsFunction)?.call(interp, xhr, emptyList())
                     (xhr.get("onreadystatechange") as? JsFunction)?.call(interp, xhr, emptyList())
                 }
-                if (url == null) {
+                if (url == null || isMixedContent(baseUrl, url)) {
                     xhr.set("readyState", JsNumber(4.0))
                     fire("error")
                     afterAsyncWork()
@@ -645,13 +652,15 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                 el.tag == "link" && el.attr("rel")?.lowercase()?.contains("stylesheet") == true -> {
                     val href = el.attr("href")
                     if (href != null) {
-                        try {
-                            val styleSheetUrl = baseUrl.resolve(href)
-                            val response = styleSheetUrl.fetch()
-                            // url()s inside an external stylesheet resolve against ITS location, not the page's.
-                            harvest(CssParser(response.body, viewportWidth), styleSheetUrl)
-                        } catch (_: Exception) {
-                            // A failed stylesheet fetch shouldn't block the page from rendering.
+                        val styleSheetUrl = baseUrl.resolve(href)
+                        if (!isMixedContent(baseUrl, styleSheetUrl)) {
+                            try {
+                                val response = styleSheetUrl.fetch()
+                                // url()s inside an external stylesheet resolve against ITS location, not the page's.
+                                harvest(CssParser(response.body, viewportWidth), styleSheetUrl)
+                            } catch (_: Exception) {
+                                // A failed stylesheet fetch shouldn't block the page from rendering.
+                            }
                         }
                     }
                 }
@@ -669,13 +678,15 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
      * (e.g. bold/italic variants declared separately) are ignored, and
      * FontCache synthesizes bold/italic from whichever one loaded.
      */
-    private fun loadFontFaces(entries: List<Pair<FontFaceRule, Url>>): Map<String, Typeface> {
+    private fun loadFontFaces(entries: List<Pair<FontFaceRule, Url>>, pageUrl: Url): Map<String, Typeface> {
         val result = HashMap<String, Typeface>()
         for ((rule, styleSheetBase) in entries) {
             val key = rule.family.lowercase()
             if (result.containsKey(key)) continue
+            val fontUrl = styleSheetBase.resolve(rule.srcUrl)
+            if (isMixedContent(pageUrl, fontUrl)) continue
             try {
-                val bytes = styleSheetBase.resolve(rule.srcUrl).fetchBytes().body
+                val bytes = fontUrl.fetchBytes().body
                 val sfnt = FontDecoder.toSfnt(bytes) ?: continue
                 val tempFile = File.createTempFile("font", ".ttf", context.cacheDir)
                 try {

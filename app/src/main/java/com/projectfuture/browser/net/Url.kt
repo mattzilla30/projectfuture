@@ -73,57 +73,110 @@ data class Url(
      * (page loads, images, stylesheets).
      */
     fun fetch(method: String = "GET", body: ByteArray? = null, extraHeaders: Map<String, String> = emptyMap(), redirectsLeft: Int = 10): HttpResponse {
+        hstsUpgrade()?.let { return it.fetch(method, body, extraHeaders, redirectsLeft) }
+        // Only cacheable requests (see HttpCache's class doc) even attempt a cache lookup - a
+        // GET with no body, matching this project's bounded RFC 7234 subset.
+        val cacheable = method.equals("GET", ignoreCase = true) && body == null
+        if (cacheable) HttpCache.get(this)?.let { return it }
         val raw = fetchRaw(method, body, extraHeaders, redirectsLeft)
         val charset = charsetFromContentType(raw.headers["content-type"])
-        return HttpResponse(raw.statusCode, raw.headers, String(raw.body, charset), raw.url)
+        val response = HttpResponse(raw.statusCode, raw.headers, String(raw.body, charset), raw.url)
+        if (cacheable) HttpCache.store(this, response)
+        return response
     }
 
     /** Same request as [fetch], but returns the raw body bytes undecoded - for binary resources like images. */
     fun fetchBytes(redirectsLeft: Int = 10): HttpBytesResponse {
+        hstsUpgrade()?.let { return it.fetchBytes(redirectsLeft) }
         val raw = fetchRaw("GET", null, emptyMap(), redirectsLeft)
         return HttpBytesResponse(raw.statusCode, raw.headers, raw.body, raw.url)
     }
 
+    /** Non-null (the HTTPS-upgraded URL to use instead) when this is a plain-HTTP request to an HSTS-enforced host. */
+    private fun hstsUpgrade(): Url? {
+        if (scheme != "http" || !HstsStore.isEnforced(host)) return null
+        return copy(scheme = "https", port = if (port == 80) 443 else port)
+    }
+
     /** Shared socket/request/response-header/body-bytes plumbing for [fetch] and [fetchBytes]. Follows redirects itself. */
+    private fun openSocket(): Socket = if (isHttps) {
+        (SSLSocketFactory.getDefault().createSocket() as Socket).also {
+            it.connect(InetSocketAddress(host, port), 15000)
+            // SNI + hostname verification happen automatically for SSLSocket
+            // created against a host/port pair on modern Android.
+        }
+    } else {
+        Socket().also { it.connect(InetSocketAddress(host, port), 15000) }
+    }
+
+    private fun buildRequestHead(method: String, body: ByteArray?, extraHeaders: Map<String, String>): String {
+        val cookieHeader = sharedCookieJar?.cookieHeaderFor(this)
+        return buildString {
+            append("${method.uppercase()} $path HTTP/1.1\r\n")
+            append("Host: $host\r\n")
+            append("Connection: keep-alive\r\n")
+            append("User-Agent: ProjectFutureBrowser/0.1 (Android; from-scratch)\r\n")
+            append("Accept: text/html,text/css,*/*\r\n")
+            append("Accept-Encoding: gzip\r\n")
+            if (cookieHeader != null) append("Cookie: $cookieHeader\r\n")
+            if (body != null) append("Content-Length: ${body.size}\r\n")
+            for ((k, v) in extraHeaders) append("$k: $v\r\n")
+            append("\r\n")
+        }
+    }
+
+    private fun writeRequest(socket: Socket, requestHead: String, body: ByteArray?) {
+        val out = socket.getOutputStream()
+        out.write(requestHead.toByteArray(Charsets.US_ASCII))
+        if (body != null) out.write(body)
+        out.flush()
+    }
+
+    /**
+     * Reuses a pooled keep-alive socket when one is available for this
+     * host, falling back to (and retrying once on) a fresh connection if
+     * the pooled one turns out to be stale - a server-side keep-alive
+     * timeout closing an idle socket from under us is routine, not
+     * exceptional. A socket is only ever offered back to [ConnectionPool]
+     * after a response with a determinate length (`Content-Length` or
+     * chunked) was fully read and the server didn't send `Connection:
+     * close`; anything else (indeterminate-length body, a redirect whose
+     * body we don't consume) closes the socket instead, since reusing it
+     * would hand the next request a stream with stale bytes still in it.
+     */
     private fun fetchRaw(method: String, body: ByteArray?, extraHeaders: Map<String, String>, redirectsLeft: Int): RawHttpResponse {
         if (scheme != "http" && scheme != "https") {
             throw IOException("Unsupported scheme: $scheme")
         }
 
-        val socket: Socket = if (isHttps) {
-            (SSLSocketFactory.getDefault().createSocket() as Socket).also {
-                it.connect(InetSocketAddress(host, port), 15000)
-                // SNI + hostname verification happen automatically for SSLSocket
-                // created against a host/port pair on modern Android.
-            }
-        } else {
-            Socket().also { it.connect(InetSocketAddress(host, port), 15000) }
-        }
-
+        val poolKey = "$scheme://$host:$port"
+        var socket = ConnectionPool.borrow(poolKey)
+        var reused = socket != null
+        if (socket == null) socket = openSocket()
         socket.soTimeout = 20000
 
+        val requestHead = buildRequestHead(method, body, extraHeaders)
         try {
-            val cookieHeader = sharedCookieJar?.cookieHeaderFor(this)
-            val requestHead = buildString {
-                append("${method.uppercase()} $path HTTP/1.1\r\n")
-                append("Host: $host\r\n")
-                append("Connection: close\r\n")
-                append("User-Agent: ProjectFutureBrowser/0.1 (Android; from-scratch)\r\n")
-                append("Accept: text/html,text/css,*/*\r\n")
-                append("Accept-Encoding: gzip\r\n")
-                if (cookieHeader != null) append("Cookie: $cookieHeader\r\n")
-                if (body != null) append("Content-Length: ${body.size}\r\n")
-                for ((k, v) in extraHeaders) append("$k: $v\r\n")
-                append("\r\n")
+            try {
+                writeRequest(socket, requestHead, body)
+            } catch (e: IOException) {
+                if (!reused) throw e
+                try { socket.close() } catch (_: Exception) {}
+                socket = openSocket()
+                socket.soTimeout = 20000
+                reused = false
+                writeRequest(socket, requestHead, body)
             }
-            val out = socket.getOutputStream()
-            out.write(requestHead.toByteArray(Charsets.US_ASCII))
-            if (body != null) out.write(body)
-            out.flush()
 
             val input = BufferedInputStream(socket.getInputStream())
 
-            val statusLine = readLine(input) ?: throw IOException("Empty response from $host")
+            val statusLine = readLine(input) ?: run {
+                if (!reused) throw IOException("Empty response from $host")
+                // The pooled socket was closed by the server between requests with nothing
+                // written back yet; retry once on a fresh connection rather than failing outright.
+                try { socket.close() } catch (_: Exception) {}
+                return fetchRaw(method, body, extraHeaders, redirectsLeft)
+            }
             val statusParts = statusLine.split(" ", limit = 3)
             if (statusParts.size < 2) throw IOException("Malformed status line: $statusLine")
             val statusCode = statusParts[1].toIntOrNull() ?: throw IOException("Bad status code: $statusLine")
@@ -142,11 +195,16 @@ data class Url(
                 if (key == "set-cookie") setCookieHeaders.add(value) else headers[key] = value
             }
             if (setCookieHeaders.isNotEmpty()) sharedCookieJar?.store(this, setCookieHeaders)
+            // Only trust Strict-Transport-Security when it arrives over a connection we've actually
+            // verified is HTTPS - honoring it over plain HTTP would let a network attacker forge it.
+            if (isHttps) headers["strict-transport-security"]?.let { HstsStore.record(host, it) }
 
-            // Redirects: follow them ourselves rather than the body.
+            // Redirects: follow them ourselves rather than the body. The redirect response's own
+            // body (if any) is left unread, so this socket can't safely be pooled - just close it.
             if (statusCode in intArrayOf(301, 302, 303, 307, 308) && redirectsLeft > 0) {
                 val location = headers["location"]
                 if (location != null) {
+                    try { socket.close() } catch (_: Exception) {}
                     val next = resolve(location)
                     // 303 (and, in practice, 301/302 for non-GET/HEAD) always redirects as a GET with no body;
                     // 307/308 preserve the original method and body, per spec.
@@ -159,12 +217,27 @@ data class Url(
                 }
             }
 
-            val rawBody = if (headers["transfer-encoding"]?.contains("chunked") == true) {
-                readChunkedBody(input)
+            val chunked = headers["transfer-encoding"]?.contains("chunked") == true
+            val contentLength = headers["content-length"]?.toIntOrNull()
+            val rawBody: ByteArray
+            val determinateLength: Boolean
+            if (chunked) {
+                rawBody = readChunkedBody(input)
+                determinateLength = true
+            } else if (contentLength != null) {
+                rawBody = readExactly(input, contentLength)
+                determinateLength = true
             } else {
-                val contentLength = headers["content-length"]?.toIntOrNull()
-                if (contentLength != null) readExactly(input, contentLength) else readToEnd(input)
+                rawBody = readToEnd(input)
+                determinateLength = false
             }
+
+            if (determinateLength && headers["connection"]?.lowercase() != "close") {
+                ConnectionPool.release(poolKey, socket)
+            } else {
+                try { socket.close() } catch (_: Exception) {}
+            }
+
             val bodyBytes = if (headers["content-encoding"]?.contains("gzip") == true) {
                 try { GZIPInputStream(rawBody.inputStream()).use { it.readBytes() } } catch (_: Exception) { rawBody }
             } else {
@@ -172,8 +245,9 @@ data class Url(
             }
 
             return RawHttpResponse(statusCode, headers, bodyBytes, this)
-        } finally {
-            try { socket.close() } catch (_: IOException) {}
+        } catch (e: Exception) {
+            try { socket.close() } catch (_: Exception) {}
+            throw e
         }
     }
 
@@ -293,6 +367,18 @@ data class HttpResponse(
 )
 
 fun isSameOrigin(a: Url, b: Url): Boolean = a.scheme == b.scheme && a.host == b.host && a.port == b.port
+
+/**
+ * True when loading [resourceUrl] from a page at [pageUrl] would be mixed
+ * content: an HTTPS page pulling in a plain-HTTP subresource (script,
+ * stylesheet, image, font, or `fetch()`/XHR target), which a real browser
+ * blocks (for active content like scripts/stylesheets) or warns about
+ * (for passive content like images) since it lets a network attacker
+ * tamper with or snoop on part of an otherwise-secure page. This project
+ * blocks all of it uniformly rather than distinguishing active/passive -
+ * simpler, and erring toward blocking is the safer default.
+ */
+fun isMixedContent(pageUrl: Url, resourceUrl: Url): Boolean = pageUrl.isHttps && !resourceUrl.isHttps
 
 /**
  * Simple-request CORS only (no preflight `OPTIONS` for non-"simple"
