@@ -39,4 +39,5 @@
     <string name="settings_home_page">Home page</string>
     <string name="settings_search_template">Search engine URL (%s = query)</string>
     <string name="action_save">Save</string>
+    <string name="menu_print">Print</string>
 </resources>

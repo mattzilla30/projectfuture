@@ -394,6 +394,20 @@ class BrowserView @JvmOverloads constructor(
         drawCommands(canvas, fixedCommands, 0f, height.toFloat())
     }
 
+    /**
+     * Paints the whole (unscrolled) page onto an arbitrary Canvas - used
+     * for printing (see MainActivity's print menu action), where the
+     * caller has already scaled the canvas to fit a print page. `position:
+     * fixed` content is skipped (it's relative to an on-screen viewport,
+     * which printing doesn't have). Text/password/textarea field values
+     * won't appear - they live in real overlaid EditText views, not this
+     * Canvas paint path, and printing doesn't recreate an Android view
+     * hierarchy for a PDF page - a known, documented print limitation.
+     */
+    fun paintFullPageForPrint(canvas: Canvas, commands: List<DisplayCommand>) {
+        drawCommands(canvas, commands.filterNot { it.fixed }, 0f, Float.MAX_VALUE)
+    }
+
     private fun drawCommands(canvas: Canvas, commands: List<DisplayCommand>, viewTop: Float, viewBottom: Float) {
         for (cmd in commands) {
             if (cmd.bottom < viewTop || cmd.top > viewBottom) continue

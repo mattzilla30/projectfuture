@@ -373,6 +373,7 @@ class MainActivity : AppCompatActivity() {
             isChecked = darkModeEnabled
         }
         popup.menu.add(0, 8, 7, R.string.menu_settings)
+        popup.menu.add(0, 9, 8, R.string.menu_print).isEnabled = currentUrl != null
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> {
@@ -404,6 +405,7 @@ class MainActivity : AppCompatActivity() {
                     true
                 }
                 8 -> { showSettingsDialog(); true }
+                9 -> { printCurrentPage(); true }
                 else -> false
             }
         }
@@ -502,6 +504,77 @@ class MainActivity : AppCompatActivity() {
         // run before the active tab could plausibly have a download triggered against it.
         tab.onDownloadRequested = { url, filename -> startDownload(url, filename) }
         binding.browserView.setContent(tab.displayList, tab.contentHeight)
+    }
+
+    /**
+     * Renders the whole page onto a single PDF page via Android's own
+     * PrintManager/PrintedPdfDocument (a platform primitive, same tier as
+     * BitmapFactory for images) - the whole scrollable document scaled
+     * (preserving aspect ratio) to fit one print page, not real multi-page
+     * pagination. A long page ends up small; that's a deliberate, bounded
+     * trade-off against the real complexity of correctly splitting content
+     * across page boundaries. Form field values aren't included - see
+     * BrowserView.paintFullPageForPrint's doc.
+     */
+    private fun printCurrentPage() {
+        val tab = tabManager.activeTab ?: return
+        val jobName = tab.currentUrl?.toString() ?: getString(R.string.app_name)
+        val printManager = getSystemService(Context.PRINT_SERVICE) as android.print.PrintManager
+        val adapter = object : android.print.PrintDocumentAdapter() {
+            private var pdfDocument: android.print.pdf.PrintedPdfDocument? = null
+
+            override fun onLayout(
+                oldAttrs: android.print.PrintAttributes?,
+                newAttrs: android.print.PrintAttributes,
+                cancellationSignal: android.os.CancellationSignal?,
+                callback: LayoutResultCallback,
+                extras: Bundle?
+            ) {
+                if (cancellationSignal?.isCanceled == true) {
+                    callback.onLayoutCancelled()
+                    return
+                }
+                pdfDocument = android.print.pdf.PrintedPdfDocument(this@MainActivity, newAttrs)
+                val info = android.print.PrintDocumentInfo.Builder(jobName)
+                    .setContentType(android.print.PrintDocumentInfo.CONTENT_TYPE_DOCUMENT)
+                    .setPageCount(1)
+                    .build()
+                callback.onLayoutFinished(info, true)
+            }
+
+            override fun onWrite(
+                pages: Array<out android.print.PageRange>,
+                destination: android.os.ParcelFileDescriptor,
+                cancellationSignal: android.os.CancellationSignal?,
+                callback: WriteResultCallback
+            ) {
+                val doc = pdfDocument
+                if (doc == null) {
+                    callback.onWriteFailed("No document")
+                    return
+                }
+                try {
+                    val page = doc.startPage(0)
+                    val canvas = page.canvas
+                    val contentWidth = lastViewportWidth.coerceAtLeast(1f)
+                    val contentHeight = tab.contentHeight.coerceAtLeast(1f)
+                    val scale = minOf(canvas.width / contentWidth, canvas.height / contentHeight)
+                    canvas.save()
+                    canvas.scale(scale, scale)
+                    binding.browserView.paintFullPageForPrint(canvas, tab.displayList)
+                    canvas.restore()
+                    doc.finishPage(page)
+                    java.io.FileOutputStream(destination.fileDescriptor).use { doc.writeTo(it) }
+                    callback.onWriteFinished(arrayOf(android.print.PageRange.ALL_PAGES))
+                } catch (e: Exception) {
+                    callback.onWriteFailed(e.message)
+                } finally {
+                    doc.close()
+                    pdfDocument = null
+                }
+            }
+        }
+        printManager.print(jobName, adapter, android.print.PrintAttributes.Builder().build())
     }
 
     /** Hands the URL off to Android's own DownloadManager - a platform primitive (like BitmapFactory for images), not "browser engine" logic. */
