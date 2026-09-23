@@ -4,7 +4,13 @@ import android.app.DownloadManager
 import android.content.ComponentCallbacks2
 import android.content.Context
 import android.content.Intent
+import android.content.pm.ShortcutInfo
+import android.content.pm.ShortcutManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.drawable.Icon
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.text.TextUtils
@@ -462,6 +468,7 @@ class MainActivity : AppCompatActivity() {
             isChecked = TrackingProtection.enabled
         }
         popup.menu.add(0, 12, 11, R.string.menu_new_private_tab)
+        popup.menu.add(0, 13, 12, R.string.menu_add_to_home_screen).isEnabled = currentUrl != null
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> {
@@ -501,6 +508,7 @@ class MainActivity : AppCompatActivity() {
                     true
                 }
                 12 -> { openNewTab(private = true); true }
+                13 -> { addToHomeScreen(); true }
                 else -> false
             }
         }
@@ -689,6 +697,49 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton(R.string.action_close, null)
             .show()
+    }
+
+    /**
+     * "Add to Home Screen": a pinned launcher shortcut whose Intent
+     * re-opens this app at the page's URL (via the same VIEW-intent path
+     * `onNewIntent`/`onCreate` already handle for external links) - not a
+     * true chromeless "standalone" PWA window, since there's no separate
+     * app-shell display mode implemented. Requires API 26+
+     * (`ShortcutManager.requestPinShortcut`); on older devices this just
+     * tells the user it isn't supported rather than silently doing
+     * nothing.
+     */
+    private fun addToHomeScreen() {
+        val tab = tabManager.activeTab ?: return
+        val url = tab.currentUrl ?: return
+        tab.fetchManifestInfo { name, iconBytes ->
+            val bitmap = iconBytes?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
+            createHomeScreenShortcut(url.toString(), name, bitmap)
+        }
+    }
+
+    private fun createHomeScreenShortcut(url: String, name: String, bitmap: Bitmap?) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            Toast.makeText(this, R.string.add_to_home_screen_unsupported, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val shortcutManager = getSystemService(ShortcutManager::class.java)
+        if (shortcutManager?.isRequestPinShortcutSupported != true) {
+            Toast.makeText(this, R.string.add_to_home_screen_unsupported, Toast.LENGTH_SHORT).show()
+            return
+        }
+        val intent = Intent(this, MainActivity::class.java).apply {
+            action = Intent.ACTION_VIEW
+            data = Uri.parse(url)
+        }
+        val icon = if (bitmap != null) Icon.createWithBitmap(bitmap) else Icon.createWithResource(this, R.drawable.ic_launcher)
+        val shortcut = ShortcutInfo.Builder(this, "shortcut-${System.currentTimeMillis()}")
+            .setShortLabel(name.take(20))
+            .setLongLabel(name)
+            .setIcon(icon)
+            .setIntent(intent)
+            .build()
+        shortcutManager.requestPinShortcut(shortcut, null)
     }
 
     /** Hands the URL off to Android's own DownloadManager - a platform primitive (like BitmapFactory for images), not "browser engine" logic. */

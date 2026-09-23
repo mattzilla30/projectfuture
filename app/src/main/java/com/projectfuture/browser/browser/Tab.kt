@@ -216,6 +216,44 @@ class Tab(
     }
 
     /**
+     * "Add to Home Screen": looks for `<link rel="manifest">`, and if
+     * present, fetches and reads just `name`/`short_name` and the first
+     * `icons[].src` from it - not a full Web App Manifest implementation
+     * (no `display`/`start_url`/`theme_color`/multiple-icon-size
+     * selection). Falls back to the page's own title and no icon (the
+     * caller uses a generic launcher icon instead) if there's no manifest
+     * or the fetch fails. [callback] always runs on the main thread.
+     */
+    fun fetchManifestInfo(callback: (name: String, iconBytes: ByteArray?) -> Unit) {
+        val doc = currentDoc
+        val base = currentUrl
+        val fallbackName = doc?.let { extractTitle(it) } ?: base?.toString() ?: "Web Page"
+        var manifestHref: String? = null
+        doc?.walkElements { el -> if (manifestHref == null && el.tag == "link" && el.attr("rel")?.lowercase() == "manifest") manifestHref = el.attr("href") }
+        val href = manifestHref
+        if (href == null || base == null) {
+            callback(fallbackName, null)
+            return
+        }
+        executor.execute {
+            try {
+                val manifestUrl = base.resolve(href)
+                val json = manifestUrl.fetch(allowCookies = !isPrivate).body
+                val parsed = parseJsonToJsValue(json) as? JsObject
+                val name = ((parsed?.get("short_name") as? JsString)?.value ?: (parsed?.get("name") as? JsString)?.value ?: fallbackName)
+                val icons = parsed?.get("icons") as? JsArray
+                val iconSrc = (icons?.elements?.firstOrNull() as? JsObject)?.get("src")?.let { (it as? JsString)?.value }
+                val iconBytes = iconSrc?.let {
+                    try { manifestUrl.resolve(it).fetchBytes(allowCookies = !isPrivate).body } catch (_: Exception) { null }
+                }
+                mainHandler.post { callback(name, iconBytes) }
+            } catch (_: Exception) {
+                mainHandler.post { callback(fallbackName, null) }
+            }
+        }
+    }
+
+    /**
      * `history.pushState`/`replaceState`: no navigation happens at all -
      * no fetch, no re-parse, the currently loaded document just gets a new
      * URL recorded against it. `pushState` adds a new same-generation

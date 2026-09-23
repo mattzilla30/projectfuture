@@ -47,4 +47,6 @@
     <string name="certificate_error_title">Your connection is not private</string>
     <string name="certificate_error_message">%1$s\'s certificate could not be verified: %2$s\n\nProceeding will trust this site\'s certificate for the rest of this session.</string>
     <string name="certificate_error_proceed">Proceed anyway</string>
+    <string name="menu_add_to_home_screen">Add to Home screen</string>
+    <string name="add_to_home_screen_unsupported">Add to Home screen isn\'t supported on this version of Android</string>
 </resources>
