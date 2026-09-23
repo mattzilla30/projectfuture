@@ -107,27 +107,158 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
 
     /**
      * Called by MainActivity when BrowserView hit-tests a tap to a source
-     * element. Bubbles the click through DomBridge; if anything actually
-     * handled it (an inline onclick or an addEventListener listener ran),
-     * re-styles and re-lays-out since the handler may have mutated the DOM,
-     * then reports TabState.Updated rather than Loaded so the UI just
-     * repaints without resetting scroll or the address bar.
+     * element. Order of operations mirrors a real browser closely enough for
+     * alpha purposes: a checkbox/radio's `checked` state flips first (native,
+     * unconditional behavior - not something `preventDefault()` can undo
+     * here, a real but minor simplification), then the click bubbles through
+     * DomBridge, then - only if nothing called `preventDefault()` - the
+     * default action runs: follow an ancestor `<a href>`, or submit an
+     * ancestor `<form>` if the tapped element is a submit control. Any of
+     * this mutating the DOM (a listener running, a checkbox toggling) is
+     * enough to re-style/re-layout and report TabState.Updated rather than
+     * Loaded, so the UI just repaints without resetting scroll or the
+     * address bar.
      */
     fun dispatchClick(element: ElementNode) {
         val interpreter = currentInterpreter ?: return
         val bridge = currentDomBridge ?: return
         val doc = currentDoc ?: return
         val url = currentUrl ?: return
-        val handled = try {
+
+        val toggled = toggleFormControlIfNeeded(element)
+
+        val event = try {
             bridge.dispatchClick(element, interpreter)
         } catch (_: Exception) {
-            false
+            null
         }
-        if (handled) {
+        if (toggled) {
+            try { bridge.dispatchEvent(element, "change", interpreter) } catch (_: Exception) {}
+        }
+
+        if (event?.defaultPrevented != true) {
+            findAncestorHref(element)?.let { href ->
+                followLink(href)
+                return
+            }
+            findSubmitForm(element)?.let { form ->
+                submitForm(form)
+                return
+            }
+        }
+
+        if (toggled || event?.listenersRan == true) {
             computeStyles(doc, currentAuthorRules)
             relayout()
             onStateChanged(TabState.Updated(url, extractTitle(doc)))
         }
+    }
+
+    /**
+     * Called by BrowserView's overlay `EditText` on every keystroke in a
+     * text/password/textarea field. Keeps the DOM's `value` attribute (and
+     * hence `input.value` in scripts) in sync, fires `input` listeners, and
+     * re-lays-out so reactive scripts see the change reflected - see
+     * BrowserView's class doc for why this doesn't clobber the field's own
+     * live text or cursor position.
+     */
+    fun dispatchInputEvent(element: ElementNode, newValue: String) {
+        val interpreter = currentInterpreter ?: return
+        val bridge = currentDomBridge ?: return
+        val doc = currentDoc ?: return
+        val url = currentUrl ?: return
+        element.attributes["value"] = newValue
+        try { bridge.dispatchEvent(element, "input", interpreter) } catch (_: Exception) {}
+        computeStyles(doc, currentAuthorRules)
+        relayout()
+        onStateChanged(TabState.Updated(url, extractTitle(doc)))
+    }
+
+    /** Native pre-listener checkbox/radio toggle behavior. Returns true if this element's checked state changed. */
+    private fun toggleFormControlIfNeeded(element: ElementNode): Boolean {
+        if (element.tag != "input") return false
+        return when (element.attr("type")?.lowercase()) {
+            "checkbox" -> {
+                if (element.attributes.containsKey("checked")) element.attributes.remove("checked") else element.attributes["checked"] = "checked"
+                true
+            }
+            "radio" -> {
+                val name = element.attr("name")
+                if (name != null) {
+                    val scope = nearestForm(element) ?: currentDoc
+                    scope?.walkElements { el ->
+                        if (el !== element && el.tag == "input" && el.attr("type")?.lowercase() == "radio" && el.attr("name") == name) {
+                            el.attributes.remove("checked")
+                        }
+                    }
+                }
+                element.attributes["checked"] = "checked"
+                true
+            }
+            else -> false
+        }
+    }
+
+    private fun nearestForm(element: ElementNode): ElementNode? {
+        var current: ElementNode? = element
+        while (current != null) {
+            if (current.tag == "form") return current
+            current = current.parent
+        }
+        return null
+    }
+
+    private fun findAncestorHref(element: ElementNode): String? {
+        var current: ElementNode? = element
+        while (current != null) {
+            if (current.tag == "a") current.attr("href")?.let { return it }
+            current = current.parent
+        }
+        return null
+    }
+
+    /** True if [element] is a submit control (`<button>`/`<input type=submit>`, `<button>`'s implicit default type). */
+    private fun findSubmitForm(element: ElementNode): ElementNode? {
+        val isSubmit = when (element.tag) {
+            "button" -> (element.attr("type")?.lowercase() ?: "submit") == "submit"
+            "input" -> element.attr("type")?.lowercase() == "submit"
+            else -> false
+        }
+        if (!isSubmit) return null
+        return nearestForm(element)
+    }
+
+    /**
+     * A basic GET-only form submission: collects every named, enabled,
+     * non-button input/textarea's current value (checkboxes/radios only if
+     * checked) into a query string and navigates to `action?query`. No POST
+     * support, no `<select>`, no file inputs, no multipart encoding - a
+     * script that wants more than this should call `preventDefault()` in a
+     * `submit` listener and handle it itself via `fetch()`.
+     */
+    private fun submitForm(form: ElementNode) {
+        val base = currentUrl ?: return
+        val action = form.attr("action")
+        val target = if (action.isNullOrBlank()) base else base.resolve(action)
+        val params = ArrayList<Pair<String, String>>()
+        form.walkElements { el ->
+            if (el === form) return@walkElements
+            if (el.tag != "input" && el.tag != "textarea") return@walkElements
+            if (el.attributes.containsKey("disabled")) return@walkElements
+            val name = el.attr("name") ?: return@walkElements
+            val type = if (el.tag == "input") el.attr("type")?.lowercase() else null
+            when (type) {
+                "submit", "button", "reset" -> {}
+                "checkbox", "radio" -> if (el.attributes.containsKey("checked")) params.add(name to (el.attr("value") ?: "on"))
+                else -> params.add(name to (el.attr("value") ?: ""))
+            }
+        }
+        val query = params.joinToString("&") { (k, v) ->
+            java.net.URLEncoder.encode(k, "UTF-8") + "=" + java.net.URLEncoder.encode(v, "UTF-8")
+        }
+        val separator = if (target.path.contains("?")) "&" else "?"
+        val finalUrl = if (query.isEmpty()) target else target.copy(path = target.path + separator + query)
+        load(finalUrl, HistoryAction.PUSH)
     }
 
     /** Called by the view when its size changes; re-runs layout without re-fetching. */

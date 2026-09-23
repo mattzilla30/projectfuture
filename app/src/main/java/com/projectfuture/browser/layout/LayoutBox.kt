@@ -224,6 +224,16 @@ class BlockLayout(
         LineFragment(trailingSpace, sourceElement)
     private class ImageFragment(val bitmap: Bitmap, val imgWidth: Float, val imgHeight: Float, sourceElement: ElementNode?) :
         LineFragment(false, sourceElement)
+    private class FormControlFragment(
+        val controlType: FormControlType,
+        val value: String,
+        val checked: Boolean,
+        val placeholder: String,
+        val style: TextStyle,
+        val boxWidth: Float,
+        val boxHeight: Float,
+        sourceElement: ElementNode?
+    ) : LineFragment(false, sourceElement)
 
     fun layout() {
         val currentColor = parseCssColor(node.style["color"]) ?: Color.BLACK
@@ -831,6 +841,10 @@ class BlockLayout(
                     currentImages[n]?.let { addImage(it, n) }
                     return
                 }
+                if (n.tag == "input" || n.tag == "textarea" || n.tag == "button") {
+                    addFormControl(n)
+                    return
+                }
                 val linkHref = if (n.tag == "a") n.attr("href") else currentLinkHref
                 for (child in n.children) recurse(child, linkHref)
             }
@@ -943,6 +957,58 @@ class BlockLayout(
         addFragment(ImageFragment(bitmap, imgW, imgH, node), imgW)
     }
 
+    /**
+     * `<input>`/`<textarea>`/`<button>` are laid out as inline-replaced
+     * elements with an intrinsic default size (there's no real UA
+     * stylesheet sizing every input type distinctly, just reasonable
+     * fixed defaults, overridable via CSS width/height). `<select>`
+     * (dropdowns) isn't handled at all yet - a real gap, tracked
+     * separately from this pass.
+     */
+    private fun addFormControl(el: ElementNode) {
+        val htmlType = if (el.tag == "input") (el.attr("type")?.lowercase() ?: "text") else if (el.tag == "textarea") "textarea" else "button"
+        val controlType = when (htmlType) {
+            "checkbox" -> FormControlType.CHECKBOX
+            "radio" -> FormControlType.RADIO
+            "password" -> FormControlType.PASSWORD
+            "textarea" -> FormControlType.TEXTAREA
+            "submit", "button", "reset" -> FormControlType.BUTTON
+            "hidden" -> return
+            else -> FormControlType.TEXT
+        }
+        val style = textStyleForElement(el, null)
+        val fontSizePx = style.sizePx
+        val paint = FontCache.paintFor(style)
+        val cssWidth = el.style["width"]?.let { lengthValue(it, width, fontSizePx) }
+        val cssHeight = el.style["height"]?.let { lengthValue(it, 0f, fontSizePx) }
+        val label = when {
+            el.tag == "button" -> collectText(el).ifBlank { "Submit" }
+            controlType == FormControlType.BUTTON -> el.attr("value") ?: if (htmlType == "reset") "Reset" else "Submit"
+            else -> ""
+        }
+        val (defaultW, defaultH) = when (controlType) {
+            FormControlType.CHECKBOX, FormControlType.RADIO -> fontSizePx to fontSizePx
+            FormControlType.BUTTON -> (paint.measureText(label) + fontSizePx * 1.5f) to (fontSizePx * 1.8f)
+            FormControlType.TEXTAREA -> 200f to fontSizePx * 4f
+            else -> 160f to fontSizePx * 1.8f
+        }
+        val boxWidth = cssWidth ?: defaultW
+        val boxHeight = cssHeight ?: defaultH
+        val value = when (controlType) {
+            FormControlType.TEXTAREA -> el.attr("value") ?: collectText(el)
+            FormControlType.BUTTON -> label
+            else -> el.attr("value") ?: ""
+        }
+        val checked = el.attributes.containsKey("checked")
+        val placeholder = el.attr("placeholder") ?: ""
+        addFragment(FormControlFragment(controlType, value, checked, placeholder, style, boxWidth, boxHeight, el), boxWidth)
+    }
+
+    private fun collectText(n: Node): String = when (n) {
+        is TextNode -> n.text
+        is ElementNode -> n.children.joinToString("") { collectText(it) }
+    }
+
     private fun addFragment(fragment: LineFragment, fragmentWidth: Float) {
         if (lineBuffer.isEmpty()) {
             val (li, ri) = floatInsetsAt(y + cursorY)
@@ -987,6 +1053,10 @@ class BlockLayout(
                     widths[i] = f.imgWidth
                     maxAscent = maxOf(maxAscent, f.imgHeight) // baseline-aligned: sits entirely above the baseline
                 }
+                is FormControlFragment -> {
+                    widths[i] = f.boxWidth
+                    maxAscent = maxOf(maxAscent, f.boxHeight) // baseline-aligned, same as images
+                }
             }
         }
 
@@ -1030,6 +1100,17 @@ class BlockLayout(
                     inlineDisplay.add(
                         DrawImage(
                             fragX, imgBottom - f.imgHeight, fragX + widths[i], imgBottom, f.bitmap,
+                            fixed = fixedContext, sourceElement = f.sourceElement
+                        )
+                    )
+                }
+                is FormControlFragment -> {
+                    val boxBottom = y + baseline
+                    val boxTop = boxBottom - f.boxHeight
+                    inlineDisplay.add(
+                        DrawFormControl(
+                            fragX, boxTop, fragX + widths[i], boxBottom,
+                            f.controlType, f.value, f.checked, f.placeholder, f.style,
                             fixed = fixedContext, sourceElement = f.sourceElement
                         )
                     )

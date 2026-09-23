@@ -118,10 +118,40 @@ class DomBridgeTest {
 
         var button: ElementNode? = null
         f.root.walkElements { if (it.attr("id") == "btn") button = it }
-        val handled = f.bridge.dispatchClick(button!!, f.interpreter)
+        val event = f.bridge.dispatchClick(button!!, f.interpreter)
 
-        assertTrue("dispatchClick should report it handled something", handled)
+        assertTrue("dispatchClick should report it handled something", event.listenersRan)
         assertTrue("addEventListener('click', ...) on the target should have run", f.bool("btnRan"))
         assertTrue("onclick=\"...\" on an ancestor should have run via bubbling", f.bool("outerRan"))
+    }
+
+    @Test fun inputValueAndCheckedRoundTripThroughJs() {
+        val f = Fixture("<html><body><input id='t' type='text'><input id='c' type='checkbox'></body></html>")
+        f.run("document.getElementById('t').value = 'hello';")
+        assertEquals("hello", f.str("document.getElementById('t').value"))
+
+        assertTrue("checkbox should start unchecked", !f.bool("document.getElementById('c').checked"))
+        f.run("document.getElementById('c').checked = true;")
+        assertTrue(f.bool("document.getElementById('c').checked"))
+        var checkbox: ElementNode? = null
+        f.root.walkElements { if (it.attr("id") == "c") checkbox = it }
+        assertTrue("checked attribute should be reflected on the underlying element", checkbox!!.attributes.containsKey("checked"))
+    }
+
+    @Test fun preventDefaultIsVisibleOnTheDispatchedEvent() {
+        val f = Fixture("<html><body><a id='link' href='https://example.com'>go</a></body></html>")
+        f.run("document.getElementById('link').addEventListener('click', function(e) { e.preventDefault(); });")
+        var link: ElementNode? = null
+        f.root.walkElements { if (it.attr("id") == "link") link = it }
+        val event = f.bridge.dispatchClick(link!!, f.interpreter)
+        assertTrue("preventDefault() called from a listener should set defaultPrevented", event.defaultPrevented)
+    }
+
+    @Test fun inlineOnclickSeesImplicitEventVariable() {
+        val f = Fixture("<html><body><button id='btn' onclick='event.preventDefault();'>go</button></body></html>")
+        var button: ElementNode? = null
+        f.root.walkElements { if (it.attr("id") == "btn") button = it }
+        val event = f.bridge.dispatchClick(button!!, f.interpreter)
+        assertTrue("inline onclick should see an implicit `event` with preventDefault()", event.defaultPrevented)
     }
 }

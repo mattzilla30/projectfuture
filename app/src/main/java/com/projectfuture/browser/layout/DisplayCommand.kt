@@ -68,3 +68,31 @@ class DrawImage(
     override val top get() = topPx
     override val bottom get() = bottomPx
 }
+
+enum class FormControlType { TEXT, PASSWORD, TEXTAREA, CHECKBOX, RADIO, BUTTON }
+
+/**
+ * A form control's box, in the same absolute page/viewport space as every
+ * other DisplayCommand. TEXT/PASSWORD/TEXTAREA aren't painted onto the
+ * Canvas at all - BrowserView instead positions a real overlaid `EditText`
+ * over this rect (see its class doc for why: genuine keyboard/IME input is
+ * a platform-widget job, not something worth hand-rolling). CHECKBOX/
+ * RADIO/BUTTON have no live keyboard-input need, so BrowserView paints
+ * them directly from [value]/[checked] like any other DisplayCommand.
+ */
+class DrawFormControl(
+    override val left: Float,
+    val topPx: Float,
+    override val right: Float,
+    val bottomPx: Float,
+    val controlType: FormControlType,
+    val value: String,
+    val checked: Boolean,
+    val placeholder: String,
+    val style: TextStyle,
+    override val fixed: Boolean = false,
+    override val sourceElement: ElementNode? = null
+) : DisplayCommand() {
+    override val top get() = topPx
+    override val bottom get() = bottomPx
+}

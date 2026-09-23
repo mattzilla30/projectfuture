@@ -57,6 +57,7 @@ class MainActivity : AppCompatActivity() {
         }
         binding.browserView.onLinkTapped = { href -> tabManager.activeTab?.followLink(href) }
         binding.browserView.onElementTapped = { element -> tabManager.activeTab?.dispatchClick(element) }
+        binding.browserView.onFormInput = { element, value -> tabManager.activeTab?.dispatchInputEvent(element, value) }
 
         binding.buttonBack.setOnClickListener { tabManager.activeTab?.goBack() }
         binding.buttonForward.setOnClickListener { tabManager.activeTab?.goForward() }
@@ -125,6 +126,7 @@ class MainActivity : AppCompatActivity() {
                 binding.progressBar.visibility = View.GONE
                 binding.editAddress.setText(state.url.toString())
                 title = state.title ?: state.url.toString()
+                binding.browserView.clearOverlayViews()
                 binding.browserView.resetScroll()
                 refreshView()
                 updateNavButtons()
@@ -153,6 +155,7 @@ class MainActivity : AppCompatActivity() {
         }
         binding.editAddress.setText(tab.currentUrl?.toString() ?: "")
         title = tabTitles[tab] ?: tab.currentUrl?.toString() ?: getString(R.string.untitled_tab)
+        binding.browserView.clearOverlayViews()
         binding.browserView.resetScroll()
         refreshView()
         updateNavButtons()

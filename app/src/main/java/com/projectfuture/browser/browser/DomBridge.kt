@@ -11,6 +11,7 @@ import com.projectfuture.browser.js.Environment
 import com.projectfuture.browser.js.Interpreter
 import com.projectfuture.browser.js.JsArray
 import com.projectfuture.browser.js.JsBoolean
+import com.projectfuture.browser.js.JsEvent
 import com.projectfuture.browser.js.JsFunction
 import com.projectfuture.browser.js.JsNull
 import com.projectfuture.browser.js.JsObject
@@ -18,6 +19,7 @@ import com.projectfuture.browser.js.JsString
 import com.projectfuture.browser.js.JsUndefined
 import com.projectfuture.browser.js.JsValue
 import com.projectfuture.browser.js.Lexer
+import com.projectfuture.browser.js.isTruthy
 import com.projectfuture.browser.js.NativeFunction
 import com.projectfuture.browser.js.Parser
 import com.projectfuture.browser.js.toJsString
@@ -62,29 +64,38 @@ class DomBridge(private val root: ElementNode) {
     fun canvasBitmaps(): Map<ElementNode, Bitmap> = canvasContexts.mapValues { it.value.bitmap }
 
     /**
-     * Bubbles a click from [startNode] up through every ancestor
-     * (inclusive), running each one's inline `onclick="..."` attribute (if
-     * any) and any `addEventListener('click', ...)` listeners. Returns
-     * true if anything actually ran, so the caller knows whether a
-     * re-style/re-layout is worth doing.
+     * Bubbles an event of [type] from [startNode] up through every ancestor
+     * (inclusive), running each one's inline `on<type>="..."` attribute (if
+     * any, with an implicit `event` variable in scope - a sloppy-mode-JS-
+     * style simplification, not a real closure over the handler's own
+     * scope) and any `addEventListener(type, ...)` listeners, `this`-bound
+     * to that ancestor. There's no `stopPropagation()` - once dispatched,
+     * an event always reaches the root. Returns the constructed
+     * [JsEvent] so the caller can check `defaultPrevented` (e.g. to decide
+     * whether a link navigation or form submission should proceed) and
+     * whether anything ran at all (worth a re-style/re-layout).
      */
-    fun dispatchClick(startNode: ElementNode, interpreter: Interpreter): Boolean {
+    fun dispatchClick(startNode: ElementNode, interpreter: Interpreter): JsEvent =
+        dispatchEvent(startNode, "click", interpreter)
+
+    fun dispatchEvent(startNode: ElementNode, type: String, interpreter: Interpreter): JsEvent {
+        val event = JsEvent(type, wrap(startNode))
+        interpreter.globalEnv.declare("event", event)
         var current: ElementNode? = startNode
-        var handled = false
         while (current != null) {
-            val onclickAttr = current.attr("onclick")
-            if (!onclickAttr.isNullOrBlank()) {
+            val onAttr = current.attr("on$type")
+            if (!onAttr.isNullOrBlank()) {
                 try {
-                    interpreter.run(Parser(Lexer(onclickAttr).tokenize()).parseProgram())
-                    handled = true
+                    interpreter.run(Parser(Lexer(onAttr).tokenize()).parseProgram())
+                    event.listenersRan = true
                 } catch (_: Exception) {
                     // A broken inline handler shouldn't block bubbling to ancestors.
                 }
             }
-            if (wrappers[current]?.dispatchEvent("click", interpreter) == true) handled = true
+            if (wrappers[current]?.runListeners(type, interpreter, event) == true) event.listenersRan = true
             current = current.parent
         }
-        return handled
+        return event
     }
 
     fun install(env: Environment) {
@@ -144,12 +155,15 @@ class DomBridge(private val root: ElementNode) {
 class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObject() {
     private val listeners = HashMap<String, MutableList<JsFunction>>()
 
-    /** Invokes every listener registered for [type] (see DomBridge.dispatchClick), `this`-bound to this element. */
-    fun dispatchEvent(type: String, interpreter: Interpreter): Boolean {
+    /** Invokes every listener registered for [type] (see DomBridge.dispatchEvent), `this`-bound to this element. */
+    fun runListeners(type: String, interpreter: Interpreter, event: JsEvent): Boolean {
         val fns = listeners[type] ?: return false
-        for (fn in fns.toList()) fn.call(interpreter, this, emptyList())
+        for (fn in fns.toList()) fn.call(interpreter, this, listOf(event))
         return fns.isNotEmpty()
     }
+
+    /** True if this element (or an ancestor of the same tag) has any listener/attribute wired for [type]. */
+    fun hasListenerFor(type: String): Boolean = listeners[type]?.isNotEmpty() == true || !node.attr("on$type").isNullOrBlank()
 
     override fun get(name: String): JsValue = when (name) {
         "tagName" -> JsString(node.tag.uppercase())
@@ -211,6 +225,11 @@ class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObjec
         "getContext" -> NativeFunction("getContext", 1) { _, _, args ->
             if (toJsString(args.getOrElse(0) { JsUndefined }) == "2d") bridge.getOrCreateCanvasContext(node) else JsNull
         }
+        "value" -> JsString(node.attr("value") ?: "")
+        "checked" -> JsBoolean(node.attributes.containsKey("checked"))
+        "type" -> JsString(node.attr("type") ?: if (node.tag == "textarea") "textarea" else "text")
+        "name" -> JsString(node.attr("name") ?: "")
+        "disabled" -> JsBoolean(node.attributes.containsKey("disabled"))
         else -> super.get(name)
     }
 
@@ -223,6 +242,9 @@ class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObjec
             "id" -> node.attributes["id"] = toJsString(value)
             "className" -> node.attributes["class"] = toJsString(value)
             "innerHTML" -> setInnerHtml(toJsString(value))
+            "value" -> node.attributes["value"] = toJsString(value)
+            "checked" -> if (isTruthy(value)) node.attributes["checked"] = "checked" else node.attributes.remove("checked")
+            "disabled" -> if (isTruthy(value)) node.attributes["disabled"] = "disabled" else node.attributes.remove("disabled")
             else -> super.set(name, value)
         }
     }
