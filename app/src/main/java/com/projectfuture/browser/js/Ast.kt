@@ -10,7 +10,9 @@ object UndefinedLit : Expr()
 object ThisExpr : Expr()
 data class Identifier(val name: String) : Expr()
 data class ArrayLit(val elements: List<Expr>) : Expr()
-data class ObjectLit(val properties: List<Pair<Expr?, Expr>>) : Expr() // key expr (StringLit); null key = `...expr` spread
+data class ObjectLit(val properties: List<Pair<Expr?, Expr>>, val accessors: List<ObjectAccessor> = emptyList()) : Expr() // key expr (StringLit); null key = `...expr` spread
+/** `{ get name() {...} }` / `{ set name(v) {...} }` - kept separate from [ObjectLit.properties] rather than folding accessors into that list's shape. */
+data class ObjectAccessor(val key: String, val isGetter: Boolean, val params: List<Param>, val body: List<Stmt>)
 data class TemplateLit(val quasis: List<String>, val expressions: List<Expr>) : Expr()
 data class RegexLit(val pattern: String, val flags: String) : Expr()
 data class Unary(val op: String, val argument: Expr) : Expr()
@@ -63,6 +65,8 @@ data class ThrowStmt(val argument: Expr) : Stmt()
 data class SwitchCase(val test: Expr?, val body: List<Stmt>) // test == null is the `default:` clause
 data class SwitchStmt(val discriminant: Expr, val cases: List<SwitchCase>) : Stmt()
 
+enum class MethodKind { NORMAL, GET, SET }
+
 /** `constructor`/`static` markers are ordinary method names/flags, not separate AST node kinds. */
-data class MethodDef(val name: String, val params: List<Param>, val body: List<Stmt>, val isStatic: Boolean)
+data class MethodDef(val name: String, val params: List<Param>, val body: List<Stmt>, val isStatic: Boolean, val kind: MethodKind = MethodKind.NORMAL)
 data class ClassDecl(val name: String, val superClass: Expr?, val methods: List<MethodDef>) : Stmt()

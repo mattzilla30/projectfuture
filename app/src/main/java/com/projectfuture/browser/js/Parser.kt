@@ -5,10 +5,11 @@ package com.projectfuture.browser.js
  * template literals, `let`/`const`, regex literals (see Lexer.kt's doc for
  * the regex-vs-division heuristic), bitwise operators, switch statements,
  * array/object destructuring (in `var`/`let`/`const`, `for-of`, and
- * function parameters), spread/rest, and default parameters. Not
- * implemented: classes, generators/async, labeled statements. See
- * Interpreter.kt's class doc for the fuller picture of what this engine
- * covers.
+ * function parameters), spread/rest, default parameters, `class`/
+ * `extends`/`super`/`static`, and getter/setter accessors (in object
+ * literals and classes). Not implemented: generators/async, labeled
+ * statements. See Interpreter.kt's class doc for the fuller picture of
+ * what this engine covers.
  */
 class Parser(private val tokens: List<Token>) {
     private var pos = 0
@@ -330,10 +331,15 @@ class Parser(private val tokens: List<Token>) {
         while (!checkPunct("}")) {
             if (matchPunct(";")) continue
             val isStatic = matchIdentText("static")
+            val kind = if (looksLikeAccessorPrefix()) {
+                if (advance().text == "get") MethodKind.GET else MethodKind.SET
+            } else {
+                MethodKind.NORMAL
+            }
             val methodName = advance().text
             val params = parseParamList()
             val body = parseBlockStatements()
-            methods.add(MethodDef(methodName, params, body, isStatic))
+            methods.add(MethodDef(methodName, params, body, isStatic, kind))
         }
         expectPunct("}")
         return ClassDecl(name, superClass, methods)
@@ -645,12 +651,28 @@ class Parser(private val tokens: List<Token>) {
         return ArrayLit(elements)
     }
 
+    /** `get`/`set` are only accessor prefixes when followed by a name *and* `(` - `{ get: 5 }` and `{ get() {} }` (a plain method named "get") both fall through to the normal paths below. */
+    private fun looksLikeAccessorPrefix(): Boolean =
+        check(TokenType.IDENT) && (peek().text == "get" || peek().text == "set") &&
+            (peek(1).type == TokenType.IDENT || peek(1).type == TokenType.STRING) &&
+            peek(2).type == TokenType.PUNCT && peek(2).text == "("
+
     private fun parseObjectLit(): Expr {
         expectPunct("{")
         val props = ArrayList<Pair<Expr?, Expr>>()
+        val accessors = ArrayList<ObjectAccessor>()
         while (!checkPunct("}")) {
             if (matchPunct("...")) {
                 props.add(null to parseAssignment())
+                if (!matchPunct(",")) break
+                continue
+            }
+            if (looksLikeAccessorPrefix()) {
+                val isGetter = advance().text == "get"
+                val name = advance().text
+                val params = parseParamList()
+                val body = parseBlockStatements()
+                accessors.add(ObjectAccessor(name, isGetter, params, body))
                 if (!matchPunct(",")) break
                 continue
             }
@@ -670,6 +692,6 @@ class Parser(private val tokens: List<Token>) {
             if (!matchPunct(",")) break
         }
         expectPunct("}")
-        return ObjectLit(props)
+        return ObjectLit(props, accessors)
     }
 }

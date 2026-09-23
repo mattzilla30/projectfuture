@@ -33,6 +33,18 @@ open class JsObject(val properties: MutableMap<String, JsValue> = LinkedHashMap(
 
     /** Kotlin-only bookkeeping for `instanceof` on `class`-declared instances - see ClassConstructor in Interpreter.kt. Empty for ordinary objects. */
     var classChain: List<JsFunction> = emptyList()
+
+    /**
+     * Accessor properties (`{ get x() {} }` / class `get`/`set` methods).
+     * Checked by Interpreter.getProperty/setProperty *before* falling back
+     * to plain [get]/[set] - accessor invocation needs a live Interpreter
+     * to run the getter/setter function's body with, which only
+     * Interpreter-level code has access to (this class's own get/set have
+     * no such reference), so the accessor check has to live at that call
+     * site rather than inside get()/set() themselves.
+     */
+    var getters: MutableMap<String, JsFunction>? = null
+    var setters: MutableMap<String, JsFunction>? = null
 }
 
 class JsArray(val elements: MutableList<JsValue> = ArrayList()) : JsObject() {

@@ -137,7 +137,14 @@ class Interpreter {
         val instanceMethods = stmt.methods.filter { !it.isStatic && it.name != "constructor" }
         val staticMethods = stmt.methods.filter { it.isStatic }
         val classFn = ClassConstructor(stmt.name, superFn, ctor?.params, ctor?.body, instanceMethods, env)
-        for (m in staticMethods) classFn.set(m.name, Closure(m.name, m.params, m.body, env, isArrow = false))
+        for (m in staticMethods) {
+            val fn = Closure(m.name, m.params, m.body, env, isArrow = false)
+            when (m.kind) {
+                MethodKind.GET -> (classFn.getters ?: HashMap<String, JsFunction>().also { classFn.getters = it })[m.name] = fn
+                MethodKind.SET -> (classFn.setters ?: HashMap<String, JsFunction>().also { classFn.setters = it })[m.name] = fn
+                MethodKind.NORMAL -> classFn.set(m.name, fn)
+            }
+        }
         env.declare(stmt.name, classFn)
     }
 
@@ -231,6 +238,14 @@ class Interpreter {
                     obj.set(key, evalExpr(v, env))
                 }
             }
+            for (accessor in expr.accessors) {
+                val fn = Closure(accessor.key, accessor.params, accessor.body, env, isArrow = false)
+                if (accessor.isGetter) {
+                    (obj.getters ?: HashMap<String, JsFunction>().also { obj.getters = it })[accessor.key] = fn
+                } else {
+                    (obj.setters ?: HashMap<String, JsFunction>().also { obj.setters = it })[accessor.key] = fn
+                }
+            }
             obj
         }
         is SpreadElement -> evalExpr(expr.argument, env) // only reached if spread appears somewhere evalArgs doesn't pre-expand it
@@ -271,12 +286,17 @@ class Interpreter {
             if (key == "length") JsNumber(obj.value.length.toDouble())
             else key.toIntOrNull()?.let { idx -> obj.value.getOrNull(idx)?.let { JsString(it.toString()) } } ?: JsUndefined
         }
-        is JsObject -> obj.get(key)
+        is JsObject -> {
+            val getter = obj.getters?.get(key)
+            if (getter != null) getter.call(this, obj, emptyList()) else obj.get(key)
+        }
         else -> JsUndefined
     }
 
     fun setProperty(obj: JsValue, key: String, value: JsValue) {
-        if (obj is JsObject) obj.set(key, value)
+        if (obj !is JsObject) return
+        val setter = obj.setters?.get(key)
+        if (setter != null) setter.call(this, obj, listOf(value)) else obj.set(key, value)
     }
 
     /** Evaluates a list of expressions that may contain `...expr` spreads, flattening each spread array/string in. */
@@ -526,7 +546,14 @@ class ClassConstructor(
         val instance = thisArg as? JsObject ?: JsObject()
         if (this !in instance.classChain) instance.classChain = instance.classChain + this
         fun bindOwnMethods() {
-            for (m in instanceMethods) instance.set(m.name, Closure(m.name, m.params, m.body, declEnv, isArrow = false))
+            for (m in instanceMethods) {
+                val fn = Closure(m.name, m.params, m.body, declEnv, isArrow = false)
+                when (m.kind) {
+                    MethodKind.GET -> (instance.getters ?: HashMap<String, JsFunction>().also { instance.getters = it })[m.name] = fn
+                    MethodKind.SET -> (instance.setters ?: HashMap<String, JsFunction>().also { instance.setters = it })[m.name] = fn
+                    MethodKind.NORMAL -> instance.set(m.name, fn)
+                }
+            }
         }
         if (ctorBody == null) {
             // No own constructor: implicit default forwards args to super (if any), then this

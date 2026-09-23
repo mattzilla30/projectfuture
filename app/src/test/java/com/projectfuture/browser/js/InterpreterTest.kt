@@ -452,6 +452,56 @@ class InterpreterTest {
         assertEquals(JsNull, interpreter.globalEnv.get("result2"))
     }
 
+    @Test fun objectLiteralGetterAndSetter() {
+        assertNum(42.0, """
+            var obj = {
+                _x: 42,
+                get x() { return this._x; },
+                set x(v) { this._x = v * 2; }
+            };
+            var result = obj.x;
+            """.trimIndent()
+        )
+        assertNum(20.0, """
+            var obj = {
+                _x: 0,
+                get x() { return this._x; },
+                set x(v) { this._x = v * 2; }
+            };
+            obj.x = 10;
+            var result = obj.x;
+            """.trimIndent()
+        )
+    }
+
+    @Test fun objectLiteralPlainGetKeyStillWorksAsRegularProperty() {
+        assertNum(5.0, "var obj = { get: 5 }; var result = obj.get;")
+    }
+
+    @Test fun classGetterAndSetter() {
+        assertNum(72.0, """
+            class Temperature {
+                constructor(celsius) { this._celsius = celsius; }
+                get fahrenheit() { return this._celsius * 9 / 5 + 32; }
+                set fahrenheit(f) { this._celsius = (f - 32) * 5 / 9; }
+            }
+            var t = new Temperature(22.222222222222225);
+            var result = Math.round(t.fahrenheit);
+            """.trimIndent()
+        )
+        assertNum(0.0, """
+            class Temperature {
+                constructor(celsius) { this._celsius = celsius; }
+                get fahrenheit() { return this._celsius * 9 / 5 + 32; }
+                set fahrenheit(f) { this._celsius = (f - 32) * 5 / 9; }
+            }
+            var t = new Temperature(100);
+            t.fahrenheit = 32;
+            var result = t._celsius;
+            """.trimIndent()
+        )
+    }
+
     @Test fun classStaticMethod() {
         assertNum(9.0, """
             class MathHelper {
