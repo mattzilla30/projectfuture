@@ -44,6 +44,7 @@ import com.projectfuture.browser.net.CertificateExceptions
 import com.projectfuture.browser.net.HttpResponse
 import com.projectfuture.browser.net.TrackingProtection
 import com.projectfuture.browser.net.Url
+import com.projectfuture.browser.net.WebSocketClient
 import com.projectfuture.browser.net.ContentSecurityPolicy
 import com.projectfuture.browser.net.corsAllows
 import com.projectfuture.browser.net.isMixedContent
@@ -831,7 +832,76 @@ class Tab(
             (args.getOrNull(0) as? JsNumber)?.let { canceledTimers.add(it.value.toInt()) }
             JsUndefined
         })
+
+        installWebSocket(interpreter, pageRoot, baseUrl, ::afterAsyncWork)
     }
+
+    /**
+     * `new WebSocket(url)`: a real client (see WebSocketClient), wired to
+     * `onopen`/`onmessage`/`onclose`/`onerror` properties (the addEventListener
+     * style isn't supported for WebSocket, only the property-assignment
+     * style most real code actually uses) plus `send()`/`close()` and a
+     * standards-shaped `readyState`. Same mixed-content principle as
+     * fetch()/XHR: an HTTPS page can't open a plain `ws://` socket, only
+     * `wss://`.
+     */
+    private fun installWebSocket(interpreter: Interpreter, pageRoot: ElementNode, baseUrl: Url, afterAsyncWork: () -> Unit) {
+        val ctor = NativeFunction("WebSocket", 1) { interp, thisArg, args ->
+            val obj = thisArg as? JsObject ?: JsObject()
+            val urlString = toJsString(args.getOrElse(0) { JsUndefined })
+            val wsUrl = try { baseUrl.resolve(urlString) } catch (e: Exception) { throw jsError("Invalid WebSocket URL: $urlString") }
+            if (baseUrl.isHttps && wsUrl.scheme == "ws") {
+                throw jsError("Mixed Content: the page at '$baseUrl' was loaded over HTTPS, but attempted to open an insecure WebSocket to '$wsUrl'. This request has been blocked.")
+            }
+            obj.set("readyState", JsNumber(0.0)) // CONNECTING
+            obj.set("url", JsString(wsUrl.toString()))
+            obj.set("send", NativeFunction("send", 1) { _, _, sendArgs ->
+                JsUndefined.also { wsClientFor(obj)?.send(toJsString(sendArgs.getOrElse(0) { JsUndefined })) }
+            })
+            obj.set("close", NativeFunction("close", 0) { _, _, _ -> wsClientFor(obj)?.close(); JsUndefined })
+
+            val client = WebSocketClient(wsUrl)
+            webSockets[obj] = client
+            client.onOpen = {
+                mainHandler.post {
+                    if (currentDoc === pageRoot) {
+                        obj.set("readyState", JsNumber(1.0))
+                        (obj.get("onopen") as? JsFunction)?.call(interp, obj, listOf(JsEvent("open", obj)))
+                    }
+                }
+            }
+            client.onMessage = { data ->
+                mainHandler.post {
+                    val event = JsEvent("message", obj)
+                    event.set("data", JsString(data))
+                    (obj.get("onmessage") as? JsFunction)?.call(interp, obj, listOf(event))
+                    afterAsyncWork()
+                }
+            }
+            client.onClose = { code, reason ->
+                mainHandler.post {
+                    obj.set("readyState", JsNumber(3.0))
+                    val event = JsEvent("close", obj)
+                    event.set("code", JsNumber(code.toDouble()))
+                    event.set("reason", JsString(reason))
+                    (obj.get("onclose") as? JsFunction)?.call(interp, obj, listOf(event))
+                    webSockets.remove(obj)
+                }
+            }
+            client.onError = { message ->
+                mainHandler.post {
+                    (obj.get("onerror") as? JsFunction)?.call(interp, obj, listOf(JsEvent("error", obj)))
+                    println("[WebSocket error] $message")
+                }
+            }
+            client.connect()
+            obj
+        }
+        interpreter.globalEnv.declare("WebSocket", ctor)
+    }
+
+    private val webSockets = HashMap<JsObject, WebSocketClient>()
+    private fun wsClientFor(obj: JsObject): WebSocketClient? = webSockets[obj]
 
     private fun makeFetchResponse(response: HttpResponse): JsObject {
         val obj = JsObject()

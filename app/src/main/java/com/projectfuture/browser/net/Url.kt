@@ -379,14 +379,17 @@ data class Url(
             } else {
                 scheme = "http"
             }
-            require(scheme == "http" || scheme == "https") { "Unsupported scheme: $scheme" }
+            // ws/wss are accepted here too (see WebSocketClient) purely as a URL container - port
+            // defaulting mirrors http/https, but Url.fetch() itself still only serves http/https;
+            // WebSocketClient does its own raw-socket handshake and never calls fetch() on one of these.
+            require(scheme in setOf("http", "https", "ws", "wss")) { "Unsupported scheme: $scheme" }
 
             if (!url.contains("/")) url += "/"
             val host = url.substringBefore("/")
             var path = "/" + url.substringAfter("/")
 
             var hostname = host
-            var port = if (scheme == "https") 443 else 80
+            var port = if (scheme == "https" || scheme == "wss") 443 else 80
             if (hostname.contains(":")) {
                 port = hostname.substringAfterLast(":").toIntOrNull() ?: port
                 hostname = hostname.substringBeforeLast(":")
