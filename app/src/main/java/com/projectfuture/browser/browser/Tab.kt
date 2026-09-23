@@ -95,11 +95,15 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
 
     private fun load(url: Url, action: HistoryAction) {
         onStateChanged(TabState.Loading(url))
+        // Read on the main thread (load() is always called from one) before
+        // handing off to the background executor, rather than reading the
+        // mutable viewportWidth field from that other thread later.
+        val mediaViewportWidth = if (viewportWidth > 0f) viewportWidth else 360f
         executor.execute {
             try {
                 val response = url.fetch()
                 val root = HtmlParser(response.body).parse()
-                val authorCss = collectAuthorCss(root, response.url)
+                val authorCss = collectAuthorCss(root, response.url, mediaViewportWidth)
                 computeStyles(root, authorCss.rules)
                 val title = extractTitle(root)
                 val images = collectAndDecodeImages(root, response.url)
@@ -168,7 +172,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
 
     private class AuthorCss(val rules: List<CssRule>, val fontFaces: List<Pair<FontFaceRule, Url>>)
 
-    private fun collectAuthorCss(root: ElementNode, baseUrl: Url): AuthorCss {
+    private fun collectAuthorCss(root: ElementNode, baseUrl: Url, viewportWidth: Float): AuthorCss {
         val rules = ArrayList<CssRule>()
         val fontFaces = ArrayList<Pair<FontFaceRule, Url>>()
 
@@ -183,7 +187,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             when {
                 el.tag == "style" -> {
                     val text = el.children.filterIsInstance<TextNode>().joinToString("") { it.text }
-                    harvest(CssParser(text), baseUrl)
+                    harvest(CssParser(text, viewportWidth), baseUrl)
                 }
                 el.tag == "link" && el.attr("rel")?.lowercase()?.contains("stylesheet") == true -> {
                     val href = el.attr("href")
@@ -192,7 +196,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                             val styleSheetUrl = baseUrl.resolve(href)
                             val response = styleSheetUrl.fetch()
                             // url()s inside an external stylesheet resolve against ITS location, not the page's.
-                            harvest(CssParser(response.body), styleSheetUrl)
+                            harvest(CssParser(response.body, viewportWidth), styleSheetUrl)
                         } catch (_: Exception) {
                             // A failed stylesheet fetch shouldn't block the page from rendering.
                         }

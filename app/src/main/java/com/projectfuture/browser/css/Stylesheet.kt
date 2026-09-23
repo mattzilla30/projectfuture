@@ -54,6 +54,10 @@ private fun styleNode(node: Node, rules: List<CssRule>, parentStyle: Map<String,
     for (key in INHERITED_PROPS) {
         parentStyle[key]?.let { node.style[key] = it }
     }
+    // Custom properties (--*) always inherit, unlike the fixed list above.
+    for ((key, value) in parentStyle) {
+        if (key.startsWith("--")) node.style[key] = value
+    }
 
     for (rule in rules) {
         if (rule.selector.matches(node)) node.style.putAll(rule.properties)
@@ -64,9 +68,34 @@ private fun styleNode(node: Node, rules: List<CssRule>, parentStyle: Map<String,
         node.style.putAll(CssParser.parseInlineDeclarations(inline))
     }
 
+    resolveCustomProperties(node.style)
     resolveFontSize(node, parentStyle)
 
     for (child in node.children) styleNode(child, rules, node.style)
+}
+
+private val VAR_REFERENCE = Regex("var\\(\\s*(--[a-zA-Z0-9_-]+)\\s*(?:,\\s*([^)]*))?\\)")
+
+/**
+ * Substitutes `var(--x)`/`var(--x, fallback)` with the custom property's
+ * value (already present in [style] from cascade + inheritance above).
+ * Custom properties are resolved first so a property referencing one that
+ * itself holds `var(--y)` sees the fully-resolved value. Bounded to a few
+ * substitution passes as a simple guard against reference cycles.
+ */
+private fun resolveCustomProperties(style: MutableMap<String, String>) {
+    val keys = style.keys.toList()
+    fun resolve(key: String) {
+        var value = style[key] ?: return
+        if ("var(" !in value) return
+        repeat(5) {
+            if ("var(" !in value) return@repeat
+            value = VAR_REFERENCE.replace(value) { m -> style[m.groupValues[1]] ?: m.groupValues.getOrElse(2) { "" } }
+        }
+        style[key] = value
+    }
+    for (key in keys) if (key.startsWith("--")) resolve(key)
+    for (key in keys) if (!key.startsWith("--")) resolve(key)
 }
 
 private fun resolveFontSize(node: ElementNode, parentStyle: Map<String, String>) {

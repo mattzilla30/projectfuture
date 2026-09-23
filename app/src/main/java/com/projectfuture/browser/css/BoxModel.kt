@@ -190,10 +190,51 @@ private fun extractShorthandSide(shorthand: String, side: String): String? {
 internal fun lengthValue(raw: String, percentBase: Float, fontSizePx: Float): Float? {
     val v = raw.trim()
     if (v.isEmpty() || v == "auto" || v == "none") return null
+    if (v.startsWith("calc(") && v.endsWith(")")) {
+        return evalCalc(v.substring(5, v.length - 1), percentBase, fontSizePx)
+    }
     return when {
         v.endsWith("%") -> v.removeSuffix("%").toFloatOrNull()?.let { percentBase * it / 100f }
         v.endsWith("px") -> v.removeSuffix("px").toFloatOrNull()
         v.endsWith("em") -> v.removeSuffix("em").toFloatOrNull()?.let { fontSizePx * it }
         else -> v.toFloatOrNull() // unitless (e.g. "0")
     }
+}
+
+/**
+ * Evaluates a flat sum/difference of terms, e.g. `calc(100% - 20px)` or
+ * `calc(50% + 2em - 10px)`. Not full CSS calc(): no `*`/`/`, no nested
+ * calc(), no mixing units within one multiplication (moot here since
+ * there isn't one). Splits on `+`/`-` that have spaces on both sides,
+ * exactly like the CSS calc() grammar requires - which conveniently also
+ * disambiguates the operator from a negative term like `-20px`.
+ */
+private fun evalCalc(expr: String, percentBase: Float, fontSizePx: Float): Float? {
+    val s = expr.trim()
+    if (s.isEmpty()) return null
+    val terms = ArrayList<Pair<Char, String>>()
+    var sign = '+'
+    val buf = StringBuilder()
+    var i = 0
+    while (i < s.length) {
+        val c = s[i]
+        val isOperator = (c == '+' || c == '-') && i > 0 && s[i - 1] == ' ' && i + 1 < s.length && s[i + 1] == ' '
+        if (isOperator) {
+            terms.add(sign to buf.toString().trim())
+            buf.setLength(0)
+            sign = c
+        } else {
+            buf.append(c)
+        }
+        i++
+    }
+    if (buf.isNotBlank()) terms.add(sign to buf.toString().trim())
+    if (terms.isEmpty()) return null
+
+    var total = 0f
+    for ((termSign, termText) in terms) {
+        val value = lengthValue(termText, percentBase, fontSizePx) ?: return null
+        total += if (termSign == '-') -value else value
+    }
+    return total
 }

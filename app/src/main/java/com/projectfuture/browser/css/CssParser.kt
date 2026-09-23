@@ -5,12 +5,22 @@ class CssRule(val selector: Selector, val properties: Map<String, String>)
 /**
  * A small hand-written CSS parser: enough for tag/class/id/descendant
  * selectors, comma-separated selector lists, and flat property:value
- * declarations. Most at-rules (@media, @import, ...) are skipped wholesale
- * rather than interpreted; `@font-face` is the one exception, collected
- * into [fontFaceRules] for Tab to resolve/fetch/load. No platform CSS
- * engine is used.
+ * declarations. Most at-rules (@import, @supports, @container, ...) are
+ * skipped wholesale rather than interpreted; `@font-face` (collected into
+ * [fontFaceRules]) and `@media` are the two exceptions. `@media` supports
+ * `min-width`/`max-width` against [viewportWidth] (by far the most common
+ * real-world usage - responsive breakpoints) plus the `screen`/`all`/
+ * `print`/`speech` media types combined with `and`/comma-separated lists;
+ * any other feature (`prefers-color-scheme`, `orientation`, `hover`, ...)
+ * makes that query not match, fail-safe, rather than guessing. Container
+ * queries (`@container`) aren't implemented. No platform CSS engine is used.
+ *
+ * Media queries are evaluated once, against the viewport size at parse
+ * time - there's no re-evaluation on rotation/resize, since that would
+ * require re-running the whole CSS cascade (not just layout) on a size
+ * change, which Tab doesn't currently do.
  */
-class CssParser(private val source: String) {
+class CssParser(private val source: String, private val viewportWidth: Float = 360f) {
 
     val fontFaceRules: List<Map<String, String>> get() = _fontFaceRules
     private val _fontFaceRules = ArrayList<Map<String, String>>()
@@ -28,6 +38,20 @@ class CssParser(private val source: String) {
                     val bodyEnd = if (brace != -1) matchingBrace(brace) else -1
                     if (brace != -1 && bodyEnd != -1) {
                         _fontFaceRules.add(parseDeclarations(source.substring(brace + 1, bodyEnd)))
+                        i = bodyEnd + 1
+                        continue
+                    }
+                }
+                if (source.startsWith("@media", i)) {
+                    val brace = source.indexOf('{', i)
+                    val bodyEnd = if (brace != -1) matchingBrace(brace) else -1
+                    if (brace != -1 && bodyEnd != -1) {
+                        val condition = source.substring(i + 6, brace).trim()
+                        if (mediaQueryMatches(condition, viewportWidth)) {
+                            val nested = CssParser(source.substring(brace + 1, bodyEnd), viewportWidth)
+                            rules.addAll(nested.parseRules())
+                            _fontFaceRules.addAll(nested.fontFaceRules)
+                        }
                         i = bodyEnd + 1
                         continue
                     }
@@ -152,6 +176,30 @@ class CssParser(private val source: String) {
     }
 
     companion object {
+        private val MEDIA_FEATURE = Regex("\\(\\s*(min-width|max-width)\\s*:\\s*([0-9.]+)(px)?\\s*\\)")
+
+        /** OR across comma-separated queries. */
+        private fun mediaQueryMatches(condition: String, viewportWidth: Float): Boolean =
+            condition.split(',').map { it.trim() }.any { matchesSingleQuery(it, viewportWidth) }
+
+        /** AND across `and`-separated conditions within one query. */
+        private fun matchesSingleQuery(query: String, viewportWidth: Float): Boolean =
+            query.split(Regex("\\band\\b", RegexOption.IGNORE_CASE)).map { it.trim() }
+                .all { matchesFeature(it, viewportWidth) }
+
+        private fun matchesFeature(part: String, viewportWidth: Float): Boolean {
+            val trimmed = part.trim()
+            if (trimmed.isEmpty() || trimmed.equals("screen", true) || trimmed.equals("all", true)) return true
+            if (trimmed.equals("print", true) || trimmed.equals("speech", true)) return false
+            val match = MEDIA_FEATURE.find(trimmed) ?: return false // unrecognized feature: fail-safe exclude
+            val value = match.groupValues[2].toFloatOrNull() ?: return false
+            return when (match.groupValues[1]) {
+                "min-width" -> viewportWidth >= value
+                "max-width" -> viewportWidth <= value
+                else -> false
+            }
+        }
+
         /** Parses a `style="..."` attribute value into a flat declaration map. */
         fun parseInlineDeclarations(text: String): Map<String, String> {
             val props = LinkedHashMap<String, String>()
