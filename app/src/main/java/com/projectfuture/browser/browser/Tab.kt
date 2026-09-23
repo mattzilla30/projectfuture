@@ -1,19 +1,26 @@
 package com.projectfuture.browser.browser
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Typeface
 import android.os.Handler
 import android.os.Looper
 import com.projectfuture.browser.css.CssParser
 import com.projectfuture.browser.css.CssRule
+import com.projectfuture.browser.css.FontFaceRule
 import com.projectfuture.browser.css.computeStyles
+import com.projectfuture.browser.css.parseFontFaceRule
 import com.projectfuture.browser.html.ElementNode
 import com.projectfuture.browser.html.HtmlParser
 import com.projectfuture.browser.html.TextNode
 import com.projectfuture.browser.html.walkElements
 import com.projectfuture.browser.layout.DisplayCommand
 import com.projectfuture.browser.layout.DocumentLayout
+import com.projectfuture.browser.layout.FontDecoder
+import com.projectfuture.browser.layout.customFonts
 import com.projectfuture.browser.net.Url
+import java.io.File
 import java.util.concurrent.Executors
 
 sealed class TabState {
@@ -30,7 +37,7 @@ private enum class HistoryAction { PUSH, NONE }
  * history. This is the only place that talks to the network and DOM/CSS/
  * layout modules together.
  */
-class Tab(private val onStateChanged: (TabState) -> Unit) {
+class Tab(private val context: Context, private val onStateChanged: (TabState) -> Unit) {
 
     private val history = ArrayList<Url>()
     private var historyIndex = -1
@@ -92,14 +99,16 @@ class Tab(private val onStateChanged: (TabState) -> Unit) {
             try {
                 val response = url.fetch()
                 val root = HtmlParser(response.body).parse()
-                val authorRules = collectAuthorCss(root, response.url)
-                computeStyles(root, authorRules)
+                val authorCss = collectAuthorCss(root, response.url)
+                computeStyles(root, authorCss.rules)
                 val title = extractTitle(root)
                 val images = collectAndDecodeImages(root, response.url)
+                val fonts = loadFontFaces(authorCss.fontFaces)
                 mainHandler.post {
                     currentUrl = response.url
                     currentDoc = root
                     currentImages = images
+                    customFonts = fonts
                     when (action) {
                         HistoryAction.PUSH -> {
                             while (history.size > historyIndex + 1) history.removeAt(history.size - 1)
@@ -157,20 +166,33 @@ class Tab(private val onStateChanged: (TabState) -> Unit) {
         return result
     }
 
-    private fun collectAuthorCss(root: ElementNode, baseUrl: Url): List<CssRule> {
+    private class AuthorCss(val rules: List<CssRule>, val fontFaces: List<Pair<FontFaceRule, Url>>)
+
+    private fun collectAuthorCss(root: ElementNode, baseUrl: Url): AuthorCss {
         val rules = ArrayList<CssRule>()
+        val fontFaces = ArrayList<Pair<FontFaceRule, Url>>()
+
+        fun harvest(parser: CssParser, styleSheetBase: Url) {
+            rules.addAll(parser.parseRules())
+            for (decl in parser.fontFaceRules) {
+                parseFontFaceRule(decl)?.let { fontFaces.add(it to styleSheetBase) }
+            }
+        }
+
         root.walkElements { el ->
             when {
                 el.tag == "style" -> {
                     val text = el.children.filterIsInstance<TextNode>().joinToString("") { it.text }
-                    rules.addAll(CssParser(text).parseRules())
+                    harvest(CssParser(text), baseUrl)
                 }
                 el.tag == "link" && el.attr("rel")?.lowercase()?.contains("stylesheet") == true -> {
                     val href = el.attr("href")
                     if (href != null) {
                         try {
-                            val response = baseUrl.resolve(href).fetch()
-                            rules.addAll(CssParser(response.body).parseRules())
+                            val styleSheetUrl = baseUrl.resolve(href)
+                            val response = styleSheetUrl.fetch()
+                            // url()s inside an external stylesheet resolve against ITS location, not the page's.
+                            harvest(CssParser(response.body), styleSheetUrl)
                         } catch (_: Exception) {
                             // A failed stylesheet fetch shouldn't block the page from rendering.
                         }
@@ -178,7 +200,38 @@ class Tab(private val onStateChanged: (TabState) -> Unit) {
                 }
             }
         }
-        return rules
+        return AuthorCss(rules, fontFaces)
+    }
+
+    /**
+     * Fetches and converts each @font-face's font file to SFNT (see
+     * FontDecoder), then hands it to Typeface via a temp cache file -
+     * Typeface.createFromFile works across all supported API levels,
+     * unlike the newer ByteBuffer-based builder. The first successfully
+     * loaded font for a given family wins; later ones for the same family
+     * (e.g. bold/italic variants declared separately) are ignored, and
+     * FontCache synthesizes bold/italic from whichever one loaded.
+     */
+    private fun loadFontFaces(entries: List<Pair<FontFaceRule, Url>>): Map<String, Typeface> {
+        val result = HashMap<String, Typeface>()
+        for ((rule, styleSheetBase) in entries) {
+            val key = rule.family.lowercase()
+            if (result.containsKey(key)) continue
+            try {
+                val bytes = styleSheetBase.resolve(rule.srcUrl).fetchBytes().body
+                val sfnt = FontDecoder.toSfnt(bytes) ?: continue
+                val tempFile = File.createTempFile("font", ".ttf", context.cacheDir)
+                try {
+                    tempFile.writeBytes(sfnt)
+                    result[key] = Typeface.createFromFile(tempFile)
+                } finally {
+                    tempFile.delete()
+                }
+            } catch (_: Exception) {
+                // Unsupported (e.g. WOFF2) or broken font file: skip it, inherited/system font still applies.
+            }
+        }
+        return result
     }
 
     private fun extractTitle(root: ElementNode): String? {

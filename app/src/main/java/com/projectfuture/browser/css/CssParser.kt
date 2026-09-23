@@ -5,10 +5,15 @@ class CssRule(val selector: Selector, val properties: Map<String, String>)
 /**
  * A small hand-written CSS parser: enough for tag/class/id/descendant
  * selectors, comma-separated selector lists, and flat property:value
- * declarations. At-rules (@media, @import, ...) are skipped wholesale
- * rather than interpreted. No platform CSS engine is used.
+ * declarations. Most at-rules (@media, @import, ...) are skipped wholesale
+ * rather than interpreted; `@font-face` is the one exception, collected
+ * into [fontFaceRules] for Tab to resolve/fetch/load. No platform CSS
+ * engine is used.
  */
 class CssParser(private val source: String) {
+
+    val fontFaceRules: List<Map<String, String>> get() = _fontFaceRules
+    private val _fontFaceRules = ArrayList<Map<String, String>>()
 
     fun parseRules(): List<CssRule> {
         val rules = ArrayList<CssRule>()
@@ -18,6 +23,15 @@ class CssParser(private val source: String) {
             i = skipWhitespace(i)
             if (i >= n) break
             if (source[i] == '@') {
+                if (source.startsWith("@font-face", i)) {
+                    val brace = source.indexOf('{', i)
+                    val bodyEnd = if (brace != -1) matchingBrace(brace) else -1
+                    if (brace != -1 && bodyEnd != -1) {
+                        _fontFaceRules.add(parseDeclarations(source.substring(brace + 1, bodyEnd)))
+                        i = bodyEnd + 1
+                        continue
+                    }
+                }
                 val brace = source.indexOf('{', i)
                 val semi = source.indexOf(';', i)
                 i = when {

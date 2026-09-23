@@ -16,8 +16,12 @@ data class TextStyle(
     val color: Int,
     val underline: Boolean,
     val strikethrough: Boolean,
-    val linkHref: String?
+    val linkHref: String?,
+    /** First non-generic font-family name (e.g. from `@font-face`), or null. See [customFonts]. */
+    val fontFamilyName: String? = null
 )
+
+private val GENERIC_FONT_FAMILIES = setOf("sans-serif", "serif", "monospace", "cursive", "fantasy", "system-ui")
 
 fun textStyleForElement(node: ElementNode, linkHref: String?): TextStyle {
     val style = node.style
@@ -25,8 +29,10 @@ fun textStyleForElement(node: ElementNode, linkHref: String?): TextStyle {
     val weight = style["font-weight"] ?: "normal"
     val bold = weight == "bold" || (weight.toIntOrNull() ?: 0) >= 700
     val italic = (style["font-style"] ?: "normal").let { it == "italic" || it == "oblique" }
-    val fontFamily = style["font-family"]?.lowercase() ?: ""
-    val monospace = fontFamily.contains("mono") || node.tag in setOf("code", "pre", "tt", "kbd", "samp")
+    val fontFamilyRaw = style["font-family"] ?: ""
+    val firstFamily = fontFamilyRaw.split(",").firstOrNull()?.trim()?.trim('"', '\'')
+    val customFamilyName = firstFamily?.takeIf { it.isNotEmpty() && it.lowercase() !in GENERIC_FONT_FAMILIES }
+    val monospace = fontFamilyRaw.lowercase().contains("mono") || node.tag in setOf("code", "pre", "tt", "kbd", "samp")
     val decoration = style["text-decoration"] ?: ""
     val color = parseCssColor(style["color"]) ?: Color.BLACK
     return TextStyle(
@@ -37,20 +43,30 @@ fun textStyleForElement(node: ElementNode, linkHref: String?): TextStyle {
         color = color,
         underline = decoration.contains("underline"),
         strikethrough = decoration.contains("line-through"),
-        linkHref = linkHref
+        linkHref = linkHref,
+        fontFamilyName = customFamilyName
     )
 }
+
+/**
+ * Fonts loaded from `@font-face` for the current document, keyed by
+ * lowercased family name. Set once per page load by Tab; see
+ * [currentImages] for why a module-level var (rather than threading a
+ * parameter through every call site) is safe here.
+ */
+var customFonts: Map<String, Typeface> = emptyMap()
 
 /** Caches Paint objects by their resolved style so we're not allocating one per glyph run. */
 object FontCache {
     private val cache = HashMap<String, Paint>()
 
     fun paintFor(style: TextStyle): Paint {
-        val key = "${style.sizePx}-${style.bold}-${style.italic}-${style.monospace}"
+        val key = "${style.sizePx}-${style.bold}-${style.italic}-${style.monospace}-${style.fontFamilyName}"
         return cache.getOrPut(key) {
             Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 textSize = style.sizePx
-                val base = if (style.monospace) Typeface.MONOSPACE else Typeface.DEFAULT
+                val customBase = style.fontFamilyName?.let { customFonts[it.lowercase()] }
+                val base = customBase ?: if (style.monospace) Typeface.MONOSPACE else Typeface.DEFAULT
                 var flags = 0
                 if (style.bold) flags = flags or Typeface.BOLD
                 if (style.italic) flags = flags or Typeface.ITALIC

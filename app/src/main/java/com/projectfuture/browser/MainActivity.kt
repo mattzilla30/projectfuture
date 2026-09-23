@@ -25,7 +25,7 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        tab = Tab(::onTabStateChanged)
+        tab = Tab(this, ::onTabStateChanged)
 
         binding.browserView.onSizeAvailable = { width, height ->
             if (tab.onViewportSizeChanged(width, height)) refreshView()
