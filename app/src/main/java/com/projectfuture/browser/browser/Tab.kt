@@ -106,7 +106,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                 val authorCss = collectAuthorCss(root, response.url, mediaViewportWidth)
                 computeStyles(root, authorCss.rules)
                 val title = extractTitle(root)
-                val images = collectAndDecodeImages(root, response.url)
+                val images = collectAndDecodeImages(root, response.url) + collectAndRenderSvgs(root)
                 val fonts = loadFontFaces(authorCss.fontFaces)
                 mainHandler.post {
                     currentUrl = response.url
@@ -164,6 +164,21 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                     } catch (_: Exception) {
                         // Broken/unreachable image: skip it rather than failing the whole page load.
                     }
+                }
+            }
+        }
+        return result
+    }
+
+    /** Rasterizes each `<svg>` to a Bitmap up front - see SvgRenderer for what it does and doesn't support. */
+    private fun collectAndRenderSvgs(root: ElementNode): Map<ElementNode, Bitmap> {
+        val result = HashMap<ElementNode, Bitmap>()
+        root.walkElements { el ->
+            if (el.tag == "svg") {
+                try {
+                    SvgRenderer.render(el)?.let { result[el] = it }
+                } catch (_: Exception) {
+                    // Malformed/unsupported SVG content: skip it rather than failing the whole page load.
                 }
             }
         }

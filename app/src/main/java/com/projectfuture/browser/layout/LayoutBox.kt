@@ -77,6 +77,10 @@ import com.projectfuture.browser.html.TextNode
  * [currentImages] map. `data:` URIs and `srcset`/`sizes` aren't handled;
  * a broken/missing image is just skipped (no alt-text or broken-image icon).
  *
+ * `<svg>` is rasterized to a bitmap up front by SvgRenderer (see its class
+ * doc for the bounded shape/path support) and then flows through this
+ * exact same `<img>` inline-image path.
+ *
  * `transform: translate()`/`translateX()`/`translateY()` folds into an
  * element's position the same way `position: relative`'s offset does.
  * `scale`/`rotate`/`skew` and animated `transition`/`@keyframes` are not
@@ -787,7 +791,7 @@ class BlockLayout(
                     }
                 }
                 is ElementNode -> {
-                    if (isSkipped(n) || n.tag == "br" || n.tag == "img") return
+                    if (isSkipped(n) || n.tag == "br" || n.tag == "img" || n.tag == "svg") return
                     val href = if (n.tag == "a") n.attr("href") else linkHref
                     for (c in n.children) walk(c, href)
                 }
@@ -816,7 +820,7 @@ class BlockLayout(
                     flushLine()
                     return
                 }
-                if (n.tag == "img") {
+                if (n.tag == "img" || n.tag == "svg") {
                     currentImages[n]?.let { addImage(it, n) }
                     return
                 }
