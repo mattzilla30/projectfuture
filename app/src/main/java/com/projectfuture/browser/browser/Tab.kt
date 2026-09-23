@@ -794,6 +794,27 @@ class Tab(
             (args.getOrNull(0) as? JsNumber)?.let { canceledTimers.add(it.value.toInt()) }
             JsUndefined
         })
+
+        // requestAnimationFrame: same one-shot-timer plumbing as setTimeout, just floored at ~60fps
+        // (16ms) and passed a timestamp - there's no real display vsync signal behind this, since
+        // painting isn't compositor-driven (see Phase 6's doc on why GPU compositing isn't attempted).
+        interpreter.globalEnv.declare("requestAnimationFrame", NativeFunction("requestAnimationFrame", 1) { _, _, args ->
+            val fn = args.getOrNull(0) as? JsFunction
+            val id = ++timerIdCounter
+            if (fn != null) {
+                mainHandler.postDelayed({
+                    if (id !in canceledTimers && currentDoc === pageRoot) {
+                        try { fn.call(interpreter, JsUndefined, listOf(JsNumber(System.nanoTime() / 1_000_000.0))) } catch (_: Exception) { }
+                        afterAsyncWork()
+                    }
+                }, 16L)
+            }
+            JsNumber(id.toDouble())
+        })
+        interpreter.globalEnv.declare("cancelAnimationFrame", NativeFunction("cancelAnimationFrame", 1) { _, _, args ->
+            (args.getOrNull(0) as? JsNumber)?.let { canceledTimers.add(it.value.toInt()) }
+            JsUndefined
+        })
     }
 
     private fun makeFetchResponse(response: HttpResponse): JsObject {
