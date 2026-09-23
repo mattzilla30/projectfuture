@@ -134,6 +134,9 @@ class CssParser(private val source: String, private val viewportWidth: Float = 3
         return props
     }
 
+    /** Parses one CSS selector independent of any stylesheet body - used by `document.querySelector`. */
+    fun parseSingleSelector(text: String): Selector? = parseSelectorChain(text.trim())
+
     private fun parseSelectorChain(text: String): Selector? {
         val tokens = text.split(Regex("\\s+"))
             .filter { it.isNotEmpty() && it != ">" && it != "+" && it != "~" }

@@ -15,6 +15,9 @@ import com.projectfuture.browser.html.ElementNode
 import com.projectfuture.browser.html.HtmlParser
 import com.projectfuture.browser.html.TextNode
 import com.projectfuture.browser.html.walkElements
+import com.projectfuture.browser.js.Interpreter
+import com.projectfuture.browser.js.Lexer
+import com.projectfuture.browser.js.Parser
 import com.projectfuture.browser.layout.DisplayCommand
 import com.projectfuture.browser.layout.DocumentLayout
 import com.projectfuture.browser.layout.FontDecoder
@@ -103,6 +106,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             try {
                 val response = url.fetch()
                 val root = HtmlParser(response.body).parse()
+                runScripts(root, response.url) // may mutate the DOM before CSS/images/fonts are collected below
                 val authorCss = collectAuthorCss(root, response.url, mediaViewportWidth)
                 computeStyles(root, authorCss.rules)
                 val title = extractTitle(root)
@@ -183,6 +187,41 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             }
         }
         return result
+    }
+
+    /**
+     * Runs every `<script>` (inline or external `src=`) in document order
+     * against a fresh Interpreter with the DOM bridge installed, then
+     * fires `DOMContentLoaded`. A script that fails to fetch, parse, or
+     * run is skipped rather than failing the whole page load - matching
+     * how a broken stylesheet is already handled above. See DomBridge's
+     * class doc for what the script<->DOM/window bridge does and doesn't
+     * cover yet (no real event dispatch from taps, no setTimeout/fetch).
+     */
+    private fun runScripts(root: ElementNode, baseUrl: Url) {
+        val interpreter = Interpreter()
+        val bridge = DomBridge(root)
+        bridge.install(interpreter.globalEnv)
+
+        val scripts = ArrayList<ElementNode>()
+        root.walkElements { if (it.tag == "script") scripts.add(it) }
+
+        for (scriptEl in scripts) {
+            val src = scriptEl.attr("src")
+            val code = if (!src.isNullOrBlank()) {
+                try { baseUrl.resolve(src).fetch().body } catch (_: Exception) { null }
+            } else {
+                scriptEl.children.filterIsInstance<TextNode>().joinToString("") { it.text }
+            }
+            if (code.isNullOrBlank()) continue
+            try {
+                interpreter.run(Parser(Lexer(code).tokenize()).parseProgram())
+            } catch (_: Exception) {
+                // A script that fails to parse or throws shouldn't take down the whole page.
+            }
+        }
+
+        bridge.fireDomContentLoaded(interpreter)
     }
 
     private class AuthorCss(val rules: List<CssRule>, val fontFaces: List<Pair<FontFaceRule, Url>>)
