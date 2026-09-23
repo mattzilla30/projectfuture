@@ -22,6 +22,7 @@ import com.projectfuture.browser.js.JsEvent
 import com.projectfuture.browser.js.JsFunction
 import com.projectfuture.browser.js.JsNull
 import com.projectfuture.browser.js.JsNumber
+import com.projectfuture.browser.js.JsArray
 import com.projectfuture.browser.js.JsObject
 import com.projectfuture.browser.js.JsPromise
 import com.projectfuture.browser.js.JsStorage
@@ -117,6 +118,7 @@ class Tab(
     private val canceledTimers = HashSet<Int>()
     /** `sessionStorage` is per-tab (unlike `localStorage`, which is shared via [sharedLocalStorage]) - see JsStorage's doc. */
     private val sessionStorageBacking = InMemoryStorageBacking()
+    private val indexedDbStore = IndexedDbStore()
 
     /**
      * True once this (background) tab's heavy in-memory state has been
@@ -834,6 +836,109 @@ class Tab(
         })
 
         installWebSocket(interpreter, pageRoot, baseUrl, ::afterAsyncWork)
+        installIndexedDb(interpreter, pageRoot)
+    }
+
+    /**
+     * `indexedDB.open(name)`: every request's `onsuccess`/`onupgradeneeded`
+     * fires via `mainHandler.post` (a real "next tick", not synchronously
+     * inline) specifically so a script's normal pattern of attaching
+     * `request.onsuccess = ...` *after* calling `open()`/`get()`/etc still
+     * works - if these fired synchronously during the call itself, the
+     * handler wouldn't be attached yet. See IndexedDbStore's doc for the
+     * bounded storage model underneath (session-only, per-tab, no
+     * indexes/cursors/key ranges).
+     */
+    private fun installIndexedDb(interpreter: Interpreter, pageRoot: ElementNode) {
+        fun <T : JsValue> deferRequest(interp: Interpreter, request: JsObject, resultProvider: () -> T) {
+            mainHandler.post {
+                if (currentDoc !== pageRoot) return@post
+                val result = try { resultProvider() } catch (e: Exception) {
+                    (request.get("onerror") as? JsFunction)?.call(interp, request, listOf(makeError(e.message ?: "IndexedDB error")))
+                    return@post
+                }
+                val event = JsObject()
+                val target = JsObject()
+                target.set("result", result)
+                event.set("target", target)
+                (request.get("onsuccess") as? JsFunction)?.call(interp, request, listOf(event))
+            }
+        }
+
+        fun makeObjectStoreObject(dbName: String, storeName: String, interp: Interpreter): JsObject {
+            val store = JsObject()
+            val putFn = NativeFunction("put", 2) { _, _, args ->
+                val value = args.getOrElse(0) { JsUndefined }
+                val key = toJsString(args.getOrElse(1) { JsUndefined })
+                val request = JsObject()
+                deferRequest(interp, request) { indexedDbStore.put(dbName, storeName, key, value); value }
+                request
+            }
+            store.set("put", putFn)
+            store.set("add", putFn) // bounded: behaves like put, no "key already exists" error
+            store.set("get", NativeFunction("get", 1) { _, _, args ->
+                val key = toJsString(args.getOrElse(0) { JsUndefined })
+                val request = JsObject()
+                deferRequest(interp, request) { indexedDbStore.get(dbName, storeName, key) ?: JsUndefined }
+                request
+            })
+            store.set("delete", NativeFunction("delete", 1) { _, _, args ->
+                val key = toJsString(args.getOrElse(0) { JsUndefined })
+                val request = JsObject()
+                deferRequest(interp, request) { indexedDbStore.delete(dbName, storeName, key); JsUndefined }
+                request
+            })
+            store.set("getAll", NativeFunction("getAll", 0) { _, _, _ ->
+                val request = JsObject()
+                deferRequest(interp, request) { JsArray(indexedDbStore.getAll(dbName, storeName).toMutableList()) }
+                request
+            })
+            store.set("clear", NativeFunction("clear", 0) { _, _, _ ->
+                val request = JsObject()
+                deferRequest(interp, request) { indexedDbStore.clear(dbName, storeName); JsUndefined }
+                request
+            })
+            return store
+        }
+
+        fun makeDbObject(dbName: String, interp: Interpreter): JsObject {
+            val db = JsObject()
+            db.set("createObjectStore", NativeFunction("createObjectStore", 1) { _, _, args ->
+                indexedDbStore.createObjectStore(dbName, toJsString(args.getOrElse(0) { JsUndefined }))
+                JsUndefined
+            })
+            db.set("transaction", NativeFunction("transaction", 2) { _, _, args ->
+                val storeName = toJsString(args.getOrElse(0) { JsUndefined })
+                val tx = JsObject()
+                tx.set("objectStore", NativeFunction("objectStore", 1) { _, _, _ -> makeObjectStoreObject(dbName, storeName, interp) })
+                tx
+            })
+            return db
+        }
+
+        val indexedDbObj = JsObject()
+        indexedDbObj.set("open", NativeFunction("open", 2) { interp, _, args ->
+            val dbName = toJsString(args.getOrElse(0) { JsUndefined })
+            val request = JsObject()
+            mainHandler.post {
+                if (currentDoc !== pageRoot) return@post
+                val dbObj = makeDbObject(dbName, interp)
+                if (indexedDbStore.isFirstOpen(dbName)) {
+                    val event = JsObject()
+                    val target = JsObject()
+                    target.set("result", dbObj)
+                    event.set("target", target)
+                    (request.get("onupgradeneeded") as? JsFunction)?.call(interp, request, listOf(event))
+                }
+                val event = JsObject()
+                val target = JsObject()
+                target.set("result", dbObj)
+                event.set("target", target)
+                (request.get("onsuccess") as? JsFunction)?.call(interp, request, listOf(event))
+            }
+            request
+        })
+        interpreter.globalEnv.declare("indexedDB", indexedDbObj)
     }
 
     /**
