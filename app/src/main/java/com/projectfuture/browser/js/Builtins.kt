@@ -14,6 +14,8 @@ fun installGlobals(env: Environment, interpreter: Interpreter) {
     env.declare("Array", makeArrayCtor())
     env.declare("Promise", makePromiseCtor())
     env.declare("RegExp", makeRegExpCtor())
+    env.declare("Map", makeMapCtor())
+    env.declare("Set", makeSetCtor())
     env.declare("NaN", JsNumber(Double.NaN))
     env.declare("Infinity", JsNumber(Double.POSITIVE_INFINITY))
 
@@ -30,7 +32,20 @@ fun installGlobals(env: Environment, interpreter: Interpreter) {
     })
     env.declare("isNaN", NativeFunction("isNaN", 1) { _, _, args -> JsBoolean(toNumber(arg(args, 0)).isNaN()) })
     env.declare("String", NativeFunction("String", 1) { _, _, args -> JsString(if (args.isEmpty()) "" else toJsString(args[0])) })
-    env.declare("Number", NativeFunction("Number", 1) { _, _, args -> JsNumber(if (args.isEmpty()) 0.0 else toNumber(args[0])) })
+    val numberCtor = NativeFunction("Number", 1) { _, _, args -> JsNumber(if (args.isEmpty()) 0.0 else toNumber(args[0])) }
+    numberCtor.set(
+        "isInteger",
+        NativeFunction("isInteger", 1) { _, _, args ->
+            val v = args.getOrNull(0)
+            JsBoolean(v is JsNumber && !v.value.isNaN() && !v.value.isInfinite() && v.value == Math.floor(v.value))
+        }
+    )
+    numberCtor.set(
+        "isFinite",
+        NativeFunction("isFinite", 1) { _, _, args -> val v = args.getOrNull(0); JsBoolean(v is JsNumber && !v.value.isNaN() && !v.value.isInfinite()) }
+    )
+    numberCtor.set("isNaN", NativeFunction("isNaN", 1) { _, _, args -> val v = args.getOrNull(0); JsBoolean(v is JsNumber && v.value.isNaN()) })
+    env.declare("Number", numberCtor)
     env.declare("Boolean", NativeFunction("Boolean", 1) { _, _, args -> JsBoolean(isTruthy(arg(args, 0))) })
 }
 
@@ -128,6 +143,27 @@ private fun makeArrayCtor(): JsFunction = object : JsFunction("Array") {
 fun builtinMethodCall(interpreter: Interpreter, obj: JsValue, key: String, args: List<JsValue>): JsValue? = when (obj) {
     is JsArray -> arrayMethod(interpreter, obj, key, args)
     is JsString -> stringMethod(interpreter, obj, key, args)
+    is JsNumber -> numberMethod(obj, key, args)
+    else -> null
+}
+
+private fun numberMethod(n: JsNumber, key: String, args: List<JsValue>): JsValue? = when (key) {
+    "toFixed" -> {
+        val digits = (args.getOrNull(0) as? JsNumber)?.value?.toInt() ?: 0
+        JsString(String.format(java.util.Locale.US, "%.${digits.coerceIn(0, 100)}f", n.value))
+    }
+    "toString" -> {
+        val radix = (args.getOrNull(0) as? JsNumber)?.value?.toInt() ?: 10
+        if (radix == 10) JsString(formatNumber(n.value)) else JsString(n.value.toLong().toString(radix))
+    }
+    "toPrecision" -> {
+        val precision = (args.getOrNull(0) as? JsNumber)?.value?.toInt()
+        if (precision == null) {
+            JsString(formatNumber(n.value))
+        } else {
+            JsString(java.math.BigDecimal(n.value).round(java.math.MathContext(precision.coerceIn(1, 100))).toPlainString())
+        }
+    }
     else -> null
 }
 

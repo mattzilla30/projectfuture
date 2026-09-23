@@ -275,4 +275,45 @@ class InterpreterTest {
         assertNum(2.0, "var a = 10; var b = 5; var result = a / b;")
         assertNum(3.0, "var arr = [9]; var result = arr[0] / 3;")
     }
+
+    @Test fun mapBasics() {
+        assertNum(
+            2.0,
+            """
+            var m = new Map();
+            m.set('a', 1).set('b', 2);
+            var result = m.size;
+            """.trimIndent()
+        )
+        assertNum(1.0, "var m = new Map(); m.set('a', 1); var result = m.get('a');")
+        assertTrue(bool("var m = new Map(); m.set('a', 1); var result = m.has('a');"))
+        assertTrue(!bool("var m = new Map([['x',1]]); m.delete('x'); var result = m.has('x');"))
+    }
+
+    @Test fun mapObjectKeysUseIdentityNotStringification() {
+        // Object keys must be distinguished by identity, not stringified - a real gap for a
+        // plain string-keyed property bag, which is exactly what Map exists to cover here.
+        assertNum(
+            3.0,
+            """
+            var k1 = {}, k2 = {};
+            var m = new Map();
+            m.set(k1, 1);
+            m.set(k2, 2);
+            var result = m.get(k1) + m.get(k2);
+            """.trimIndent()
+        )
+    }
+
+    @Test fun setBasics() {
+        assertNum(2.0, "var s = new Set([1,2,2,3]); s.delete(3); var result = s.size;")
+        assertTrue(bool("var s = new Set(); s.add('x'); var result = s.has('x');"))
+    }
+
+    @Test fun numberFormatting() {
+        assertEquals("3.14", str("var result = (3.14159).toFixed(2);"))
+        assertEquals("ff", str("var result = (255).toString(16);"))
+        assertTrue(bool("var result = Number.isInteger(5);"))
+        assertTrue(!bool("var result = Number.isInteger(5.5);"))
+    }
 }
