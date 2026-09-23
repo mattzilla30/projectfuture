@@ -217,11 +217,23 @@ class MainActivity : AppCompatActivity() {
             is TabState.Loaded -> {
                 binding.progressBar.visibility = View.GONE
                 binding.editAddress.setText(state.url.toString())
-                applyWindowTitle(tab, state.title ?: state.url.toString())
+                val label = state.title ?: state.url.toString()
+                applyWindowTitle(tab, label)
                 binding.browserView.clearOverlayViews()
                 binding.browserView.resetScroll()
                 refreshView()
                 updateNavButtons()
+                // The one accessibility improvement made here: announcing navigation to a screen
+                // reader. Real per-element screen-reader navigation of the rendered page (reading
+                // individual paragraphs/links/form fields, matching ARIA semantics) isn't attempted -
+                // it would need a virtual-view AccessibilityNodeProvider over the Canvas-painted
+                // content, real complexity with correctness invariants (consistent bounds, no id/
+                // cycle bugs) that's genuinely risky to ship unverified: a broken accessibility tree
+                // can hang or crash TalkBack for the exact users depending on it, a worse outcome
+                // than the current gap. The overlaid form-control EditText fields are unaffected by
+                // this gap - they're real platform widgets, so TalkBack already reads/operates them
+                // correctly for free (see BrowserView's Autofill-hints work for the same point).
+                binding.browserView.announceForAccessibility(label)
             }
             is TabState.Updated -> {
                 state.title?.let { tabTitles[tab] = it; applyWindowTitle(tab, it) }
