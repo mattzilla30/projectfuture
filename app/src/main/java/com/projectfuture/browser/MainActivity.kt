@@ -3,6 +3,7 @@ package com.projectfuture.browser
 import android.content.Context
 import android.os.Bundle
 import android.text.TextUtils
+import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.View
@@ -19,6 +20,7 @@ import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.projectfuture.browser.browser.BookmarkStore
 import com.projectfuture.browser.browser.HistoryStore
 import com.projectfuture.browser.browser.Tab
@@ -182,31 +184,16 @@ class MainActivity : AppCompatActivity() {
             override fun getItemId(position: Int) = position.toLong()
             override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                 val tab = tabs[position]
-                val row = LinearLayout(this@MainActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    setPadding(32, 24, 16, 24)
-                }
+                val row = listRow(this@MainActivity)
                 val activeMarker = if (position == tabManager.activeIndex) "●  " else ""
                 val label = tabTitles[tab] ?: tab.currentUrl?.toString() ?: getString(R.string.untitled_tab)
                 row.addView(
-                    TextView(this@MainActivity).apply {
-                        text = activeMarker + label
-                        layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                        textSize = 16f
-                        maxLines = 1
-                        ellipsize = TextUtils.TruncateAt.END
-                    }
+                    listRowLabel(this@MainActivity, activeMarker + label)
                 )
                 row.addView(
-                    ImageButton(this@MainActivity).apply {
-                        setImageResource(R.drawable.ic_close)
-                        background = null
-                        contentDescription = getString(R.string.action_close)
-                        setOnClickListener {
-                            closeTabAt(position)
-                            dialog.dismiss()
-                        }
+                    listRowCloseButton(this@MainActivity) {
+                        closeTabAt(position)
+                        dialog.dismiss()
                     }
                 )
                 return row
@@ -216,7 +203,7 @@ class MainActivity : AppCompatActivity() {
             switchToTab(position)
             dialog.dismiss()
         }
-        dialog = AlertDialog.Builder(this)
+        dialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.tabs_dialog_title)
             .setView(listView)
             .setPositiveButton(R.string.action_new_tab) { d, _ -> openNewTab(); d.dismiss() }
@@ -256,28 +243,9 @@ class MainActivity : AppCompatActivity() {
 
     /** Shared row builder for the bookmarks/history dialogs: a label, tap to navigate, X to remove. */
     private fun buildListRow(label: String, onTap: () -> Unit, onRemove: () -> Unit): View {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(32, 24, 16, 24)
-        }
-        row.addView(
-            TextView(this).apply {
-                text = label
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                textSize = 16f
-                maxLines = 1
-                ellipsize = TextUtils.TruncateAt.END
-            }
-        )
-        row.addView(
-            ImageButton(this).apply {
-                setImageResource(R.drawable.ic_close)
-                background = null
-                contentDescription = getString(R.string.action_close)
-                setOnClickListener { onRemove() }
-            }
-        )
+        val row = listRow(this)
+        row.addView(listRowLabel(this, label))
+        row.addView(listRowCloseButton(this, onRemove))
         row.setOnClickListener { onTap() }
         return row
     }
@@ -302,7 +270,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         bind()
-        dialog = AlertDialog.Builder(this)
+        dialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.bookmarks_dialog_title)
             .setView(listView)
             .setNegativeButton(R.string.action_close, null)
@@ -330,7 +298,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         bind()
-        dialog = AlertDialog.Builder(this)
+        dialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.history_dialog_title)
             .setView(listView)
             .setPositiveButton(R.string.action_clear) { _, _ -> historyStore.clear(); dialog.dismiss() }
@@ -363,4 +331,39 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         tabManager.destroyAll()
     }
+}
+
+/** Builds a themed, rippling row container shared by the tabs/bookmarks/history dialogs. */
+private fun listRow(context: Context): LinearLayout = LinearLayout(context).apply {
+    orientation = LinearLayout.HORIZONTAL
+    gravity = Gravity.CENTER_VERTICAL
+    setPadding(24, 20, 8, 20)
+    val outValue = TypedValue()
+    context.theme.resolveAttribute(android.R.attr.selectableItemBackground, outValue, true)
+    setBackgroundResource(outValue.resourceId)
+}
+
+private fun listRowLabel(context: Context, label: String): TextView = TextView(context).apply {
+    text = label
+    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+    maxLines = 1
+    ellipsize = TextUtils.TruncateAt.END
+    setTextAppearance(com.google.android.material.R.style.TextAppearance_Material3_BodyLarge)
+    setTextColor(resolveThemeColor(context, com.google.android.material.R.attr.colorOnSurface))
+}
+
+private fun listRowCloseButton(context: Context, onRemove: () -> Unit): ImageButton = ImageButton(context).apply {
+    setImageResource(R.drawable.ic_close)
+    background = null
+    imageTintList = android.content.res.ColorStateList.valueOf(
+        resolveThemeColor(context, com.google.android.material.R.attr.colorOnSurfaceVariant)
+    )
+    contentDescription = context.getString(R.string.action_close)
+    setOnClickListener { onRemove() }
+}
+
+private fun resolveThemeColor(context: Context, attr: Int): Int {
+    val value = TypedValue()
+    context.theme.resolveAttribute(attr, value, true)
+    return value.data
 }

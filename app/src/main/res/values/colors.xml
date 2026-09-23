@@ -1,9 +1,48 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <color name="chrome_background">#FFF2F2F2</color>
-    <color name="page_background">#FFFFFFFF</color>
-    <color name="address_bar_background">#FFFFFFFF</color>
-    <color name="link_color">#FF1A0DAB</color>
-    <color name="text_color">#FF202020</color>
-    <color name="address_bar_stroke">#FFDADADA</color>
+    <!-- Material 3 Expressive color roles - light scheme. Seeded from the brand blue
+         (#3B7DE0), with a warm amber tertiary for expressive contrast. -->
+    <color name="md_primary">#FF2F5FA8</color>
+    <color name="md_on_primary">#FFFFFFFF</color>
+    <color name="md_primary_container">#FFD6E3FF</color>
+    <color name="md_on_primary_container">#FF001B3F</color>
+    <color name="md_primary_inverse">#FFAAC7FF</color>
+
+    <color name="md_secondary">#FF55606F</color>
+    <color name="md_on_secondary">#FFFFFFFF</color>
+    <color name="md_secondary_container">#FFD9E3F8</color>
+    <color name="md_on_secondary_container">#FF121C29</color>
+
+    <color name="md_tertiary">#FF8A5300</color>
+    <color name="md_on_tertiary">#FFFFFFFF</color>
+    <color name="md_tertiary_container">#FFFFDDB3</color>
+    <color name="md_on_tertiary_container">#FF2B1700</color>
+
+    <color name="md_error">#FFBA1A1A</color>
+    <color name="md_on_error">#FFFFFFFF</color>
+    <color name="md_error_container">#FFFFDAD6</color>
+    <color name="md_on_error_container">#FF410002</color>
+
+    <color name="md_background">#FFF9F9FF</color>
+    <color name="md_on_background">#FF1A1B20</color>
+
+    <color name="md_surface">#FFF9F9FF</color>
+    <color name="md_on_surface">#FF1A1B20</color>
+    <color name="md_surface_variant">#FFE0E2EC</color>
+    <color name="md_on_surface_variant">#FF43474E</color>
+    <color name="md_surface_inverse">#FF2F3036</color>
+    <color name="md_on_surface_inverse">#FFF1F0F7</color>
+
+    <color name="md_surface_container_lowest">#FFFFFFFF</color>
+    <color name="md_surface_container_low">#FFF3F3FA</color>
+    <color name="md_surface_container">#FFEDEDF4</color>
+    <color name="md_surface_container_high">#FFE7E8EE</color>
+    <color name="md_surface_container_highest">#FFE2E2E9</color>
+
+    <color name="md_outline">#FF73777F</color>
+    <color name="md_outline_variant">#FFC3C7CF</color>
+    <color name="md_scrim">#FF000000</color>
+
+    <!-- Link color for rendered page text; not part of the Material role set. -->
+    <color name="link_color">#FF2F5FA8</color>
 </resources>
