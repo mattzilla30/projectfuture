@@ -80,7 +80,8 @@ private fun makeMath(): JsObject {
     return obj
 }
 
-private fun jsonStringify(v: JsValue): String = when (v) {
+/** Public so Tab.kt's Web Worker bridge can reuse it for a structured-clone approximation - see installWorker's doc. */
+fun jsonStringify(v: JsValue): String = when (v) {
     JsUndefined -> "null" // JSON has no undefined; simplified to null everywhere rather than omitting keys
     JsNull -> "null"
     is JsBoolean -> v.value.toString()

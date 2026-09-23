@@ -461,4 +461,20 @@ class InterpreterTest {
             """.trimIndent()
         )
     }
+
+    /** The structured-clone approximation Tab.kt's Web Worker bridge relies on to safely pass messages across threads. */
+    @Test fun jsonStringifyParseRoundTripProducesAnIndependentCopy() {
+        val interpreter = Interpreter()
+        interpreter.globalEnv.declare("original", parseJsonToJsValue("""{"a":1,"b":[2,3],"c":"text"}"""))
+        val cloned = parseJsonToJsValue(jsonStringify(interpreter.globalEnv.get("original")))
+        val original = interpreter.globalEnv.get("original") as JsObject
+        val clonedObj = cloned as JsObject
+
+        assertEquals(1.0, (clonedObj.get("a") as JsNumber).value, 0.0)
+        assertEquals("text", (clonedObj.get("c") as JsString).value)
+
+        // Mutating the clone must not affect the original - proof they don't share any underlying storage.
+        clonedObj.set("a", JsNumber(999.0))
+        assertEquals(1.0, (original.get("a") as JsNumber).value, 0.0)
+    }
 }

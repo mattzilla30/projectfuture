@@ -33,6 +33,7 @@ import com.projectfuture.browser.js.Lexer
 import com.projectfuture.browser.js.NativeFunction
 import com.projectfuture.browser.js.Parser
 import com.projectfuture.browser.js.jsError
+import com.projectfuture.browser.js.jsonStringify
 import com.projectfuture.browser.js.parseJsonToJsValue
 import com.projectfuture.browser.js.toJsString
 import com.projectfuture.browser.js.toNumber
@@ -837,6 +838,87 @@ class Tab(
 
         installWebSocket(interpreter, pageRoot, baseUrl, ::afterAsyncWork)
         installIndexedDb(interpreter, pageRoot)
+        installWorker(interpreter, pageRoot, baseUrl)
+    }
+
+    /**
+     * `new Worker(url)`: a genuinely separate JS execution context on its
+     * own thread with its own fresh `Interpreter()` (no DOM bridge - real
+     * Web Workers don't get DOM access either), communicating with the
+     * main thread only via `postMessage`/`onmessage`. Message *values* are
+     * round-tripped through `JSON.stringify`/`parse` before crossing
+     * threads (see [jsonStringify]) - a deliberate, real safety measure,
+     * not just a spec nicety: this interpreter's JsObject/JsArray are
+     * plain, unsynchronized mutable Kotlin collections, so hand one
+     * across threads without cloning and a concurrent mutation from
+     * either side is a genuine data race. Functions can't be cloned this
+     * way and become `null`, matching a real structured-clone
+     * DataCloneError's spirit if not its exact behavior. No
+     * `importScripts`, no nested Workers, no `SharedWorker`.
+     */
+    private fun installWorker(interpreter: Interpreter, pageRoot: ElementNode, baseUrl: Url) {
+        fun cloneForThread(value: JsValue): JsValue = if (value is JsObject) {
+            try { parseJsonToJsValue(jsonStringify(value)) } catch (_: Exception) { JsUndefined }
+        } else {
+            value // primitives are immutable - safe to share across threads as-is
+        }
+
+        val ctor = NativeFunction("Worker", 1) { interp, thisArg, args ->
+            val obj = thisArg as? JsObject ?: JsObject()
+            val scriptUrlString = toJsString(args.getOrElse(0) { JsUndefined })
+            val scriptUrl = try { baseUrl.resolve(scriptUrlString) } catch (e: Exception) { throw jsError("Invalid Worker script URL: $scriptUrlString") }
+
+            class ToWorkerMessage(val value: JsValue)
+            val terminateSentinel = Any()
+            val inbox = java.util.concurrent.LinkedBlockingQueue<Any>()
+
+            obj.set("postMessage", NativeFunction("postMessage", 1) { _, _, pmArgs ->
+                inbox.put(ToWorkerMessage(cloneForThread(pmArgs.getOrElse(0) { JsUndefined })))
+                JsUndefined
+            })
+            obj.set("terminate", NativeFunction("terminate", 0) { _, _, _ -> inbox.put(terminateSentinel); JsUndefined })
+
+            Thread {
+                try {
+                    val code = scriptUrl.fetch().body
+                    val workerInterpreter = Interpreter()
+                    val workerEnv = workerInterpreter.globalEnv
+                    workerEnv.declare("postMessage", NativeFunction("postMessage", 1) { _, _, args ->
+                        val cloned = cloneForThread(args.getOrElse(0) { JsUndefined })
+                        mainHandler.post {
+                            if (currentDoc === pageRoot) {
+                                val event = JsObject()
+                                event.set("data", cloned)
+                                (obj.get("onmessage") as? JsFunction)?.call(interp, obj, listOf(event))
+                            }
+                        }
+                        JsUndefined
+                    })
+                    workerInterpreter.run(Parser(Lexer(code).tokenize()).parseProgram())
+                    while (true) {
+                        when (val msg = inbox.take()) {
+                            is ToWorkerMessage -> {
+                                val event = JsObject()
+                                event.set("data", msg.value)
+                                try {
+                                    (workerEnv.get("onmessage") as? JsFunction)?.call(workerInterpreter, JsUndefined, listOf(event))
+                                } catch (_: Exception) {
+                                    // A worker with no onmessage handler, or one that throws, shouldn't kill the worker thread.
+                                }
+                            }
+                            else -> return@Thread // Terminate
+                        }
+                    }
+                } catch (e: Exception) {
+                    mainHandler.post {
+                        if (currentDoc === pageRoot) (obj.get("onerror") as? JsFunction)?.call(interp, obj, listOf(makeError(e.message ?: "Worker error")))
+                    }
+                }
+            }.apply { isDaemon = true }.start()
+
+            obj
+        }
+        interpreter.globalEnv.declare("Worker", ctor)
     }
 
     /**
