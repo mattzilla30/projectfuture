@@ -13,4 +13,16 @@
     <string name="untitled_tab">New tab</string>
     <string name="loading">Loading…</string>
     <string name="error_load_failed">Couldn\'t load %1$s: %2$s</string>
+    <string name="action_menu">More options</string>
+    <string name="menu_add_bookmark">Bookmark this page</string>
+    <string name="menu_remove_bookmark">Remove bookmark</string>
+    <string name="menu_bookmarks">Bookmarks</string>
+    <string name="menu_history">History</string>
+    <string name="bookmarks_dialog_title">Bookmarks</string>
+    <string name="history_dialog_title">History</string>
+    <string name="action_clear">Clear all</string>
+    <string name="bookmarks_empty">No bookmarks yet</string>
+    <string name="history_empty">No history yet</string>
+    <string name="bookmark_added">Bookmarked</string>
+    <string name="bookmark_removed">Bookmark removed</string>
 </resources>

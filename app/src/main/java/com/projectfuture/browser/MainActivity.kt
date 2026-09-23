@@ -13,11 +13,14 @@ import android.widget.BaseAdapter
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ListView
+import android.widget.PopupMenu
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import com.projectfuture.browser.browser.BookmarkStore
+import com.projectfuture.browser.browser.HistoryStore
 import com.projectfuture.browser.browser.Tab
 import com.projectfuture.browser.browser.TabManager
 import com.projectfuture.browser.browser.TabState
@@ -29,6 +32,8 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
     private lateinit var tabManager: TabManager
+    private lateinit var bookmarkStore: BookmarkStore
+    private lateinit var historyStore: HistoryStore
     private val tabTitles = HashMap<Tab, String>()
     private var lastViewportWidth = 0f
     private var lastViewportHeight = 0f
@@ -39,6 +44,8 @@ class MainActivity : AppCompatActivity() {
         setContentView(binding.root)
 
         tabManager = TabManager(this, ::onTabStateChanged)
+        bookmarkStore = BookmarkStore(this)
+        historyStore = HistoryStore(this)
 
         binding.browserView.onSizeAvailable = { width, height ->
             lastViewportWidth = width
@@ -52,6 +59,7 @@ class MainActivity : AppCompatActivity() {
         binding.buttonForward.setOnClickListener { tabManager.activeTab?.goForward() }
         binding.buttonReload.setOnClickListener { tabManager.activeTab?.reload() }
         binding.buttonTabs.setOnClickListener { showTabSwitcher() }
+        binding.buttonMenu.setOnClickListener { showOverflowMenu() }
 
         binding.editAddress.setOnEditorActionListener { _, actionId, event ->
             val committed = actionId == EditorInfo.IME_ACTION_GO ||
@@ -92,7 +100,11 @@ class MainActivity : AppCompatActivity() {
         // so the switcher list stays accurate for background tabs too.
         when (state) {
             is TabState.Loading -> tabTitles[tab] = getString(R.string.loading)
-            is TabState.Loaded -> tabTitles[tab] = state.title ?: state.url.toString()
+            is TabState.Loaded -> {
+                val label = state.title ?: state.url.toString()
+                tabTitles[tab] = label
+                historyStore.record(state.url.toString(), label)
+            }
             else -> {}
         }
 
@@ -202,6 +214,120 @@ class MainActivity : AppCompatActivity() {
             .setTitle(R.string.tabs_dialog_title)
             .setView(listView)
             .setPositiveButton(R.string.action_new_tab) { d, _ -> openNewTab(); d.dismiss() }
+            .setNegativeButton(R.string.action_close, null)
+            .create()
+        dialog.show()
+    }
+
+    private fun showOverflowMenu() {
+        val currentUrl = tabManager.activeTab?.currentUrl?.toString()
+        val popup = PopupMenu(this, binding.buttonMenu)
+        val bookmarkItemTitle = if (currentUrl != null && bookmarkStore.isBookmarked(currentUrl)) {
+            R.string.menu_remove_bookmark
+        } else {
+            R.string.menu_add_bookmark
+        }
+        popup.menu.add(0, 1, 0, bookmarkItemTitle).isEnabled = currentUrl != null
+        popup.menu.add(0, 2, 1, R.string.menu_bookmarks)
+        popup.menu.add(0, 3, 2, R.string.menu_history)
+        popup.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                1 -> {
+                    val url = currentUrl ?: return@setOnMenuItemClickListener true
+                    val label = tabManager.activeTab?.let { tabTitles[it] } ?: url
+                    val nowBookmarked = bookmarkStore.toggle(url, label)
+                    val message = if (nowBookmarked) R.string.bookmark_added else R.string.bookmark_removed
+                    Toast.makeText(this, message, Toast.LENGTH_SHORT).show()
+                    true
+                }
+                2 -> { showBookmarksDialog(); true }
+                3 -> { showHistoryDialog(); true }
+                else -> false
+            }
+        }
+        popup.show()
+    }
+
+    /** Shared row builder for the bookmarks/history dialogs: a label, tap to navigate, X to remove. */
+    private fun buildListRow(label: String, onTap: () -> Unit, onRemove: () -> Unit): View {
+        val row = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(32, 24, 16, 24)
+        }
+        row.addView(
+            TextView(this).apply {
+                text = label
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                textSize = 16f
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+            }
+        )
+        row.addView(
+            ImageButton(this).apply {
+                setImageResource(R.drawable.ic_close)
+                background = null
+                contentDescription = getString(R.string.action_close)
+                setOnClickListener { onRemove() }
+            }
+        )
+        row.setOnClickListener { onTap() }
+        return row
+    }
+
+    private fun showBookmarksDialog() {
+        lateinit var dialog: AlertDialog
+        val listView = ListView(this)
+        fun bind() {
+            val bookmarks = bookmarkStore.all()
+            listView.adapter = object : BaseAdapter() {
+                override fun getCount() = bookmarks.size
+                override fun getItem(position: Int) = bookmarks[position]
+                override fun getItemId(position: Int) = position.toLong()
+                override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                    val bookmark = bookmarks[position]
+                    return buildListRow(
+                        label = bookmark.title,
+                        onTap = { tabManager.activeTab?.navigate(bookmark.url); dialog.dismiss() },
+                        onRemove = { bookmarkStore.remove(bookmark.url); bind() }
+                    )
+                }
+            }
+        }
+        bind()
+        dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.bookmarks_dialog_title)
+            .setView(listView)
+            .setNegativeButton(R.string.action_close, null)
+            .create()
+        dialog.show()
+    }
+
+    private fun showHistoryDialog() {
+        lateinit var dialog: AlertDialog
+        val listView = ListView(this)
+        fun bind() {
+            val entries = historyStore.load()
+            listView.adapter = object : BaseAdapter() {
+                override fun getCount() = entries.size
+                override fun getItem(position: Int) = entries[position]
+                override fun getItemId(position: Int) = position.toLong()
+                override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                    val entry = entries[position]
+                    return buildListRow(
+                        label = entry.title,
+                        onTap = { tabManager.activeTab?.navigate(entry.url); dialog.dismiss() },
+                        onRemove = { historyStore.remove(entry.url); bind() }
+                    )
+                }
+            }
+        }
+        bind()
+        dialog = AlertDialog.Builder(this)
+            .setTitle(R.string.history_dialog_title)
+            .setView(listView)
+            .setPositiveButton(R.string.action_clear) { _, _ -> historyStore.clear(); dialog.dismiss() }
             .setNegativeButton(R.string.action_close, null)
             .create()
         dialog.show()
