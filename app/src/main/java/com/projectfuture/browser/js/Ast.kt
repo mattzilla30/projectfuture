@@ -24,6 +24,7 @@ data class New(val callee: Expr, val args: List<Expr>) : Expr()
 data class Member(val obj: Expr, val property: Expr, val computed: Boolean) : Expr()
 data class FunctionExpr(val name: String?, val params: List<Param>, val body: List<Stmt>, val isArrow: Boolean) : Expr()
 data class SpreadElement(val argument: Expr) : Expr() // `...expr` inside an array/object literal or a call's argument list
+object SuperExpr : Expr() // only meaningful as a Call callee (`super(...)`); see Interpreter's ClassConstructor
 
 /**
  * A binding target: a plain name, or an array/object destructuring shape.
@@ -61,3 +62,7 @@ data class TryStmt(val block: Block, val catchParam: String?, val catchBlock: Bl
 data class ThrowStmt(val argument: Expr) : Stmt()
 data class SwitchCase(val test: Expr?, val body: List<Stmt>) // test == null is the `default:` clause
 data class SwitchStmt(val discriminant: Expr, val cases: List<SwitchCase>) : Stmt()
+
+/** `constructor`/`static` markers are ordinary method names/flags, not separate AST node kinds. */
+data class MethodDef(val name: String, val params: List<Param>, val body: List<Stmt>, val isStatic: Boolean)
+data class ClassDecl(val name: String, val superClass: Expr?, val methods: List<MethodDef>) : Stmt()

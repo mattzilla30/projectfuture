@@ -127,7 +127,18 @@ class Interpreter {
             is TryStmt -> execTry(stmt, env)
             is ThrowStmt -> throw JsException(evalExpr(stmt.argument, env))
             is SwitchStmt -> execSwitch(stmt, env)
+            is ClassDecl -> execClassDecl(stmt, env)
         }
+    }
+
+    private fun execClassDecl(stmt: ClassDecl, env: Environment) {
+        val superFn = stmt.superClass?.let { evalExpr(it, env) as? JsFunction }
+        val ctor = stmt.methods.firstOrNull { it.name == "constructor" && !it.isStatic }
+        val instanceMethods = stmt.methods.filter { !it.isStatic && it.name != "constructor" }
+        val staticMethods = stmt.methods.filter { it.isStatic }
+        val classFn = ClassConstructor(stmt.name, superFn, ctor?.params, ctor?.body, instanceMethods, env)
+        for (m in staticMethods) classFn.set(m.name, Closure(m.name, m.params, m.body, env, isArrow = false))
+        env.declare(stmt.name, classFn)
     }
 
     /**
@@ -223,6 +234,7 @@ class Interpreter {
             obj
         }
         is SpreadElement -> evalExpr(expr.argument, env) // only reached if spread appears somewhere evalArgs doesn't pre-expand it
+        SuperExpr -> if (env.has("__superclassctor__")) env.get("__superclassctor__") else JsUndefined
         is TemplateLit -> {
             val sb = StringBuilder()
             for (i in expr.quasis.indices) {
@@ -285,6 +297,11 @@ class Interpreter {
     }
 
     private fun evalCall(expr: Call, env: Environment): JsValue {
+        if (expr.callee is SuperExpr) {
+            val superFn = env.get("__superclassctor__") as? JsFunction
+                ?: throw jsError("'super' keyword is only valid inside a derived class's constructor")
+            return superFn.call(this, env.get("this"), evalArgs(expr.args, env))
+        }
         if (expr.callee is Member) {
             val obj = evalExpr(expr.callee.obj, env)
             val key = memberKey(expr.callee, env)
@@ -322,7 +339,7 @@ class Interpreter {
         }
     }
 
-    private fun bindParams(params: List<Param>, args: List<JsValue>, env: Environment) {
+    fun bindParams(params: List<Param>, args: List<JsValue>, env: Environment) {
         var argIdx = 0
         for (param in params) {
             if (param.rest) {
@@ -437,7 +454,7 @@ class Interpreter {
         ">" -> compareValues(l, r) { a, b -> a > b }
         "<=" -> compareValues(l, r) { a, b -> a <= b }
         ">=" -> compareValues(l, r) { a, b -> a >= b }
-        "instanceof" -> JsBoolean(false) // no prototype chain - see class doc
+        "instanceof" -> JsBoolean(r is JsFunction && l is JsObject && r in l.classChain) // real for `class` instances; always false against plain constructor functions (no prototype chain)
         "in" -> JsBoolean(r is JsObject && r.has(toJsString(l)))
         "&" -> JsNumber((toInt32(toNumber(l)) and toInt32(toNumber(r))).toDouble())
         "|" -> JsNumber((toInt32(toNumber(l)) or toInt32(toNumber(r))).toDouble())
@@ -473,6 +490,67 @@ class Interpreter {
             "??" -> if (left != JsUndefined && left != JsNull) left else evalExpr(expr.right, env)
             else -> JsUndefined
         }
+    }
+}
+
+/**
+ * The constructor function a `class` declaration produces (see
+ * Interpreter.execClassDecl). `new`-ing it, or a subclass constructor
+ * calling `super(...)`, builds up shared instance state on one JsObject:
+ * when there's no explicit constructor, the superclass is called
+ * automatically with the same arguments (matching real JS's implicit
+ * default derived-class constructor); when there IS one, it must call
+ * `super(...)` itself if it wants the superclass's instance methods/state -
+ * this class does not auto-call it in that case, matching the real spec
+ * rule that a derived class's own constructor is responsible for that.
+ * Either way, this class's own instance methods are (re-)bound onto the
+ * instance afterward, so they correctly override same-named inherited
+ * ones. Static methods live as ordinary properties on this object itself
+ * (it's a JsObject), so `Foo.method()` needs no special handling.
+ *
+ * Known gap: `super.method()` (an instance-method super-call, as opposed
+ * to `super(...)`) isn't supported - `super` used as a bare expression
+ * resolves to the superclass *constructor function*, so `super.method()`
+ * would look up `method` as a static property of it, not as an inherited
+ * instance method. `super(...)` itself is fully supported.
+ */
+class ClassConstructor(
+    name: String,
+    val superClassFn: JsFunction?,
+    val ctorParams: List<Param>?,
+    val ctorBody: List<Stmt>?,
+    val instanceMethods: List<MethodDef>,
+    val declEnv: Environment
+) : JsFunction(name) {
+    override fun call(interpreter: Interpreter, thisArg: JsValue, args: List<JsValue>): JsValue {
+        val instance = thisArg as? JsObject ?: JsObject()
+        if (this !in instance.classChain) instance.classChain = instance.classChain + this
+        fun bindOwnMethods() {
+            for (m in instanceMethods) instance.set(m.name, Closure(m.name, m.params, m.body, declEnv, isArrow = false))
+        }
+        if (ctorBody == null) {
+            // No own constructor: implicit default forwards args to super (if any), then this
+            // class's methods are bound to override whatever the superclass just bound.
+            superClassFn?.call(interpreter, instance, args)
+            bindOwnMethods()
+        } else {
+            // Bind first so `this.ownMethod()` works during construction, then re-bind after the
+            // body runs - a `super(...)` call partway through would otherwise re-bind the
+            // superclass's same-named methods afterward and silently un-override this class's own.
+            bindOwnMethods()
+            val callEnv = Environment(declEnv)
+            callEnv.declare("this", instance)
+            superClassFn?.let { callEnv.declare("__superclassctor__", it) }
+            interpreter.bindParams(ctorParams ?: emptyList(), args, callEnv)
+            try {
+                interpreter.execBlock(ctorBody, callEnv)
+            } catch (r: ReturnSignal) {
+                // a constructor `return;` (no value) is legal and just ends early; a `return <object>` would
+                // override the constructed instance in real JS, a corner case not implemented here
+            }
+            bindOwnMethods()
+        }
+        return instance
     }
 }
 

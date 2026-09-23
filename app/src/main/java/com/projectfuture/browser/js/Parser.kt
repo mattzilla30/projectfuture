@@ -66,6 +66,7 @@ class Parser(private val tokens: List<Token>) {
         if (checkKeyword("try")) return parseTry()
         if (checkKeyword("throw")) return parseThrow()
         if (checkIdentText("switch")) return parseSwitch()
+        if (checkIdentText("class")) return parseClassDecl()
         if (matchPunct(";")) return Block(emptyList()) // empty statement
         val expr = parseExpression()
         consumeSemicolon()
@@ -311,6 +312,31 @@ class Parser(private val tokens: List<Token>) {
         }
         expectPunct("}")
         return SwitchStmt(disc, cases)
+    }
+
+    /**
+     * `class`/`extends`/`static`/`super` are all recognized by identifier
+     * text (see [checkIdentText]) rather than added to the lexer's keyword
+     * set, same reasoning as `switch`/`case`/`default`. Only class
+     * *declarations* are supported, not class expressions
+     * (`const Foo = class {...}`) - a real but narrow gap.
+     */
+    private fun parseClassDecl(): Stmt {
+        advance() // 'class'
+        val name = advance().text
+        val superClass: Expr? = if (matchIdentText("extends")) parseCallMember() else null
+        expectPunct("{")
+        val methods = ArrayList<MethodDef>()
+        while (!checkPunct("}")) {
+            if (matchPunct(";")) continue
+            val isStatic = matchIdentText("static")
+            val methodName = advance().text
+            val params = parseParamList()
+            val body = parseBlockStatements()
+            methods.add(MethodDef(methodName, params, body, isStatic))
+        }
+        expectPunct("}")
+        return ClassDecl(name, superClass, methods)
     }
 
     // ---- expressions (precedence climbing, low to high) ----
@@ -568,7 +594,11 @@ class Parser(private val tokens: List<Token>) {
                 return TemplateLit(tok.templateParts, exprs)
             }
             TokenType.REGEX -> { advance(); return RegexLit(tok.text, tok.regexFlags) }
-            TokenType.IDENT -> { advance(); return Identifier(tok.text) }
+            TokenType.IDENT -> {
+                if (tok.text == "super") { advance(); return SuperExpr }
+                advance()
+                return Identifier(tok.text)
+            }
             TokenType.KEYWORD -> {
                 when (tok.text) {
                     "true" -> { advance(); return BoolLit(true) }

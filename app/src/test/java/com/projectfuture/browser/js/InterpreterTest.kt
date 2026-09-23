@@ -392,4 +392,55 @@ class InterpreterTest {
         )
         assertNum(3.0, "var f = ({a, b}) => a + b; var result = f({a: 1, b: 2});")
     }
+
+    @Test fun classBasicsAndInstanceof() {
+        assertNum(4.0, """
+            class Point {
+                constructor(x, y) { this.x = x; this.y = y; }
+                sum() { return this.x + this.y; }
+            }
+            var p = new Point(1, 3);
+            var result = p.sum();
+            """.trimIndent()
+        )
+        assertTrue(bool("""
+            class Animal {}
+            var a = new Animal();
+            var result = a instanceof Animal;
+            """.trimIndent()
+        ))
+    }
+
+    @Test fun classInheritanceWithSuperAndOverride() {
+        assertNum(30.0, """
+            class Base {
+                constructor(x) { this.x = x; }
+                greetValue() { return this.x; }
+            }
+            class Derived extends Base {
+                constructor(x, y) { super(x); this.y = y; }
+                greetValue() { return this.x + this.y; } // overrides Base's method
+            }
+            var d = new Derived(10, 20);
+            var result = d.greetValue();
+            """.trimIndent()
+        )
+        assertTrue(bool("""
+            class Base {}
+            class Derived extends Base {}
+            var d = new Derived();
+            var result = (d instanceof Derived) && (d instanceof Base);
+            """.trimIndent()
+        ))
+    }
+
+    @Test fun classStaticMethod() {
+        assertNum(9.0, """
+            class MathHelper {
+                static square(n) { return n * n; }
+            }
+            var result = MathHelper.square(3);
+            """.trimIndent()
+        )
+    }
 }

@@ -30,6 +30,9 @@ open class JsObject(val properties: MutableMap<String, JsValue> = LinkedHashMap(
     }
     open fun has(name: String): Boolean = properties.containsKey(name)
     open fun ownKeys(): List<String> = properties.keys.toList()
+
+    /** Kotlin-only bookkeeping for `instanceof` on `class`-declared instances - see ClassConstructor in Interpreter.kt. Empty for ordinary objects. */
+    var classChain: List<JsFunction> = emptyList()
 }
 
 class JsArray(val elements: MutableList<JsValue> = ArrayList()) : JsObject() {
