@@ -492,6 +492,21 @@ class InterpreterTest {
         assertTrue((result("var result = new Date('not-a-date').getTime();") as JsNumber).value.isNaN())
     }
 
+    @Test fun arraySomeEveryReduceRightFlatMap() {
+        assertTrue(bool("var result = [1,2,3].some(function(x) { return x > 2; });"))
+        assertTrue(!bool("var result = [1,2,3].every(function(x) { return x > 2; });"))
+        assertTrue(bool("var result = [1,2,3].every(function(x) { return x > 0; });"))
+        assertEquals("cba", str("var result = ['a','b','c'].reduceRight(function(acc, x) { return acc + x; }, '');"))
+        assertNum(4.0, "var result = [[1,2],[3,4]].flatMap(function(x) { return x; }).length;")
+    }
+
+    @Test fun arrayFromAndOf() {
+        assertNum(3.0, "var result = Array.of(1,2,3).length;")
+        assertNum(3.0, "var result = Array.from('abc').length;")
+        assertNum(12.0, "var result = Array.from([1,2,3], function(x) { return x * 2; }).reduce(function(a,b){return a+b;});") // [2,4,6] summed
+        assertNum(2.0, "var result = Array.from({0: 'a', 1: 'b', length: 2}).length;")
+    }
+
     /** The structured-clone approximation Tab.kt's Web Worker bridge relies on to safely pass messages across threads. */
     @Test fun jsonStringifyParseRoundTripProducesAnIndependentCopy() {
         val interpreter = Interpreter()

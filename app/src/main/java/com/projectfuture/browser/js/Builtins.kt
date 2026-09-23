@@ -137,6 +137,23 @@ private fun makeArrayCtor(): JsFunction = object : JsFunction("Array") {
 
     override fun get(name: String): JsValue = when (name) {
         "isArray" -> NativeFunction("isArray", 1) { _, _, a -> JsBoolean(arg(a, 0) is JsArray) }
+        "of" -> NativeFunction("of", 0) { _, _, a -> JsArray(a.toMutableList()) }
+        "from" -> NativeFunction("from", 2) { interp, _, a ->
+            val source = arg(a, 0)
+            val mapFn = a.getOrNull(1) as? JsFunction
+            val items: List<JsValue> = when (source) {
+                is JsArray -> source.elements.toList()
+                is JsString -> source.value.map { JsString(it.toString()) }
+                is JsMap -> source.entryPairs()
+                is JsSet -> source.valuesList()
+                is JsObject -> {
+                    val len = toNumber(source.get("length")).toInt().coerceAtLeast(0)
+                    (0 until len).map { source.get(it.toString()) }
+                }
+                else -> emptyList()
+            }
+            JsArray(items.mapIndexed { idx, v -> mapFn?.call(interp, JsUndefined, listOf(v, JsNumber(idx.toDouble()))) ?: v }.toMutableList())
+        }
         else -> super.get(name)
     }
 }
@@ -270,6 +287,43 @@ private fun arrayMethod(interpreter: Interpreter, arr: JsArray, key: String, arg
         arr
     }
     "flat" -> JsArray(arr.elements.flatMap { if (it is JsArray) it.elements else listOf(it) }.toMutableList())
+    "flatMap" -> {
+        val fn = args.getOrNull(0) as? JsFunction
+        val mapped = arr.elements.toList().mapIndexed { idx, v -> fn?.call(interpreter, JsUndefined, listOf(v, JsNumber(idx.toDouble()), arr)) ?: JsUndefined }
+        JsArray(mapped.flatMap { if (it is JsArray) it.elements else listOf(it) }.toMutableList())
+    }
+    "some" -> {
+        val fn = args.getOrNull(0) as? JsFunction
+        JsBoolean(
+            arr.elements.toList().withIndex().any { (idx, v) ->
+                fn != null && isTruthy(fn.call(interpreter, JsUndefined, listOf(v, JsNumber(idx.toDouble()), arr)))
+            }
+        )
+    }
+    "every" -> {
+        val fn = args.getOrNull(0) as? JsFunction
+        JsBoolean(
+            arr.elements.toList().withIndex().all { (idx, v) ->
+                fn != null && isTruthy(fn.call(interpreter, JsUndefined, listOf(v, JsNumber(idx.toDouble()), arr)))
+            }
+        )
+    }
+    "reduceRight" -> {
+        val fn = args.getOrNull(0) as? JsFunction
+        var acc: JsValue
+        var startIdx: Int
+        if (args.size > 1) {
+            acc = args[1]
+            startIdx = arr.elements.size - 1
+        } else {
+            acc = arr.elements.lastOrNull() ?: JsUndefined
+            startIdx = arr.elements.size - 2
+        }
+        for (idx in startIdx downTo 0) {
+            acc = fn?.call(interpreter, JsUndefined, listOf(acc, arr.elements[idx], JsNumber(idx.toDouble()), arr)) ?: acc
+        }
+        acc
+    }
     else -> null
 }
 
