@@ -107,6 +107,40 @@ class CookieJarTest {
         assertTrue(!HstsStore.isEnforced("example.com", now))
     }
 
+    @Test fun cspAllowsEverythingWhenNoPolicyPresent() {
+        val csp = ContentSecurityPolicy.parse(null)
+        assertTrue(csp.allowsInlineScript())
+        assertTrue(csp.allowsScriptSrc(Url.parse("https://example.com/"), Url.parse("https://cdn.example.com/x.js")))
+    }
+
+    @Test fun cspSelfAllowsSameOriginOnly() {
+        val csp = ContentSecurityPolicy.parse("default-src 'self'")
+        val page = Url.parse("https://example.com/")
+        assertTrue(csp.allowsScriptSrc(page, Url.parse("https://example.com/a.js")))
+        assertTrue(!csp.allowsScriptSrc(page, Url.parse("https://other.com/a.js")))
+        assertTrue(!csp.allowsInlineScript()) // no 'unsafe-inline'
+    }
+
+    @Test fun cspAllowsExplicitHostAndWildcardSubdomain() {
+        val csp = ContentSecurityPolicy.parse("script-src https://cdn.example.com *.trusted.com")
+        val page = Url.parse("https://example.com/")
+        assertTrue(csp.allowsScriptSrc(page, Url.parse("https://cdn.example.com/lib.js")))
+        assertTrue(csp.allowsScriptSrc(page, Url.parse("https://sub.trusted.com/lib.js")))
+        assertTrue(!csp.allowsScriptSrc(page, Url.parse("https://untrusted.com/lib.js")))
+    }
+
+    @Test fun cspUnsafeInlineAllowsInlineScriptsAndStyles() {
+        val csp = ContentSecurityPolicy.parse("script-src 'unsafe-inline'; style-src 'unsafe-inline'")
+        assertTrue(csp.allowsInlineScript())
+        assertTrue(csp.allowsInlineStyle())
+    }
+
+    @Test fun cspDirectiveFallsBackToDefaultSrc() {
+        val csp = ContentSecurityPolicy.parse("default-src 'none'")
+        val page = Url.parse("https://example.com/")
+        assertTrue(!csp.allowsImgSrc(page, Url.parse("https://example.com/x.png"))) // no img-src, falls back to default-src 'none'
+    }
+
     @Test fun httpCacheServesFreshEntryAndDropsExpiredOne() {
         HttpCache.clear()
         val url = Url.parse("https://example.com/cached")

@@ -37,6 +37,7 @@ import com.projectfuture.browser.layout.customFonts
 import com.projectfuture.browser.layout.textScaleFactor
 import com.projectfuture.browser.net.HttpResponse
 import com.projectfuture.browser.net.Url
+import com.projectfuture.browser.net.ContentSecurityPolicy
 import com.projectfuture.browser.net.corsAllows
 import com.projectfuture.browser.net.isMixedContent
 import com.projectfuture.browser.net.isSameOrigin
@@ -379,14 +380,15 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         executor.execute {
             try {
                 val response = url.fetch(method, body, requestHeaders)
+                val csp = ContentSecurityPolicy.parse(response.headers["content-security-policy"])
                 val root = HtmlParser(response.body).parse()
                 // Scripts may mutate the DOM, so this runs before CSS/images/fonts are collected below.
-                val (interpreter, bridge) = runScripts(root, response.url)
-                val authorCss = collectAuthorCss(root, response.url, mediaViewportWidth)
+                val (interpreter, bridge) = runScripts(root, response.url, csp)
+                val authorCss = collectAuthorCss(root, response.url, mediaViewportWidth, csp)
                 computeStyles(root, authorCss.rules)
                 val title = extractTitle(root)
-                val images = collectAndDecodeImages(root, response.url) + collectAndRenderSvgs(root) + bridge.canvasBitmaps()
-                val fonts = loadFontFaces(authorCss.fontFaces, response.url)
+                val images = collectAndDecodeImages(root, response.url, csp) + collectAndRenderSvgs(root) + bridge.canvasBitmaps()
+                val fonts = loadFontFaces(authorCss.fontFaces, response.url, csp)
                 mainHandler.post {
                     currentUrl = response.url
                     currentDoc = root
@@ -440,7 +442,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
      * skipped, matching how the reference build already treats a failed
      * stylesheet fetch - no broken-image icon or alt-text fallback yet.
      */
-    private fun collectAndDecodeImages(root: ElementNode, baseUrl: Url): Map<ElementNode, Bitmap> {
+    private fun collectAndDecodeImages(root: ElementNode, baseUrl: Url, csp: ContentSecurityPolicy): Map<ElementNode, Bitmap> {
         val result = HashMap<ElementNode, Bitmap>()
         root.walkElements { el ->
             if (el.tag == "img") {
@@ -448,6 +450,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                 if (!src.isNullOrBlank()) {
                     val imgUrl = baseUrl.resolve(src)
                     if (isMixedContent(baseUrl, imgUrl)) return@walkElements
+                    if (!csp.allowsImgSrc(baseUrl, imgUrl)) return@walkElements
                     try {
                         val bytes = imgUrl.fetchBytes().body
                         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { result[el] = it }
@@ -485,11 +488,11 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
      * cover yet (no real event dispatch from taps, no setTimeout/fetch).
      */
     /** Returns the Interpreter/DomBridge pair so Tab can keep them alive for later click dispatch (see dispatchClick). */
-    private fun runScripts(root: ElementNode, baseUrl: Url): Pair<Interpreter, DomBridge> {
+    private fun runScripts(root: ElementNode, baseUrl: Url, csp: ContentSecurityPolicy): Pair<Interpreter, DomBridge> {
         val interpreter = Interpreter()
         val bridge = DomBridge(root)
         bridge.install(interpreter.globalEnv)
-        installBrowserRuntime(interpreter, root, baseUrl)
+        installBrowserRuntime(interpreter, root, baseUrl, csp)
 
         val scripts = ArrayList<ElementNode>()
         root.walkElements { if (it.tag == "script") scripts.add(it) }
@@ -498,10 +501,12 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             val src = scriptEl.attr("src")
             val code = if (!src.isNullOrBlank()) {
                 val scriptUrl = baseUrl.resolve(src)
-                if (isMixedContent(baseUrl, scriptUrl)) null
+                if (isMixedContent(baseUrl, scriptUrl) || !csp.allowsScriptSrc(baseUrl, scriptUrl)) null
                 else try { scriptUrl.fetch().body } catch (_: Exception) { null }
-            } else {
+            } else if (csp.allowsInlineScript()) {
                 scriptEl.children.filterIsInstance<TextNode>().joinToString("") { it.text }
+            } else {
+                null
             }
             if (code.isNullOrBlank()) continue
             try {
@@ -534,7 +539,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
      * floors its delay at 16ms (~60fps) as a throttle against a
      * pathological `setInterval(fn, 0)`.
      */
-    private fun installBrowserRuntime(interpreter: Interpreter, pageRoot: ElementNode, baseUrl: Url) {
+    private fun installBrowserRuntime(interpreter: Interpreter, pageRoot: ElementNode, baseUrl: Url, csp: ContentSecurityPolicy) {
         fun afterAsyncWork() {
             if (currentDoc !== pageRoot) return
             computeStyles(pageRoot, currentAuthorRules)
@@ -553,6 +558,8 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                 promise.reject(JsString("Invalid URL"))
             } else if (isMixedContent(baseUrl, requestUrl)) {
                 promise.reject(makeError("Mixed Content: the page at '$baseUrl' was loaded over HTTPS, but requested an insecure resource '$requestUrl'. This request has been blocked."))
+            } else if (!csp.allowsConnectSrc(baseUrl, requestUrl)) {
+                promise.reject(makeError("Refused to connect to '$requestUrl' because it violates the page's Content Security Policy."))
             } else {
                 val options = args.getOrNull(1) as? JsObject
                 val method = options?.get("method")?.let { if (it != JsUndefined) toJsString(it) else null } ?: "GET"
@@ -585,7 +592,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
             promise
         })
 
-        installXmlHttpRequest(interpreter, baseUrl, ::afterAsyncWork)
+        installXmlHttpRequest(interpreter, baseUrl, csp, ::afterAsyncWork)
 
         interpreter.globalEnv.declare("setTimeout", NativeFunction("setTimeout", 2) { _, _, args ->
             val fn = args.getOrNull(0) as? JsFunction
@@ -661,7 +668,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
      * the main thread, which Android's NetworkOnMainThreadException
      * forbids anyway).
      */
-    private fun installXmlHttpRequest(interpreter: Interpreter, baseUrl: Url, afterAsyncWork: () -> Unit) {
+    private fun installXmlHttpRequest(interpreter: Interpreter, baseUrl: Url, csp: ContentSecurityPolicy, afterAsyncWork: () -> Unit) {
         val ctor = NativeFunction("XMLHttpRequest", 0) { _, thisArg, _ ->
             val xhr = thisArg as? JsObject ?: JsObject()
             var method = "GET"
@@ -686,7 +693,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
                     (xhr.get("on$type") as? JsFunction)?.call(interp, xhr, emptyList())
                     (xhr.get("onreadystatechange") as? JsFunction)?.call(interp, xhr, emptyList())
                 }
-                if (url == null || isMixedContent(baseUrl, url)) {
+                if (url == null || isMixedContent(baseUrl, url) || !csp.allowsConnectSrc(baseUrl, url)) {
                     xhr.set("readyState", JsNumber(4.0))
                     fire("error")
                     afterAsyncWork()
@@ -725,7 +732,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
 
     private class AuthorCss(val rules: List<CssRule>, val fontFaces: List<Pair<FontFaceRule, Url>>)
 
-    private fun collectAuthorCss(root: ElementNode, baseUrl: Url, viewportWidth: Float): AuthorCss {
+    private fun collectAuthorCss(root: ElementNode, baseUrl: Url, viewportWidth: Float, csp: ContentSecurityPolicy): AuthorCss {
         val rules = ArrayList<CssRule>()
         val fontFaces = ArrayList<Pair<FontFaceRule, Url>>()
 
@@ -739,14 +746,16 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         root.walkElements { el ->
             when {
                 el.tag == "style" -> {
-                    val text = el.children.filterIsInstance<TextNode>().joinToString("") { it.text }
-                    harvest(CssParser(text, viewportWidth), baseUrl)
+                    if (csp.allowsInlineStyle()) {
+                        val text = el.children.filterIsInstance<TextNode>().joinToString("") { it.text }
+                        harvest(CssParser(text, viewportWidth), baseUrl)
+                    }
                 }
                 el.tag == "link" && el.attr("rel")?.lowercase()?.contains("stylesheet") == true -> {
                     val href = el.attr("href")
                     if (href != null) {
                         val styleSheetUrl = baseUrl.resolve(href)
-                        if (!isMixedContent(baseUrl, styleSheetUrl)) {
+                        if (!isMixedContent(baseUrl, styleSheetUrl) && csp.allowsStyleSrc(baseUrl, styleSheetUrl)) {
                             try {
                                 val response = styleSheetUrl.fetch()
                                 // url()s inside an external stylesheet resolve against ITS location, not the page's.
@@ -771,13 +780,13 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
      * (e.g. bold/italic variants declared separately) are ignored, and
      * FontCache synthesizes bold/italic from whichever one loaded.
      */
-    private fun loadFontFaces(entries: List<Pair<FontFaceRule, Url>>, pageUrl: Url): Map<String, Typeface> {
+    private fun loadFontFaces(entries: List<Pair<FontFaceRule, Url>>, pageUrl: Url, csp: ContentSecurityPolicy): Map<String, Typeface> {
         val result = HashMap<String, Typeface>()
         for ((rule, styleSheetBase) in entries) {
             val key = rule.family.lowercase()
             if (result.containsKey(key)) continue
             val fontUrl = styleSheetBase.resolve(rule.srcUrl)
-            if (isMixedContent(pageUrl, fontUrl)) continue
+            if (isMixedContent(pageUrl, fontUrl) || !csp.allowsFontSrc(pageUrl, fontUrl)) continue
             try {
                 val bytes = fontUrl.fetchBytes().body
                 val sfnt = FontDecoder.toSfnt(bytes) ?: continue
