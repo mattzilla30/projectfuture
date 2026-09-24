@@ -43,8 +43,16 @@ class Http2Connection(private val socket: Socket) {
     private val nextStreamId = AtomicInteger(1)
     private val streams = ConcurrentHashMap<Int, StreamState>()
 
-    @Volatile private var peerInitialWindowSize = DEFAULT_INITIAL_WINDOW
-    @Volatile private var connectionSendWindow = DEFAULT_INITIAL_WINDOW
+    // Guards every read-modify-write of a send-window field below (peerInitialWindowSize,
+    // connectionSendWindow, and each StreamState.sendWindow). Both the reader thread (WINDOW_UPDATE/
+    // SETTINGS frames granting more window) and any number of concurrent requesting threads (writeBody
+    // spending window on DATA frames) touch these, and `x += y`/`x -= y` is a read-then-write, not an
+    // atomic op - without a shared lock two threads spending the same connection-level budget at once
+    // can each observe the same "window has room" snapshot and together send more than the peer
+    // granted, which a conformant server treats as a FLOW_CONTROL_ERROR and tears the connection down for.
+    private val windowLock = Any()
+    private var peerInitialWindowSize = DEFAULT_INITIAL_WINDOW
+    private var connectionSendWindow = DEFAULT_INITIAL_WINDOW
     @Volatile private var maxFrameSize = DEFAULT_MAX_FRAME_SIZE
     @Volatile private var closed = false
     @Volatile private var closeCause: IOException? = null
@@ -71,9 +79,15 @@ class Http2Connection(private val socket: Socket) {
         @Volatile var statusCode: Int = 0
         val responseHeaders = ArrayList<Pair<String, String>>()
         val body = java.io.ByteArrayOutputStream()
-        @Volatile var sendWindow = 0
+        // Guarded by the owning Http2Connection's windowLock, not @Volatile alone - see windowLock's doc.
+        var sendWindow = 0
         @Volatile var error: IOException? = null
         var headerBlockInProgress: java.io.ByteArrayOutputStream? = null
+        // Set when a HEADERS frame arrives with END_STREAM but *without* END_HEADERS (the header
+        // block continues in one or more CONTINUATION frames): the stream must not be considered
+        // finished until those CONTINUATION frames complete the header block, even though
+        // END_STREAM already told us no DATA frames are coming (see handleHeaders/handleContinuation).
+        @Volatile var endStreamPending = false
     }
 
     /**
@@ -84,7 +98,7 @@ class Http2Connection(private val socket: Socket) {
      */
     fun request(pseudoAndHeaders: List<HpackHeader>, body: ByteArray?): Http2Response {
         if (closed) throw closeCause ?: Http2ConnectionClosedException("HTTP/2 connection is closed")
-        val state = StreamState().apply { sendWindow = peerInitialWindowSize }
+        val state = StreamState().apply { sendWindow = synchronized(windowLock) { peerInitialWindowSize } }
         val streamId = nextStreamId.getAndAdd(2)
         streams[streamId] = state
         try {
@@ -134,17 +148,28 @@ class Http2Connection(private val socket: Socket) {
             // window allows (RFC 7540 6.9), polling for WINDOW_UPDATE frames the reader thread
             // applies concurrently. A short poll loop rather than wait/notify keeps this simple;
             // request bodies in this browser (form POSTs) are small enough that it never matters.
+            // The "is there room, and if so how much" check and the spend of that room must happen
+            // as one atomic step under windowLock - checking then separately decrementing (the two
+            // used to be split across two unsynchronized statements) lets two concurrent streams
+            // both see the same leftover window and each spend it in full, sending more bytes than
+            // the peer ever granted.
+            var chunkSize: Int
             while (true) {
-                val available = minOf(state.sendWindow, connectionSendWindow, maxFrameSize)
-                if (available > 0) break
+                chunkSize = synchronized(windowLock) {
+                    val available = minOf(state.sendWindow, connectionSendWindow, maxFrameSize)
+                    val take = minOf(available, body.size - offset)
+                    if (take > 0) {
+                        state.sendWindow -= take
+                        connectionSendWindow -= take
+                    }
+                    take
+                }
+                if (chunkSize > 0) break
                 if (System.currentTimeMillis() > deadline) throw IOException("HTTP/2 flow-control window timed out")
                 Thread.sleep(5)
             }
-            val chunkSize = minOf(minOf(state.sendWindow, connectionSendWindow, maxFrameSize), body.size - offset)
             val chunk = body.copyOfRange(offset, offset + chunkSize)
             offset += chunkSize
-            state.sendWindow -= chunkSize
-            connectionSendWindow -= chunkSize
             val flags = if (offset >= body.size) FrameFlag.END_STREAM else 0
             writeFrameLocked(Http2Frame(FrameType.DATA, flags, streamId, chunk), flush = true)
         }
@@ -204,7 +229,18 @@ class Http2Connection(private val socket: Socket) {
         if (frame.hasFlag(FrameFlag.ACK)) return
         for ((id, value) in Http2FrameIO.decodeSettings(frame.payload)) {
             when (id) {
-                SettingsId.INITIAL_WINDOW_SIZE -> peerInitialWindowSize = value
+                SettingsId.INITIAL_WINDOW_SIZE -> synchronized(windowLock) {
+                    // RFC 7540 6.9.2: changing SETTINGS_INITIAL_WINDOW_SIZE retroactively adjusts
+                    // the flow-control window of every currently open stream by the same delta (new
+                    // minus old) - it's not just the initial value for streams opened from now on.
+                    // Without this, a server that lowers/raises the setting mid-connection leaves
+                    // already-open streams' windows silently wrong: too large (a protocol violation
+                    // if we then send past what the server actually still allows) or too small
+                    // (a needless stall, since we'd never use window room the server just granted).
+                    val delta = value - peerInitialWindowSize
+                    peerInitialWindowSize = value
+                    for (state in streams.values) state.sendWindow += delta
+                }
                 SettingsId.MAX_FRAME_SIZE -> if (value in DEFAULT_MAX_FRAME_SIZE..(1 shl 24) - 1) maxFrameSize = value
                 SettingsId.HEADER_TABLE_SIZE -> {} // hpackEncoder's dynamic table already defaults within bounds any real server sets.
             }
@@ -215,22 +251,34 @@ class Http2Connection(private val socket: Socket) {
 
     private fun handleWindowUpdate(frame: Http2Frame) {
         val increment = Http2FrameIO.decodeWindowUpdate(frame.payload)
-        if (frame.streamId == CONNECTION_STREAM_ID) {
-            connectionSendWindow += increment
-        } else {
-            streams[frame.streamId]?.let { it.sendWindow += increment }
+        synchronized(windowLock) {
+            if (frame.streamId == CONNECTION_STREAM_ID) {
+                connectionSendWindow += increment
+            } else {
+                streams[frame.streamId]?.let { it.sendWindow += increment }
+            }
         }
     }
 
     private fun handleHeaders(frame: Http2Frame) {
         val state = streams[frame.streamId] ?: return // Response for a stream we've stopped tracking (e.g. timed out) - ignore.
         val fragment = Http2FrameIO.extractHeaderBlockFragment(frame.payload, frame.flags)
+        val endStream = frame.hasFlag(FrameFlag.END_STREAM)
         if (frame.hasFlag(FrameFlag.END_HEADERS)) {
             applyHeaderBlock(state, fragment)
+            // Only safe to signal "done" once the header block itself has actually been decoded
+            // into state.statusCode/responseHeaders - see the CONTINUATION branch below for why
+            // this can't just unconditionally fire on END_STREAM.
+            if (endStream) finishStream(frame.streamId, state)
         } else {
             state.headerBlockInProgress = java.io.ByteArrayOutputStream().apply { write(fragment) }
+            // A HEADERS frame can carry END_STREAM (no DATA frames follow) while still needing
+            // CONTINUATION frame(s) to complete its own header block (RFC 7540 6.2/6.10 - END_HEADERS
+            // and END_STREAM are independent flags). Finishing the stream now, before the header
+            // block is fully decoded, would hand the caller a response with no status/headers even
+            // though a decodable HEADERS+CONTINUATION sequence is still in flight - defer instead.
+            state.endStreamPending = endStream
         }
-        if (frame.hasFlag(FrameFlag.END_STREAM)) finishStream(frame.streamId, state)
     }
 
     private fun handleContinuation(frame: Http2Frame) {
@@ -240,6 +288,7 @@ class Http2Connection(private val socket: Socket) {
         if (frame.hasFlag(FrameFlag.END_HEADERS)) {
             applyHeaderBlock(state, buffer.toByteArray())
             state.headerBlockInProgress = null
+            if (state.endStreamPending) finishStream(frame.streamId, state)
         }
     }
 
