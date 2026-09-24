@@ -6,82 +6,6 @@
     android:orientation="vertical"
     android:fitsSystemWindows="true">
 
-    <LinearLayout
-        android:layout_width="match_parent"
-        android:layout_height="wrap_content"
-        android:orientation="horizontal"
-        android:background="?attr/colorSurfaceContainer"
-        android:gravity="center_vertical"
-        android:paddingHorizontal="8dp"
-        android:paddingVertical="8dp">
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/buttonBack"
-            style="?attr/materialIconButtonStyle"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:contentDescription="@string/action_back"
-            app:icon="@drawable/ic_arrow_back" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/buttonForward"
-            style="?attr/materialIconButtonStyle"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:contentDescription="@string/action_forward"
-            app:icon="@drawable/ic_arrow_forward" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/buttonReload"
-            style="?attr/materialIconButtonStyle"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:contentDescription="@string/action_reload"
-            app:icon="@drawable/ic_reload" />
-
-        <EditText
-            android:id="@+id/editAddress"
-            android:layout_width="0dp"
-            android:layout_height="56dp"
-            android:layout_weight="1"
-            android:layout_marginHorizontal="4dp"
-            android:background="@drawable/bg_address_bar"
-            android:paddingHorizontal="20dp"
-            android:hint="@string/address_hint"
-            android:textColor="?attr/colorOnSurface"
-            android:textColorHint="?attr/colorOnSurfaceVariant"
-            android:textSize="16sp"
-            android:imeOptions="actionGo"
-            android:inputType="textUri"
-            android:maxLines="1"
-            android:singleLine="true"
-            android:selectAllOnFocus="true" />
-
-        <TextView
-            android:id="@+id/buttonTabs"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:layout_marginStart="4dp"
-            android:background="@drawable/bg_tab_count"
-            android:clickable="true"
-            android:focusable="true"
-            android:contentDescription="@string/action_tabs"
-            android:gravity="center"
-            android:text="1"
-            android:textColor="?attr/colorOnSecondaryContainer"
-            android:textAppearance="?attr/textAppearanceLabelLarge" />
-
-        <com.google.android.material.button.MaterialButton
-            android:id="@+id/buttonMenu"
-            style="?attr/materialIconButtonStyle"
-            android:layout_width="48dp"
-            android:layout_height="48dp"
-            android:layout_marginStart="4dp"
-            android:contentDescription="@string/action_menu"
-            app:icon="@drawable/ic_more_vert" />
-
-    </LinearLayout>
-
     <com.google.android.material.progressindicator.LinearProgressIndicator
         android:id="@+id/progressBar"
         style="@style/Widget.Material3Expressive.LinearProgressIndicator.Wavy"
@@ -132,6 +56,7 @@
             style="?attr/materialIconButtonStyle"
             android:layout_width="40dp"
             android:layout_height="40dp"
+            android:layout_marginEnd="8dp"
             android:contentDescription="@string/find_previous"
             app:icon="@drawable/ic_arrow_back" />
 
@@ -140,6 +65,7 @@
             style="?attr/materialIconButtonStyle"
             android:layout_width="40dp"
             android:layout_height="40dp"
+            android:layout_marginEnd="8dp"
             android:contentDescription="@string/find_next"
             app:icon="@drawable/ic_arrow_forward" />
 
@@ -159,5 +85,84 @@
         android:layout_height="0dp"
         android:layout_weight="1"
         android:background="?attr/colorSurface" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:background="?attr/colorSurfaceContainer"
+        android:gravity="center_vertical"
+        android:paddingHorizontal="8dp"
+        android:paddingVertical="8dp">
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/buttonBack"
+            style="?attr/materialIconButtonStyle"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginEnd="8dp"
+            android:contentDescription="@string/action_back"
+            app:icon="@drawable/ic_arrow_back" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/buttonForward"
+            style="?attr/materialIconButtonStyle"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginEnd="8dp"
+            android:contentDescription="@string/action_forward"
+            app:icon="@drawable/ic_arrow_forward" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/buttonReload"
+            style="?attr/materialIconButtonStyle"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginEnd="8dp"
+            android:contentDescription="@string/action_reload"
+            app:icon="@drawable/ic_reload" />
+
+        <EditText
+            android:id="@+id/editAddress"
+            android:layout_width="0dp"
+            android:layout_height="56dp"
+            android:layout_weight="1"
+            android:layout_marginHorizontal="4dp"
+            android:background="@drawable/bg_address_bar"
+            android:paddingHorizontal="20dp"
+            android:hint="@string/address_hint"
+            android:textColor="?attr/colorOnSurface"
+            android:textColorHint="?attr/colorOnSurfaceVariant"
+            android:textSize="16sp"
+            android:imeOptions="actionGo"
+            android:inputType="textUri"
+            android:maxLines="1"
+            android:singleLine="true"
+            android:selectAllOnFocus="true" />
+
+        <TextView
+            android:id="@+id/buttonTabs"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:layout_marginStart="4dp"
+            android:layout_marginEnd="8dp"
+            android:background="@drawable/bg_tab_count"
+            android:clickable="true"
+            android:focusable="true"
+            android:contentDescription="@string/action_tabs"
+            android:gravity="center"
+            android:text="1"
+            android:textColor="?attr/colorOnSecondaryContainer"
+            android:textAppearance="?attr/textAppearanceLabelLarge" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/buttonMenu"
+            style="?attr/materialIconButtonStyle"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:contentDescription="@string/action_menu"
+            app:icon="@drawable/ic_more_vert" />
+
+    </LinearLayout>
 
 </LinearLayout>
