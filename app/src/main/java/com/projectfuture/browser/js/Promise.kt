@@ -8,8 +8,10 @@ package com.projectfuture.browser.js
  * single-threaded with nothing else that could interleave, this produces
  * the same observable results for ordinary chains - it just doesn't match
  * the exact tick-by-tick ordering the spec guarantees for edge cases that
- * depend on it. `async`/`await` are NOT implemented (see Parser.kt's
- * class doc) - only explicit `.then()`/`.catch()`/`.finally()` chains.
+ * depend on it. `async`/`await` (see Coroutines.kt's `JsCoroutine`/
+ * `Interpreter.runAsync`) are built on top of this same class: an `async`
+ * function's `await` subscribes to exactly this synchronous
+ * resolve/reject mechanism, and returns a `JsPromise` for its result.
  */
 class JsPromise : JsObject() {
     private var state = PromiseState.PENDING

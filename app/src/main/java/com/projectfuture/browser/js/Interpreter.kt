@@ -120,7 +120,7 @@ class Interpreter {
                 }
             }
             is ForIn -> execForIn(stmt, env)
-            is FunctionDecl -> env.declare(stmt.name, Closure(stmt.name, stmt.params, stmt.body, env, isArrow = false))
+            is FunctionDecl -> env.declare(stmt.name, Closure(stmt.name, stmt.params, stmt.body, env, isArrow = false, isGenerator = stmt.isGenerator, isAsync = stmt.isAsync))
             is Return -> throw ReturnSignal(stmt.argument?.let { evalExpr(it, env) } ?: JsUndefined)
             BreakStmt -> throw BreakException()
             ContinueStmt -> throw ContinueException()
@@ -136,9 +136,14 @@ class Interpreter {
         val ctor = stmt.methods.firstOrNull { it.name == "constructor" && !it.isStatic }
         val instanceMethods = stmt.methods.filter { !it.isStatic && it.name != "constructor" }
         val staticMethods = stmt.methods.filter { it.isStatic }
-        val classFn = ClassConstructor(stmt.name, superFn, ctor?.params, ctor?.body, instanceMethods, env)
+        // A dedicated environment layer between the class body and its declaration site, holding
+        // `__superclassctor__` so instance/static method closures (not just the constructor, which
+        // used to declare it only in its own per-call env) can resolve `super`/`super.method()` too.
+        val classBodyEnv = Environment(env)
+        superFn?.let { classBodyEnv.declare("__superclassctor__", it) }
+        val classFn = ClassConstructor(stmt.name, superFn, ctor?.params, ctor?.body, instanceMethods, classBodyEnv)
         for (m in staticMethods) {
-            val fn = Closure(m.name, m.params, m.body, env, isArrow = false)
+            val fn = Closure(m.name, m.params, m.body, classBodyEnv, isArrow = false, isGenerator = m.isGenerator, isAsync = m.isAsync)
             when (m.kind) {
                 MethodKind.GET -> (classFn.getters ?: HashMap<String, JsFunction>().also { classFn.getters = it })[m.name] = fn
                 MethodKind.SET -> (classFn.setters ?: HashMap<String, JsFunction>().also { classFn.setters = it })[m.name] = fn
@@ -179,14 +184,8 @@ class Interpreter {
 
     private fun execForIn(stmt: ForIn, env: Environment) {
         val obj = evalExpr(stmt.obj, env)
-        val iterationValues: List<JsValue> = if (stmt.isOf) {
-            when (obj) {
-                is JsArray -> obj.elements.toList()
-                is JsString -> obj.value.map { JsString(it.toString()) }
-                is JsMap -> obj.entryPairs()
-                is JsSet -> obj.valuesList()
-                else -> emptyList()
-            }
+        val iterationValues: Iterable<JsValue> = if (stmt.isOf) {
+            Iterable { iterableToSequence(obj) }
         } else {
             (obj as? JsObject)?.ownKeys()?.map { JsString(it) } ?: emptyList()
         }
@@ -234,7 +233,7 @@ class Interpreter {
                     // `...expr` spread: merge the spread object's own properties in.
                     (evalExpr(v, env) as? JsObject)?.let { spread -> for (key in spread.ownKeys()) obj.set(key, spread.get(key)) }
                 } else {
-                    val key = if (k is StringLit) k.value else toJsString(evalExpr(k, env))
+                    val key = if (k is StringLit) k.value else propertyKeyOf(evalExpr(k, env))
                     obj.set(key, evalExpr(v, env))
                 }
             }
@@ -274,12 +273,35 @@ class Interpreter {
         is Member -> memberKey(expr, env).let { getProperty(evalExpr(expr.obj, env), it) }
         is FunctionExpr -> {
             val capturedThis = if (expr.isArrow && env.has("this")) env.get("this") else null
-            Closure(expr.name ?: "", expr.params, expr.body, env, expr.isArrow, capturedThis)
+            Closure(expr.name ?: "", expr.params, expr.body, env, expr.isArrow, capturedThis, isGenerator = expr.isGenerator, isAsync = expr.isAsync)
         }
+        is YieldExpr -> evalYield(expr, env)
+        is AwaitExpr -> evalAwait(expr, env)
+    }
+
+    /** `yield`/`yield*`: only meaningful with a `__coroutine__` in scope, which [callClosure] declares for a `function*` body - see Coroutines.kt. */
+    private fun evalYield(expr: YieldExpr, env: Environment): JsValue {
+        if (!env.has("__coroutine__")) throw jsError("yield is only valid inside a generator function")
+        val coroutine = (env.get("__coroutine__") as CoroutineRef).coroutine
+        if (!expr.delegate) return coroutine.pause(expr.argument?.let { evalExpr(it, env) } ?: JsUndefined)
+        // yield*: re-yield every value the delegate produces, then evaluate to whatever value was
+        // last sent back in - real JS instead evaluates to the delegate's own final return value,
+        // a narrow simplification here since iterableToSequence only exposes yielded values.
+        val delegate = expr.argument?.let { evalExpr(it, env) } ?: JsUndefined
+        var last: JsValue = JsUndefined
+        for (v in iterableToSequence(delegate)) last = coroutine.pause(v)
+        return last
+    }
+
+    /** `await`: suspends the enclosing async function's coroutine until [value] settles - see [runAsync]. Outside of one, just evaluates its argument (this interpreter's Promises resolve synchronously anyway - see Promise.kt), so a stray top-level `await` degrades gracefully instead of erroring. */
+    private fun evalAwait(expr: AwaitExpr, env: Environment): JsValue {
+        val value = evalExpr(expr.argument, env)
+        if (!env.has("__coroutine__")) return value
+        return (env.get("__coroutine__") as CoroutineRef).coroutine.pause(value)
     }
 
     private fun memberKey(expr: Member, env: Environment): String =
-        if (expr.computed) toJsString(evalExpr(expr.property, env)) else (expr.property as StringLit).value
+        if (expr.computed) propertyKeyOf(evalExpr(expr.property, env)) else (expr.property as StringLit).value
 
     fun getProperty(obj: JsValue, key: String): JsValue = when (obj) {
         is JsString -> {
@@ -307,7 +329,7 @@ class Interpreter {
                 when (val v = evalExpr(e.argument, env)) {
                     is JsArray -> result.addAll(v.elements)
                     is JsString -> v.value.forEach { result.add(JsString(it.toString())) }
-                    else -> {}
+                    else -> iterableToSequence(v).forEach { result.add(it) }
                 }
             } else {
                 result.add(evalExpr(e, env))
@@ -321,6 +343,13 @@ class Interpreter {
             val superFn = env.get("__superclassctor__") as? JsFunction
                 ?: throw jsError("'super' keyword is only valid inside a derived class's constructor")
             return superFn.call(this, env.get("this"), evalArgs(expr.args, env))
+        }
+        if (expr.callee is Member && expr.callee.obj is SuperExpr) {
+            val superCtor = (if (env.has("__superclassctor__")) env.get("__superclassctor__") else null) as? ClassConstructor
+                ?: throw jsError("'super' keyword is only valid inside a derived class's method")
+            val key = memberKey(expr.callee, env)
+            val method = findSuperMethod(superCtor, key) ?: throw jsError("super.$key is not a function")
+            return method.call(this, env.get("this"), evalArgs(expr.args, env))
         }
         if (expr.callee is Member) {
             val obj = evalExpr(expr.callee.obj, env)
@@ -337,6 +366,14 @@ class Interpreter {
         return callee.call(this, JsUndefined, args)
     }
 
+    /** `super.method()`: walks up the superclass chain (a class's `superClassFn`, if it's itself a `class`) looking for the first same-named instance method, matching real JS's prototype-chain walk since this model doesn't otherwise have one. */
+    private fun findSuperMethod(ctor: ClassConstructor, name: String): JsFunction? {
+        val m = ctor.instanceMethods.firstOrNull { it.name == name && it.kind == MethodKind.NORMAL }
+        if (m != null) return Closure(m.name, m.params, m.body, ctor.declEnv, isArrow = false, isGenerator = m.isGenerator, isAsync = m.isAsync)
+        val parentCtor = ctor.superClassFn as? ClassConstructor ?: return null
+        return findSuperMethod(parentCtor, name)
+    }
+
     private fun evalNew(expr: New, env: Environment): JsValue {
         val callee = evalExpr(expr.callee, env)
         val args = evalArgs(expr.args, env)
@@ -351,11 +388,110 @@ class Interpreter {
         val effectiveThis = if (closure.isArrow) (closure.capturedThis ?: JsUndefined) else thisArg
         callEnv.declare("this", effectiveThis)
         bindParams(closure.params, args, callEnv)
-        return try {
-            execBlock(closure.body, callEnv)
-            JsUndefined
-        } catch (r: ReturnSignal) {
-            r.value
+        return when {
+            closure.isGenerator -> makeGenerator(closure, callEnv)
+            closure.isAsync -> runAsync(closure, callEnv)
+            else -> runFunctionBody(closure, callEnv)
+        }
+    }
+
+    private fun runFunctionBody(closure: Closure, callEnv: Environment): JsValue = try {
+        execBlock(closure.body, callEnv)
+        JsUndefined
+    } catch (r: ReturnSignal) {
+        r.value
+    }
+
+    /** `function*`: wraps a [JsCoroutine] running the body (see Coroutines.kt) in a [JsGenerator], without starting it - a generator only begins running on its first `.next()` call, matching real JS. */
+    private fun makeGenerator(closure: Closure, callEnv: Environment): JsValue {
+        val coroutine = JsCoroutine { co ->
+            callEnv.declare("__coroutine__", CoroutineRef(co))
+            runFunctionBody(closure, callEnv)
+        }
+        return JsGenerator(coroutine)
+    }
+
+    /**
+     * `async function`: runs the body on a [JsCoroutine] exactly like a
+     * generator does, but drives it itself instead of handing that job to
+     * user code's `.next()` calls - each `await` pauses the coroutine with
+     * the awaited value, which this loop subscribes to and, once it
+     * settles, resumes (or throws into) the coroutine with the result,
+     * looping until the body completes or throws. Returns the promise for
+     * the function's eventual result/rejection, exactly like real
+     * `async function`.
+     */
+    fun runAsync(closure: Closure, callEnv: Environment): JsPromise {
+        val resultPromise = JsPromise()
+        val coroutine = JsCoroutine { co ->
+            callEnv.declare("__coroutine__", CoroutineRef(co))
+            runFunctionBody(closure, callEnv)
+        }
+        fun step(msg: CoroutineOutMsg) {
+            when (msg) {
+                is Completed -> resultPromise.resolve(msg.value)
+                is Failed -> resultPromise.reject(msg.error)
+                is Yielded -> subscribeAwaited(
+                    msg.value,
+                    onFulfilled = { v -> step(coroutine.resume(v)) },
+                    onRejected = { e -> step(coroutine.throwIn(e)) }
+                )
+            }
+        }
+        step(coroutine.resume(JsUndefined))
+        return resultPromise
+    }
+
+    /** Resolves whatever `await` was given the way real JS's `Await` abstract operation would: a native Promise subscribes directly, a thenable's `.then` is called with fresh resolve/reject callbacks, and anything else is treated as already-settled (this interpreter's Promises settle synchronously - see Promise.kt - so there's no real microtask queue to defer a plain value's "resolution" onto anyway). */
+    private fun subscribeAwaited(value: JsValue, onFulfilled: (JsValue) -> Unit, onRejected: (JsValue) -> Unit) {
+        when {
+            value is JsPromise -> value.subscribe(onFulfilled, onRejected)
+            value is JsObject && value.get("then") is JsFunction -> {
+                val then = value.get("then") as JsFunction
+                var settled = false
+                val resolveFn = NativeFunction("resolve", 1) { _, _, a -> if (!settled) { settled = true; onFulfilled(a.getOrElse(0) { JsUndefined }) }; JsUndefined }
+                val rejectFn = NativeFunction("reject", 1) { _, _, a -> if (!settled) { settled = true; onRejected(a.getOrElse(0) { JsUndefined }) }; JsUndefined }
+                try {
+                    then.call(this, value, listOf(resolveFn, rejectFn))
+                } catch (e: JsException) {
+                    if (!settled) { settled = true; onRejected(e.value) }
+                }
+            }
+            else -> onFulfilled(value)
+        }
+    }
+
+    /**
+     * The general iterable protocol backing `for-of`, spread, and
+     * `yield*`: arrays/strings/Map/Set/typed arrays are special-cased for
+     * directness (matching execForIn's pre-existing behavior), and
+     * anything else - a generator, a Proxy, or a plain object implementing
+     * `[Symbol.iterator]()` - is driven through that method the way real
+     * JS would, lazily via Kotlin's `iterator{}` builder so an infinite
+     * generator works fine as long as the consumer doesn't try to
+     * materialize it. Iterators aren't `.return()`-closed on early
+     * termination (e.g. a `break` mid for-of) - see Coroutines.kt's class
+     * doc for why that's an accepted gap here.
+     */
+    fun iterableToSequence(obj: JsValue): Iterator<JsValue> = when (obj) {
+        is JsArray -> obj.elements.toList().iterator()
+        is JsString -> obj.value.map { JsString(it.toString()) }.iterator()
+        is JsMap -> obj.entryPairs().iterator()
+        is JsSet -> obj.valuesList().iterator()
+        is JsTypedArray -> obj.toList().iterator()
+        is JsObject -> {
+            val iterFn = getProperty(obj, SYMBOL_ITERATOR_KEY) as? JsFunction
+            if (iterFn != null) objectIteratorSequence(iterFn.call(this, obj, emptyList())) else emptyList<JsValue>().iterator()
+        }
+        else -> emptyList<JsValue>().iterator()
+    }
+
+    private fun objectIteratorSequence(iterObj: JsValue): Iterator<JsValue> = iterator {
+        val nextFn = (iterObj as? JsObject)?.get("next") as? JsFunction ?: return@iterator
+        while (true) {
+            val res = nextFn.call(this@Interpreter, iterObj, emptyList()) as? JsObject ?: break
+            if (isTruthy(res.get("done"))) break
+            yield(res.get("value"))
         }
     }
 
@@ -452,7 +588,8 @@ class Interpreter {
         "delete" -> {
             if (expr.argument is Member) {
                 val obj = evalExpr(expr.argument.obj, env)
-                if (obj is JsObject) obj.properties.remove(memberKey(expr.argument, env))
+                val key = memberKey(expr.argument, env)
+                if (obj is JsProxy) obj.deleteProperty(key) else if (obj is JsObject) obj.properties.remove(key)
             }
             JsBoolean(true)
         }
@@ -475,7 +612,7 @@ class Interpreter {
         "<=" -> compareValues(l, r) { a, b -> a <= b }
         ">=" -> compareValues(l, r) { a, b -> a >= b }
         "instanceof" -> JsBoolean(r is JsFunction && l is JsObject && r in l.classChain) // real for `class` instances; always false against plain constructor functions (no prototype chain)
-        "in" -> JsBoolean(r is JsObject && r.has(toJsString(l)))
+        "in" -> JsBoolean(r is JsObject && r.has(propertyKeyOf(l)))
         "&" -> JsNumber((toInt32(toNumber(l)) and toInt32(toNumber(r))).toDouble())
         "|" -> JsNumber((toInt32(toNumber(l)) or toInt32(toNumber(r))).toDouble())
         "^" -> JsNumber((toInt32(toNumber(l)) xor toInt32(toNumber(r))).toDouble())
@@ -528,11 +665,15 @@ class Interpreter {
  * ones. Static methods live as ordinary properties on this object itself
  * (it's a JsObject), so `Foo.method()` needs no special handling.
  *
- * Known gap: `super.method()` (an instance-method super-call, as opposed
- * to `super(...)`) isn't supported - `super` used as a bare expression
- * resolves to the superclass *constructor function*, so `super.method()`
- * would look up `method` as a static property of it, not as an inherited
- * instance method. `super(...)` itself is fully supported.
+ * `super.method()` (an instance-method super-call, as opposed to
+ * `super(...)`) is handled by Interpreter.evalCall's dedicated
+ * `Call(Member(SuperExpr, ...))` case and `findSuperMethod`, which walks
+ * `superClassFn` for the first same-named instance method - see that
+ * method's doc. `super` used as a bare (non-call) expression still just
+ * resolves to the superclass constructor function itself, so a plain
+ * `super.someProp` read looks up a static property of it rather than an
+ * inherited instance property - a narrower, less commonly hit remaining
+ * gap than the method-call case used to be.
  */
 class ClassConstructor(
     name: String,
@@ -547,7 +688,7 @@ class ClassConstructor(
         if (this !in instance.classChain) instance.classChain = instance.classChain + this
         fun bindOwnMethods() {
             for (m in instanceMethods) {
-                val fn = Closure(m.name, m.params, m.body, declEnv, isArrow = false)
+                val fn = Closure(m.name, m.params, m.body, declEnv, isArrow = false, isGenerator = m.isGenerator, isAsync = m.isAsync)
                 when (m.kind) {
                     MethodKind.GET -> (instance.getters ?: HashMap<String, JsFunction>().also { instance.getters = it })[m.name] = fn
                     MethodKind.SET -> (instance.setters ?: HashMap<String, JsFunction>().also { instance.setters = it })[m.name] = fn

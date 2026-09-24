@@ -29,7 +29,9 @@ open class JsObject(val properties: MutableMap<String, JsValue> = LinkedHashMap(
         properties[name] = value
     }
     open fun has(name: String): Boolean = properties.containsKey(name)
-    open fun ownKeys(): List<String> = properties.keys.toList()
+
+    /** Symbol-keyed properties (see Symbols.kt's [propertyKeyOf]) are stored as ordinary string-keyed entries internally, but excluded from enumeration here to approximate real JS's separate symbol key space without actually modeling one. */
+    open fun ownKeys(): List<String> = properties.keys.filterNot { it.startsWith(SYMBOL_KEY_PREFIX) }
 
     /** Kotlin-only bookkeeping for `instanceof` on `class`-declared instances - see ClassConstructor in Interpreter.kt. Empty for ordinary objects. */
     var classChain: List<JsFunction> = emptyList()
@@ -92,7 +94,9 @@ class Closure(
     val body: List<Stmt>,
     val closureEnv: Environment,
     val isArrow: Boolean,
-    val capturedThis: JsValue? = null
+    val capturedThis: JsValue? = null,
+    val isGenerator: Boolean = false,
+    val isAsync: Boolean = false
 ) : JsFunction(name) {
     override fun call(interpreter: Interpreter, thisArg: JsValue, args: List<JsValue>): JsValue =
         interpreter.callClosure(this, thisArg, args)
@@ -127,6 +131,9 @@ fun toJsString(v: JsValue): String = when (v) {
     JsUndefined -> "undefined"
     is JsArray -> v.elements.joinToString(",") { if (it == JsUndefined || it == JsNull) "" else toJsString(it) }
     is JsFunction -> "function ${v.name}() { [native or user code] }"
+    // Real JS throws on implicit Symbol->string coercion; simplified here to a plain description string,
+    // consistent with this interpreter's general preference for a usable result over a spec-accurate throw.
+    is JsSymbol -> v.toString()
     is JsObject -> "[object Object]"
 }
 
@@ -153,6 +160,7 @@ fun typeOf(v: JsValue): String = when (v) {
     is JsBoolean -> "boolean"
     is JsNumber -> "number"
     is JsString -> "string"
+    is JsSymbol -> "symbol"
     is JsFunction -> "function"
     is JsObject -> "object"
 }

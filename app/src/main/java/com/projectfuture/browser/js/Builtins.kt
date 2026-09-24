@@ -19,6 +19,11 @@ fun installGlobals(env: Environment, interpreter: Interpreter) {
     env.declare("Date", makeDateCtor())
     env.declare("NaN", JsNumber(Double.NaN))
     env.declare("Infinity", JsNumber(Double.POSITIVE_INFINITY))
+    env.declare("Symbol", makeSymbolCtor())
+    env.declare("Proxy", makeProxyCtor())
+    env.declare("Reflect", makeReflectObj())
+    env.declare("ArrayBuffer", makeArrayBufferCtor())
+    for (kind in TypedArrayKind.values()) env.declare(kind.label, makeTypedArrayCtor(kind))
 
     env.declare("parseInt", NativeFunction("parseInt", 2) { _, _, args ->
         val s = toJsString(arg(args, 0)).trim()
@@ -163,6 +168,7 @@ fun builtinMethodCall(interpreter: Interpreter, obj: JsValue, key: String, args:
     is JsArray -> arrayMethod(interpreter, obj, key, args)
     is JsString -> stringMethod(interpreter, obj, key, args)
     is JsNumber -> numberMethod(obj, key, args)
+    is JsTypedArray -> typedArrayMethod(interpreter, obj, key, args)
     else -> null
 }
 

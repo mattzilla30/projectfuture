@@ -6,10 +6,15 @@ package com.projectfuture.browser.js
  * the regex-vs-division heuristic), bitwise operators, switch statements,
  * array/object destructuring (in `var`/`let`/`const`, `for-of`, and
  * function parameters), spread/rest, default parameters, `class`/
- * `extends`/`super`/`static`, and getter/setter accessors (in object
- * literals and classes). Not implemented: generators/async, labeled
- * statements. See Interpreter.kt's class doc for the fuller picture of
- * what this engine covers.
+ * `extends`/`super`/`static`, getter/setter accessors (in object literals
+ * and classes), generators (`function*`/`yield`/`yield*`) and
+ * `async`/`await`. Not implemented: labeled statements. `async`/`await`/
+ * `yield`/`static` are recognized by identifier text rather than added to
+ * the lexer's keyword set - same reasoning as `class`/`switch` (see
+ * [checkIdentText]) - so using one of those words as an ordinary
+ * identifier in code that isn't actually using the feature is a real,
+ * if narrow, misparse risk this parser accepts. See Interpreter.kt's
+ * class doc for the fuller picture of what this engine covers.
  */
 class Parser(private val tokens: List<Token>) {
     private var pos = 0
@@ -60,6 +65,7 @@ class Parser(private val tokens: List<Token>) {
         if (checkKeyword("while")) return parseWhile()
         if (checkKeyword("do")) return parseDoWhile()
         if (checkKeyword("for")) return parseFor()
+        if (checkIdentText("async") && peek(1).type == TokenType.KEYWORD && peek(1).text == "function") { advance(); return parseFunctionDecl(isAsync = true) }
         if (checkKeyword("function")) return parseFunctionDecl()
         if (checkKeyword("return")) return parseReturn()
         if (checkKeyword("break")) { advance(); consumeSemicolon(); return BreakStmt }
@@ -233,12 +239,13 @@ class Parser(private val tokens: List<Token>) {
         return ForIn(declKind, pattern, obj, parseStatement(), isOf)
     }
 
-    private fun parseFunctionDecl(): Stmt {
-        advance()
+    private fun parseFunctionDecl(isAsync: Boolean = false): Stmt {
+        advance() // 'function'
+        val isGenerator = matchPunct("*")
         val name = advance().text
         val params = parseParamList()
         val body = parseBlockStatements()
-        return FunctionDecl(name, params, body)
+        return FunctionDecl(name, params, body, isGenerator, isAsync)
     }
 
     private fun parseParamList(): List<Param> {
@@ -331,6 +338,9 @@ class Parser(private val tokens: List<Token>) {
         while (!checkPunct("}")) {
             if (matchPunct(";")) continue
             val isStatic = matchIdentText("static")
+            val isAsyncMethod = checkIdentText("async") && !(peek(1).type == TokenType.PUNCT && peek(1).text == "(")
+            if (isAsyncMethod) advance()
+            val isGeneratorMethod = matchPunct("*")
             val kind = if (looksLikeAccessorPrefix()) {
                 if (advance().text == "get") MethodKind.GET else MethodKind.SET
             } else {
@@ -339,7 +349,7 @@ class Parser(private val tokens: List<Token>) {
             val methodName = advance().text
             val params = parseParamList()
             val body = parseBlockStatements()
-            methods.add(MethodDef(methodName, params, body, isStatic, kind))
+            methods.add(MethodDef(methodName, params, body, isStatic, kind, isGeneratorMethod, isAsyncMethod))
         }
         expectPunct("}")
         return ClassDecl(name, superClass, methods)
@@ -352,6 +362,7 @@ class Parser(private val tokens: List<Token>) {
     private val assignOps = setOf("=", "+=", "-=", "*=", "/=", "%=")
 
     private fun parseAssignment(): Expr {
+        if (checkIdentText("yield")) return parseYield()
         tryParseArrowFunction()?.let { return it }
         val left = parseConditional()
         if (peek().type == TokenType.PUNCT && peek().text in assignOps) {
@@ -362,11 +373,34 @@ class Parser(private val tokens: List<Token>) {
         return left
     }
 
+    /** `yield`/`yield*` - only meaningful (checked at runtime, not here) inside a generator function's body. */
+    private fun parseYield(): Expr {
+        advance() // 'yield'
+        val delegate = matchPunct("*")
+        val noArgument = checkPunct(")") || checkPunct("]") || checkPunct("}") || checkPunct(";") || checkPunct(",") || checkPunct(":") || peek().newlineBefore || isAtEnd()
+        val arg = if (noArgument) null else parseAssignment()
+        return YieldExpr(arg, delegate)
+    }
+
+    /**
+     * An arrow function's parameter list, optionally preceded by `async`
+     * (`x => x`, `(a, b) => a+b`, `async x => ...`, `async (a, b) => ...`).
+     * Both the plain-identifier and parenthesized forms are tried
+     * speculatively and backtracked on failure, same reasoning as before
+     * `async` support was added - see [tryParseArrowFunction]'s prior
+     * revision in version control for the un-merged original shape.
+     */
     private fun tryParseArrowFunction(): Expr? {
+        val startPos = pos
+        val isAsync = checkIdentText("async") &&
+            (peek(1).type == TokenType.IDENT || (peek(1).type == TokenType.PUNCT && peek(1).text == "(")) &&
+            !peek(1).newlineBefore
+        if (isAsync) advance() // tentatively consume 'async' - restored via startPos if this doesn't pan out
+
         if (check(TokenType.IDENT) && peek(1).type == TokenType.PUNCT && peek(1).text == "=>") {
             val param = advance().text
             advance() // =>
-            return finishArrow(listOf(Param(IdentifierPattern(param))))
+            return finishArrow(listOf(Param(IdentifierPattern(param))), isAsync)
         }
         if (checkPunct("(")) {
             val saved = pos
@@ -391,7 +425,7 @@ class Parser(private val tokens: List<Token>) {
                     advance()
                     if (checkPunct("=>")) {
                         advance()
-                        return finishArrow(params)
+                        return finishArrow(params, isAsync)
                     }
                 }
             } catch (_: Exception) {
@@ -399,12 +433,13 @@ class Parser(private val tokens: List<Token>) {
             }
             pos = saved
         }
+        pos = startPos // not an arrow function (async or otherwise) after all - let 'async' parse normally
         return null
     }
 
-    private fun finishArrow(params: List<Param>): Expr {
+    private fun finishArrow(params: List<Param>, isAsync: Boolean = false): Expr {
         val body = if (checkPunct("{")) parseBlockStatements() else listOf(Return(parseAssignment()))
-        return FunctionExpr(null, params, body, isArrow = true)
+        return FunctionExpr(null, params, body, isArrow = true, isAsync = isAsync)
     }
 
     private fun parseConditional(): Expr {
@@ -513,6 +548,7 @@ class Parser(private val tokens: List<Token>) {
     private val unaryOps = setOf("!", "-", "+", "~")
 
     private fun parseUnary(): Expr {
+        if (checkIdentText("await")) { advance(); return AwaitExpr(parseUnary()) }
         if (peek().type == TokenType.PUNCT && peek().text in unaryOps) {
             val op = advance().text
             return Unary(op, parseUnary())
@@ -602,6 +638,10 @@ class Parser(private val tokens: List<Token>) {
             TokenType.REGEX -> { advance(); return RegexLit(tok.text, tok.regexFlags) }
             TokenType.IDENT -> {
                 if (tok.text == "super") { advance(); return SuperExpr }
+                if (tok.text == "async" && peek(1).type == TokenType.KEYWORD && peek(1).text == "function" && !peek(1).newlineBefore) {
+                    advance() // 'async'
+                    return parseFunctionExpr(isAsync = true)
+                }
                 advance()
                 return Identifier(tok.text)
             }
@@ -632,12 +672,13 @@ class Parser(private val tokens: List<Token>) {
         throw jsError("Parse error: unexpected token '${tok.text}'")
     }
 
-    private fun parseFunctionExpr(): Expr {
+    private fun parseFunctionExpr(isAsync: Boolean = false): Expr {
         advance() // 'function'
+        val isGenerator = matchPunct("*")
         val name = if (check(TokenType.IDENT)) advance().text else null
         val params = parseParamList()
         val body = parseBlockStatements()
-        return FunctionExpr(name, params, body, isArrow = false)
+        return FunctionExpr(name, params, body, isArrow = false, isGenerator = isGenerator, isAsync = isAsync)
     }
 
     private fun parseArrayLit(): Expr {
@@ -676,15 +717,36 @@ class Parser(private val tokens: List<Token>) {
                 if (!matchPunct(",")) break
                 continue
             }
+            // `async foo() {}` / `*foo() {}` / `async *foo() {}` shorthand methods - `async` only
+            // counts as a modifier here when it isn't itself the property (`{ async: 1 }`) or a
+            // method named "async" (`{ async() {} }`).
+            val isAsyncMethod = checkIdentText("async") && !(peek(1).type == TokenType.PUNCT && (peek(1).text == ":" || peek(1).text == "("))
+            if (isAsyncMethod) advance()
+            val isGeneratorMethod = matchPunct("*")
+            if (checkPunct("[")) {
+                // computed key: `{ [expr]: value }` / `{ [expr]() {} }` - e.g. `{ [Symbol.iterator]: function() {...} }`.
+                advance()
+                val keyExpr = parseAssignment()
+                expectPunct("]")
+                if (!isAsyncMethod && !isGeneratorMethod && matchPunct(":")) {
+                    props.add(keyExpr to parseAssignment())
+                } else {
+                    val params = parseParamList()
+                    val body = parseBlockStatements()
+                    props.add(keyExpr to FunctionExpr(null, params, body, isArrow = false, isGenerator = isGeneratorMethod, isAsync = isAsyncMethod))
+                }
+                if (!matchPunct(",")) break
+                continue
+            }
             val keyTok = advance()
             val key: Expr = StringLit(keyTok.text)
-            if (matchPunct(":")) {
+            if (!isAsyncMethod && !isGeneratorMethod && matchPunct(":")) {
                 props.add(key to parseAssignment())
             } else if (checkPunct("(")) {
                 // shorthand method syntax: { foo(a, b) { ... } } -> { foo: function(a, b) { ... } }
                 val params = parseParamList()
                 val body = parseBlockStatements()
-                props.add(key to FunctionExpr(keyTok.text, params, body, isArrow = false))
+                props.add(key to FunctionExpr(keyTok.text, params, body, isArrow = false, isGenerator = isGeneratorMethod, isAsync = isAsyncMethod))
             } else {
                 // shorthand { x } -> { x: x }
                 props.add(key to Identifier(keyTok.text))

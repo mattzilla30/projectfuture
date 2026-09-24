@@ -24,9 +24,20 @@ data class Conditional(val test: Expr, val consequent: Expr, val alternate: Expr
 data class Call(val callee: Expr, val args: List<Expr>) : Expr()
 data class New(val callee: Expr, val args: List<Expr>) : Expr()
 data class Member(val obj: Expr, val property: Expr, val computed: Boolean) : Expr()
-data class FunctionExpr(val name: String?, val params: List<Param>, val body: List<Stmt>, val isArrow: Boolean) : Expr()
+data class FunctionExpr(
+    val name: String?,
+    val params: List<Param>,
+    val body: List<Stmt>,
+    val isArrow: Boolean,
+    val isGenerator: Boolean = false,
+    val isAsync: Boolean = false
+) : Expr()
 data class SpreadElement(val argument: Expr) : Expr() // `...expr` inside an array/object literal or a call's argument list
-object SuperExpr : Expr() // only meaningful as a Call callee (`super(...)`); see Interpreter's ClassConstructor
+object SuperExpr : Expr() // meaningful as a Call callee (`super(...)`) or as a Member's object (`super.method()`) - see Interpreter's ClassConstructor
+/** `yield expr` / `yield* expr` - only valid (checked at runtime, not parse time) inside a generator function's body. [delegate] marks `yield*`. */
+data class YieldExpr(val argument: Expr?, val delegate: Boolean = false) : Expr()
+/** `await expr` - only suspends when evaluated inside an async function's body (see Interpreter.callClosure); elsewhere it just evaluates its argument, since this interpreter's Promises resolve synchronously anyway (see Promise.kt). */
+data class AwaitExpr(val argument: Expr) : Expr()
 
 /**
  * A binding target: a plain name, or an array/object destructuring shape.
@@ -56,7 +67,7 @@ data class While(val test: Expr, val body: Stmt) : Stmt()
 data class DoWhile(val body: Stmt, val test: Expr) : Stmt()
 data class For(val init: Stmt?, val test: Expr?, val update: Expr?, val body: Stmt) : Stmt()
 data class ForIn(val declKind: String?, val pattern: Pattern, val obj: Expr, val body: Stmt, val isOf: Boolean) : Stmt()
-data class FunctionDecl(val name: String, val params: List<Param>, val body: List<Stmt>) : Stmt()
+data class FunctionDecl(val name: String, val params: List<Param>, val body: List<Stmt>, val isGenerator: Boolean = false, val isAsync: Boolean = false) : Stmt()
 data class Return(val argument: Expr?) : Stmt()
 object BreakStmt : Stmt()
 object ContinueStmt : Stmt()
@@ -68,5 +79,13 @@ data class SwitchStmt(val discriminant: Expr, val cases: List<SwitchCase>) : Stm
 enum class MethodKind { NORMAL, GET, SET }
 
 /** `constructor`/`static` markers are ordinary method names/flags, not separate AST node kinds. */
-data class MethodDef(val name: String, val params: List<Param>, val body: List<Stmt>, val isStatic: Boolean, val kind: MethodKind = MethodKind.NORMAL)
+data class MethodDef(
+    val name: String,
+    val params: List<Param>,
+    val body: List<Stmt>,
+    val isStatic: Boolean,
+    val kind: MethodKind = MethodKind.NORMAL,
+    val isGenerator: Boolean = false,
+    val isAsync: Boolean = false
+)
 data class ClassDecl(val name: String, val superClass: Expr?, val methods: List<MethodDef>) : Stmt()
