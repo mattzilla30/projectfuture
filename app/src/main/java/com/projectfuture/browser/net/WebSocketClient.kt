@@ -148,6 +148,17 @@ class WebSocketClient(private val url: Url) {
                 }
                 0x9 -> writeFrame(sock, 0xA, payload) // ping -> pong
                 0xA -> {} // pong: nothing to do
+                0x0 -> {} // continuation frame - fragmentation isn't implemented (see class doc)
+                else -> {
+                    // RFC 6455 7.1.7 / 5.2: opcodes 0x3-0x7 and 0xB-0xF are reserved for future
+                    // non-control and control frames. A frame using one of them is something this
+                    // (or any RFC 6455) client cannot interpret, so per spec the connection must be
+                    // failed rather than silently dropping the frame and trying to parse whatever
+                    // bytes follow as the next frame header.
+                    try { writeFrame(sock, 0x8, byteArrayOf(0x03, 0xEA.toByte())) } catch (_: Exception) {}
+                    handleClose(1002, "Unsupported opcode: $opcode")
+                    return
+                }
             }
         }
     }

@@ -117,6 +117,58 @@ class WebSocketClientTest {
     }
 
     /**
+     * RFC 6455 7.1.7 / section 5.2: an opcode the client doesn't understand (a reserved,
+     * non-control opcode like 0x3) makes it unsafe to keep interpreting the byte stream as WebSocket
+     * frames, so a compliant endpoint MUST fail the connection rather than silently ignore the frame
+     * and carry on reading. Before the fix, WebSocketClient's opcode `when` had no `else` branch, so
+     * an unknown opcode fell through as a no-op and the read loop kept going - no onClose was ever
+     * delivered for this frame.
+     */
+    @Test fun reservedOpcodeFailsTheConnection() {
+        val server = ServerSocket(0)
+        val serverDone = CountDownLatch(1)
+
+        Thread {
+            try {
+                val socket = server.accept()
+                val input = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.US_ASCII))
+                var clientKey: String? = null
+                var line = input.readLine()
+                while (line != null && line.isNotEmpty()) {
+                    if (line.startsWith("Sec-WebSocket-Key:", ignoreCase = true)) {
+                        clientKey = line.substringAfter(":").trim()
+                    }
+                    line = input.readLine()
+                }
+                val accept = acceptKeyFor(clientKey!!)
+                val response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: $accept\r\n\r\n"
+                socket.getOutputStream().write(response.toByteArray(Charsets.US_ASCII))
+                socket.getOutputStream().flush()
+
+                // Opcode 0x3 is reserved for future non-control frames - no compliant server sends
+                // it, but a malicious/buggy one might.
+                writeServerFrame(socket.getOutputStream(), 0x3, "bogus".toByteArray(Charsets.UTF_8))
+                socket.close()
+            } catch (_: Exception) {
+            } finally {
+                serverDone.countDown()
+            }
+        }.apply { isDaemon = true }.start()
+
+        val port = server.localPort
+        val client = WebSocketClient(Url.parse("ws://127.0.0.1:$port/socket"))
+        val closeLatch = CountDownLatch(1)
+        var closeCode = -1
+        client.onClose = { code, _ -> closeCode = code; closeLatch.countDown() }
+        client.connect()
+
+        assertTrue("client must fail the connection on a reserved opcode, not hang forever", closeLatch.await(5, TimeUnit.SECONDS))
+        assertEquals(1002, closeCode)
+        assertTrue(serverDone.await(5, TimeUnit.SECONDS))
+        server.close()
+    }
+
+    /**
      * A close frame's payload is a real 2-byte status code (+ optional UTF-8 reason), and real
      * servers send codes other than 1000 - e.g. 1001 "Going Away" - which the client must surface
      * as-is rather than always reporting a hardcoded 1000. Reproduces the bug fixed in
