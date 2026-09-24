@@ -43,4 +43,45 @@ object Http2ConnectionPool {
             return connection
         }
     }
+
+    /** Hosts whose last handshake negotiated HTTP/1.1. Concurrent requests to them each need their own socket, so they skip [claimOrWait]. */
+    private val http1Hosts = object : LinkedHashMap<String, Unit>(64, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Unit>?) = size > 512
+    }
+    private val inFlight = HashMap<String, java.util.concurrent.CountDownLatch>()
+
+    enum class Claim { CLAIMED, WAITED, SKIPPED }
+
+    /**
+     * Coalesces concurrent connection setup to one https host. Without it, a page's 6 parallel
+     * subresource fetches each missed [get] at once, each paid a full TCP+TLS handshake, and
+     * [putIfAbsent] then kept one connection and closed the other 5.
+     *
+     * Returns [Claim.CLAIMED] when the caller should connect and must then call [finishConnect].
+     * Returns [Claim.WAITED] after another caller's connect finished: check [get] again, and
+     * connect without a claim if it has nothing. Returns [Claim.SKIPPED] for a host known to
+     * speak HTTP/1.1, which gains nothing from waiting.
+     */
+    fun claimOrWait(key: String, timeoutMs: Long = 30_000): Claim {
+        val latch = synchronized(connections) {
+            if (http1Hosts.containsKey(key)) return Claim.SKIPPED
+            val existing = inFlight[key]
+            if (existing == null) {
+                inFlight[key] = java.util.concurrent.CountDownLatch(1)
+                return Claim.CLAIMED
+            }
+            existing
+        }
+        latch.await(timeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+        return Claim.WAITED
+    }
+
+    /** Ends a [Claim.CLAIMED] connect. [negotiatedHttp1] is true when the handshake succeeded without h2. */
+    fun finishConnect(key: String, negotiatedHttp1: Boolean) {
+        synchronized(connections) {
+            if (negotiatedHttp1) http1Hosts[key] = Unit else http1Hosts.remove(key)
+            inFlight.remove(key)
+        }?.countDown()
+    }
 }
+

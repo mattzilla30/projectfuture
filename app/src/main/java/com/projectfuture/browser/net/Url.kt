@@ -197,10 +197,15 @@ data class Url(
      */
     fun preconnect() {
         if (scheme != "http" && scheme != "https") return
+        val poolKey = "$scheme://$host:$port"
+        // A request (or another preconnect) already connecting, or a live h2 connection, makes this one redundant.
+        if (isHttps && Http2ConnectionPool.get(poolKey) != null) return
+        val claim = if (isHttps) Http2ConnectionPool.claimOrWait(poolKey, timeoutMs = 0) else Http2ConnectionPool.Claim.SKIPPED
+        if (claim == Http2ConnectionPool.Claim.WAITED) return
+        var negotiatedHttp1 = false
         try {
             val socket = openSocket()
             socket.soTimeout = 20000
-            val poolKey = "$scheme://$host:$port"
             // A preconnected socket that negotiated h2 over ALPN must go into Http2ConnectionPool,
             // not the plain HTTP/1.1 ConnectionPool below: the real request later checks
             // Http2ConnectionPool first and, missing an entry there, would fall through to
@@ -215,9 +220,12 @@ data class Url(
                 }
                 return
             }
+            negotiatedHttp1 = true
             ConnectionPool.release(poolKey, socket)
         } catch (_: Exception) {
             // Best-effort - see doc above.
+        } finally {
+            if (claim == Http2ConnectionPool.Claim.CLAIMED) Http2ConnectionPool.finishConnect(poolKey, negotiatedHttp1)
         }
     }
 
@@ -329,18 +337,38 @@ data class Url(
         var socket = ConnectionPool.borrow(poolKey)
         var reused = socket != null
         if (socket == null) {
-            socket = openSocket()
-            if (isHttps && socket is SSLSocket && Alpn.negotiated(socket) == "h2") {
-                val connection = Http2Connection(socket)
-                // putIfAbsent, not put: another thread (a concurrent request from a different Tab
-                // to the same host, or a racing preconnect()) may have already finished its own
-                // handshake and registered a connection for this key first. If so, use that one and
-                // close this redundant one instead of clobbering - see putIfAbsent's doc.
-                val winner = Http2ConnectionPool.putIfAbsent(poolKey, connection)
-                if (winner !== connection) {
-                    try { connection.close() } catch (_: Exception) {}
+            // One handshake per host at a time: requests that arrive while it runs wait and then
+            // share the HTTP/2 connection it produced - see Http2ConnectionPool.claimOrWait.
+            val claim = if (isHttps) Http2ConnectionPool.claimOrWait(poolKey) else Http2ConnectionPool.Claim.SKIPPED
+            if (claim == Http2ConnectionPool.Claim.WAITED) {
+                Http2ConnectionPool.get(poolKey)?.let { connection ->
+                    return fetchViaHttp2(connection, method, body, extraHeaders, redirectsLeft, allowCookies)
                 }
-                return fetchViaHttp2(winner, method, body, extraHeaders, redirectsLeft, allowCookies)
+                socket = ConnectionPool.borrow(poolKey)
+                reused = socket != null
+            }
+            if (socket == null) {
+                val claimed = claim == Http2ConnectionPool.Claim.CLAIMED
+                var h2Connection: Http2Connection? = null
+                try {
+                    val fresh = openSocket()
+                    socket = fresh
+                    if (isHttps && fresh is SSLSocket && Alpn.negotiated(fresh) == "h2") {
+                        val connection = Http2Connection(fresh)
+                        // putIfAbsent, not put: a connect that didn't hold the claim (a waiter whose
+                        // wait timed out, or a preconnect) may have registered one first. Use that
+                        // one and close this redundant one - see putIfAbsent's doc.
+                        val winner = Http2ConnectionPool.putIfAbsent(poolKey, connection)
+                        if (winner !== connection) {
+                            try { connection.close() } catch (_: Exception) {}
+                        }
+                        h2Connection = winner
+                    }
+                } finally {
+                    // Released after registering, so waiters find the connection in the pool.
+                    if (claimed) Http2ConnectionPool.finishConnect(poolKey, negotiatedHttp1 = socket != null && h2Connection == null)
+                }
+                h2Connection?.let { return fetchViaHttp2(it, method, body, extraHeaders, redirectsLeft, allowCookies) }
             }
         }
         socket.soTimeout = 20000
