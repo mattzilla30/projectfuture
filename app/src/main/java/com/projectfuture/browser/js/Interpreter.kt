@@ -16,14 +16,14 @@ class Environment(val parent: Environment?) {
             if (env.vars.containsKey(name)) return env.vars[name]!!
             env = env.parent
         }
-        throw jsError("$name is not defined")
+        throw jsError("$name is not defined", "ReferenceError")
     }
 
     fun assign(name: String, value: JsValue) {
         var env: Environment? = this
         while (env != null) {
             if (env.vars.containsKey(name)) {
-                if (name in env.consts) throw jsError("Assignment to constant variable.")
+                if (name in env.consts) throw jsError("Assignment to constant variable.", "TypeError")
                 env.vars[name] = value
                 return
             }
@@ -375,7 +375,7 @@ class Interpreter {
             // of searching instanceMethods - otherwise a static method's own `super.staticMethod()` call
             // never finds anything, even though the superclass plainly has one.
             val method = (if (thisVal is JsFunction) findSuperStaticMethod(superCtor, key) else findSuperMethod(superCtor, key))
-                ?: throw jsError("super.$key is not a function")
+                ?: throw jsError("super.$key is not a function", "TypeError")
             return method.call(this, thisVal, evalArgs(expr.args, env))
         }
         if (expr.callee is Member) {
@@ -384,12 +384,12 @@ class Interpreter {
             val args = evalArgs(expr.args, env)
             builtinMethodCall(this, obj, key, args)?.let { return it }
             val fn = getProperty(obj, key)
-            if (fn !is JsFunction) throw jsError("$key is not a function")
+            if (fn !is JsFunction) throw jsError("$key is not a function", "TypeError")
             return fn.call(this, obj, args)
         }
         val callee = evalExpr(expr.callee, env)
         val args = evalArgs(expr.args, env)
-        if (callee !is JsFunction) throw jsError("value is not a function")
+        if (callee !is JsFunction) throw jsError("value is not a function", "TypeError")
         return callee.call(this, JsUndefined, args)
     }
 
@@ -411,7 +411,7 @@ class Interpreter {
     private fun evalNew(expr: New, env: Environment): JsValue {
         val callee = evalExpr(expr.callee, env)
         val args = evalArgs(expr.args, env)
-        if (callee !is JsFunction) throw jsError("not a constructor")
+        if (callee !is JsFunction) throw jsError("not a constructor", "TypeError")
         val instance = JsObject()
         val result = callee.call(this, instance, args)
         return if (result is JsObject) result else instance
@@ -645,7 +645,7 @@ class Interpreter {
         ">" -> compareValues(l, r) { a, b -> a > b }
         "<=" -> compareValues(l, r) { a, b -> a <= b }
         ">=" -> compareValues(l, r) { a, b -> a >= b }
-        "instanceof" -> JsBoolean(r is JsFunction && l is JsObject && r in l.classChain) // real for `class` instances; always false against plain constructor functions (no prototype chain)
+        "instanceof" -> JsBoolean(r is JsFunction && l is JsObject && r in l.classChain) // real for `class` instances and Error-family constructors (see ErrorConstructor in JsValue.kt), both of which stamp classChain; always false against a plain constructor function (no prototype chain)
         "in" -> JsBoolean(r is JsObject && r.has(propertyKeyOf(l)))
         "&" -> JsNumber((toInt32(toNumber(l)) and toInt32(toNumber(r))).toDouble())
         "|" -> JsNumber((toInt32(toNumber(l)) or toInt32(toNumber(r))).toDouble())

@@ -175,9 +175,57 @@ fun typeOf(v: JsValue): String = when (v) {
 /** Thrown for a JS-level `throw` and for interpreter runtime errors (wrapped as an Error-shaped JsObject or JsString). */
 class JsException(val value: JsValue) : RuntimeException(toJsString(value), null, false, false)
 
-fun jsError(message: String): JsException {
-    val obj = JsObject()
-    obj.set("message", JsString(message))
-    obj.set("name", JsString("Error"))
-    return JsException(obj)
+/**
+ * `Error`/`TypeError`/`RangeError`/etc. constructors. Modeled the same way `class`-declared
+ * constructors are (see ClassConstructor in Interpreter.kt): calling one - via `new`, via a bare
+ * call (real JS allows `TypeError("x")` without `new` too - both paths here just build a fresh
+ * object when `thisArg` isn't already an instance, e.g. when driven through `super(...)` from a
+ * user `class ... extends Error`), or as the implicit superclass of such a subclass - stamps the
+ * constructor (and its ancestors, so `new TypeError() instanceof Error` is true too) onto the
+ * instance's [JsObject.classChain], which is exactly what the interpreter's `instanceof` operator
+ * checks. Sharing one singleton instance per error type (below) across every [Interpreter] is what
+ * makes that check work at all: `instanceof` compares by reference, so the constructor a script
+ * looks up by name (from its Environment) has to be the same object this class stamps onto
+ * instances, including the ones [jsError] builds for the interpreter's own internally-thrown
+ * errors - otherwise a catch block's `e instanceof TypeError` could never match them.
+ */
+class ErrorConstructor(name: String, val parent: ErrorConstructor? = null) : JsFunction(name) {
+    override fun call(interpreter: Interpreter, thisArg: JsValue, args: List<JsValue>): JsValue = buildError(this, thisArg, args)
+}
+
+private fun buildError(ctor: ErrorConstructor, thisArg: JsValue, args: List<JsValue>): JsObject {
+    val instance = thisArg as? JsObject ?: JsObject()
+    var chain = instance.classChain
+    var c: ErrorConstructor? = ctor
+    while (c != null) {
+        if (c !in chain) chain = chain + c
+        c = c.parent
+    }
+    instance.classChain = chain
+    val messageArg = args.getOrNull(0)
+    if (messageArg != null && messageArg != JsUndefined) instance.set("message", JsString(toJsString(messageArg)))
+    else if (!instance.has("message")) instance.set("message", JsString(""))
+    instance.set("name", JsString(ctor.name))
+    instance.set("stack", JsString("${ctor.name}: ${toJsString(instance.get("message"))}"))
+    return instance
+}
+
+val ERROR_CTOR = ErrorConstructor("Error")
+val TYPE_ERROR_CTOR = ErrorConstructor("TypeError", ERROR_CTOR)
+val RANGE_ERROR_CTOR = ErrorConstructor("RangeError", ERROR_CTOR)
+val SYNTAX_ERROR_CTOR = ErrorConstructor("SyntaxError", ERROR_CTOR)
+val REFERENCE_ERROR_CTOR = ErrorConstructor("ReferenceError", ERROR_CTOR)
+
+/** Builds a real, catchable Error-family instance (`e instanceof TypeError`/`instanceof Error` work - see
+ * [ErrorConstructor]) for the interpreter's own internally-thrown errors, e.g. `jsError("x is not a
+ * function", "TypeError")`. [name] defaults to plain `Error` for messages with no more specific type. */
+fun jsError(message: String, name: String = "Error"): JsException {
+    val ctor = when (name) {
+        "TypeError" -> TYPE_ERROR_CTOR
+        "RangeError" -> RANGE_ERROR_CTOR
+        "SyntaxError" -> SYNTAX_ERROR_CTOR
+        "ReferenceError" -> REFERENCE_ERROR_CTOR
+        else -> ERROR_CTOR
+    }
+    return JsException(buildError(ctor, JsUndefined, listOf(JsString(message))))
 }

@@ -101,6 +101,145 @@ class ModernFeaturesTest {
         )
     }
 
+    // ---- Error/TypeError/instanceof ----
+
+    /** Before this fix there was no `Error`/`TypeError`/`RangeError`/`SyntaxError` global at all -
+     * `new TypeError(...)` failed with "TypeError is not defined". */
+    @Test fun errorConstructorsExistAndSetMessageAndName() {
+        assertEquals(
+            "TypeError:boom",
+            str(
+                """
+                var e = new TypeError('boom');
+                var result = e.name + ':' + e.message;
+                """.trimIndent()
+            )
+        )
+    }
+
+    /** The extremely common `catch (e) { if (e instanceof TypeError) ... }` pattern: a `TypeError`
+     * instance must match both its own constructor and `Error`, its prototype-chain ancestor. */
+    @Test fun errorInstancesMatchInstanceofTheirOwnTypeAndError() {
+        assertEquals(
+            "true,true,false",
+            str(
+                """
+                var e = new TypeError('bad');
+                var result = (e instanceof TypeError) + ',' + (e instanceof Error) + ',' + (e instanceof RangeError);
+                """.trimIndent()
+            )
+        )
+    }
+
+    /** The interpreter's own internally-thrown errors (calling a non-function, here) must construct
+     * real Error-family objects - not some other internal representation - so a `catch (e) { if (e
+     * instanceof TypeError) }` guard, extremely common in real code, actually matches them. */
+    @Test fun internalNotAFunctionErrorIsARealCatchableTypeError() {
+        assertEquals(
+            "true",
+            str(
+                """
+                var result = 'false';
+                try {
+                    var x = 5;
+                    x();
+                } catch (e) {
+                    result = String(e instanceof TypeError);
+                }
+                """.trimIndent()
+            )
+        )
+    }
+
+    /** Same as above for `JSON.stringify`'s circular-reference error (fixed in an earlier pass): it
+     * must be a catchable `TypeError`, matching real JS, not just some ad hoc thrown value. */
+    @Test fun jsonCircularReferenceErrorIsARealCatchableTypeError() {
+        assertEquals(
+            "true",
+            str(
+                """
+                var result = 'false';
+                var o = {};
+                o.self = o;
+                try {
+                    JSON.stringify(o);
+                } catch (e) {
+                    result = String(e instanceof TypeError);
+                }
+                """.trimIndent()
+            )
+        )
+    }
+
+    /** A user `class` extending the built-in `Error` must chain correctly through `super(...)`: the
+     * resulting instance matches `instanceof` for both its own class and `Error`. */
+    @Test fun customErrorSubclassChainsInstanceofThroughError() {
+        assertEquals(
+            "true,true,my-msg,MyError",
+            str(
+                """
+                class MyError extends Error {
+                    constructor(msg) {
+                        super(msg);
+                        this.name = 'MyError';
+                    }
+                }
+                var e = new MyError('my-msg');
+                var result = (e instanceof MyError) + ',' + (e instanceof Error) + ',' + e.message + ',' + e.name;
+                """.trimIndent()
+            )
+        )
+    }
+
+    // ---- Promise.finally ----
+
+    /** Per spec, `.finally()`'s callback throwing overrides the original settlement (fulfilled or
+     * rejected) with the thrown reason - it must not be silently swallowed. */
+    @Test fun promiseFinallyCallbackThrowingRejectsTheChainInsteadOfBeingSwallowed() {
+        assertEquals(
+            "caught: finally-boom",
+            str(
+                """
+                var result;
+                Promise.resolve(1)
+                    .finally(function() { throw 'finally-boom'; })
+                    .then(function(v) { result = 'resolved: ' + v; })
+                    .catch(function(e) { result = 'caught: ' + e; });
+                """.trimIndent()
+            )
+        )
+    }
+
+    /** `.finally()` on an already-rejected promise: the callback still runs, and if it throws, that
+     * new reason (not the original rejection) is what the following `.catch()` sees. */
+    @Test fun promiseFinallyCallbackThrowingOnARejectedPromiseOverridesTheOriginalReason() {
+        assertEquals(
+            "caught: finally-boom",
+            str(
+                """
+                var result;
+                Promise.reject('original')
+                    .finally(function() { throw 'finally-boom'; })
+                    .catch(function(e) { result = 'caught: ' + e; });
+                """.trimIndent()
+            )
+        )
+    }
+
+    /** `.finally()`'s callback runs but must not alter the value it passes through when it doesn't throw. */
+    @Test fun promiseFinallyPassesThroughTheOriginalValueWhenItDoesNotThrow() {
+        assertNum(
+            42.0,
+            """
+            var ran = false;
+            var result;
+            Promise.resolve(42)
+                .finally(function() { ran = true; })
+                .then(function(v) { result = v; });
+            """.trimIndent()
+        )
+    }
+
     // ---- generators ----
 
     @Test fun generatorYieldsValuesAcrossNextCalls() {
