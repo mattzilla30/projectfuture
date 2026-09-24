@@ -154,6 +154,13 @@ fun strictEquals(l: JsValue, r: JsValue): Boolean = when {
     else -> l === r
 }
 
+/** SameValueZero: like strictEquals, but NaN equals itself and +0/-0 are treated as the same value.
+ * Used by Array.prototype.includes (unlike indexOf, which uses strict equality) and by Map/Set key lookup. */
+fun sameValueZero(l: JsValue, r: JsValue): Boolean = when {
+    l is JsNumber && r is JsNumber -> (l.value.isNaN() && r.value.isNaN()) || l.value == r.value
+    else -> strictEquals(l, r)
+}
+
 fun typeOf(v: JsValue): String = when (v) {
     JsUndefined -> "undefined"
     JsNull -> "object" // matches real JS's famous quirk

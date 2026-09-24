@@ -9,11 +9,17 @@ package com.projectfuture.browser.js
  * while JsObject/JsArray/JsFunction use default reference equality
  * (matching JS objects, which are always keyed by identity).
  */
+/** Map/Set keys use SameValueZero, which (unlike JsNumber's plain data-class equals used elsewhere,
+ * e.g. by strictEquals) treats +0 and -0 as the same key. NaN already round-trips correctly through
+ * a plain Kotlin/JVM `HashMap`/`equals` (Double.equals defines NaN.equals(NaN) == true, unlike `==`),
+ * but +0.0 and -0.0 have distinct bit patterns and so hash/equal differently - normalize -0 to +0 here. */
+private fun mapKey(v: JsValue): JsValue = if (v is JsNumber && v.value == 0.0) JsNumber(0.0) else v
+
 class JsMap : JsObject() {
     private val map = LinkedHashMap<JsValue, JsValue>()
 
     fun putEntry(key: JsValue, value: JsValue) {
-        map[key] = value
+        map[mapKey(key)] = value
     }
 
     /** Backs `for (const [k, v] of someMap)` - see Interpreter.execForIn. */
@@ -22,12 +28,12 @@ class JsMap : JsObject() {
     override fun get(name: String): JsValue = when (name) {
         "size" -> JsNumber(map.size.toDouble())
         "set" -> NativeFunction("set", 2) { _, thisArg, args ->
-            map[args.getOrElse(0) { JsUndefined }] = args.getOrElse(1) { JsUndefined }
+            map[mapKey(args.getOrElse(0) { JsUndefined })] = args.getOrElse(1) { JsUndefined }
             thisArg
         }
-        "get" -> NativeFunction("get", 1) { _, _, args -> map[args.getOrElse(0) { JsUndefined }] ?: JsUndefined }
-        "has" -> NativeFunction("has", 1) { _, _, args -> JsBoolean(map.containsKey(args.getOrElse(0) { JsUndefined })) }
-        "delete" -> NativeFunction("delete", 1) { _, _, args -> JsBoolean(map.remove(args.getOrElse(0) { JsUndefined }) != null) }
+        "get" -> NativeFunction("get", 1) { _, _, args -> map[mapKey(args.getOrElse(0) { JsUndefined })] ?: JsUndefined }
+        "has" -> NativeFunction("has", 1) { _, _, args -> JsBoolean(map.containsKey(mapKey(args.getOrElse(0) { JsUndefined }))) }
+        "delete" -> NativeFunction("delete", 1) { _, _, args -> JsBoolean(map.remove(mapKey(args.getOrElse(0) { JsUndefined })) != null) }
         "clear" -> NativeFunction("clear", 0) { _, _, _ -> map.clear(); JsUndefined }
         "forEach" -> NativeFunction("forEach", 1) { interpreter, thisArg, args ->
             val fn = args.getOrNull(0) as? JsFunction
@@ -47,7 +53,7 @@ class JsSet : JsObject() {
     private val values = LinkedHashSet<JsValue>()
 
     fun addValue(v: JsValue) {
-        values.add(v)
+        values.add(mapKey(v))
     }
 
     /** Backs `for (const v of someSet)` - see Interpreter.execForIn. */
@@ -55,9 +61,9 @@ class JsSet : JsObject() {
 
     override fun get(name: String): JsValue = when (name) {
         "size" -> JsNumber(values.size.toDouble())
-        "add" -> NativeFunction("add", 1) { _, thisArg, args -> values.add(args.getOrElse(0) { JsUndefined }); thisArg }
-        "has" -> NativeFunction("has", 1) { _, _, args -> JsBoolean(values.contains(args.getOrElse(0) { JsUndefined })) }
-        "delete" -> NativeFunction("delete", 1) { _, _, args -> JsBoolean(values.remove(args.getOrElse(0) { JsUndefined })) }
+        "add" -> NativeFunction("add", 1) { _, thisArg, args -> values.add(mapKey(args.getOrElse(0) { JsUndefined })); thisArg }
+        "has" -> NativeFunction("has", 1) { _, _, args -> JsBoolean(values.contains(mapKey(args.getOrElse(0) { JsUndefined }))) }
+        "delete" -> NativeFunction("delete", 1) { _, _, args -> JsBoolean(values.remove(mapKey(args.getOrElse(0) { JsUndefined }))) }
         "clear" -> NativeFunction("clear", 0) { _, _, _ -> values.clear(); JsUndefined }
         "forEach" -> NativeFunction("forEach", 1) { interpreter, thisArg, args ->
             val fn = args.getOrNull(0) as? JsFunction

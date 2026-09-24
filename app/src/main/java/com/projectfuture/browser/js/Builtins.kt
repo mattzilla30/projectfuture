@@ -111,7 +111,13 @@ private fun jsonStringify(v: JsValue, seen: MutableSet<JsObject>): String = when
     is JsObject -> {
         if (!seen.add(v)) throw jsError("Converting circular structure to JSON")
         try {
-            "{" + v.ownKeys().joinToString(",") { k -> "\"$k\":" + jsonStringify(v.get(k), seen) } + "}"
+            // Per spec, undefined/function-valued object properties are omitted entirely (unlike array
+            // elements, which become "null" - see the JsArray branch above), so a straight per-key map
+            // would wrongly emit e.g. {"b":null} for `{a:1,b:undefined}`.
+            "{" + v.ownKeys().mapNotNull { k ->
+                val value = v.get(k)
+                if (value == JsUndefined || value is JsFunction) null else "\"$k\":" + jsonStringify(value, seen)
+            }.joinToString(",") + "}"
         } finally {
             seen.remove(v)
         }
@@ -212,6 +218,11 @@ private fun numberMethod(n: JsNumber, key: String, args: List<JsValue>): JsValue
     else -> null
 }
 
+private fun flattenToDepth(elements: List<JsValue>, depth: Int): List<JsValue> {
+    if (depth <= 0) return elements
+    return elements.flatMap { if (it is JsArray) flattenToDepth(it.elements, depth - 1) else listOf(it) }
+}
+
 private fun normalizeIndex(v: JsValue, len: Int, default: Int): Int {
     if (v == JsUndefined) return default
     var i = toNumber(v).toInt()
@@ -240,7 +251,9 @@ private fun arrayMethod(interpreter: Interpreter, arr: JsArray, key: String, arg
         JsArray(removed)
     }
     "indexOf" -> JsNumber(arr.elements.indexOfFirst { strictEquals(it, arg(args, 0)) }.toDouble())
-    "includes" -> JsBoolean(arr.elements.any { strictEquals(it, arg(args, 0)) })
+    "lastIndexOf" -> JsNumber(arr.elements.indexOfLast { strictEquals(it, arg(args, 0)) }.toDouble())
+    // Per spec, includes() uses SameValueZero (unlike indexOf's strict equality), so it finds NaN.
+    "includes" -> JsBoolean(arr.elements.any { sameValueZero(it, arg(args, 0)) })
     "join" -> {
         val sep = if (args.isNotEmpty()) toJsString(args[0]) else ","
         JsString(arr.elements.joinToString(sep) { if (it == JsUndefined || it == JsNull) "" else toJsString(it) })
@@ -282,6 +295,20 @@ private fun arrayMethod(interpreter: Interpreter, arr: JsArray, key: String, arg
             }.toDouble()
         )
     }
+    "findLast" -> {
+        val fn = args.getOrNull(0) as? JsFunction
+        arr.elements.toList().withIndex().lastOrNull { (idx, v) ->
+            fn != null && isTruthy(fn.call(interpreter, JsUndefined, listOf(v, JsNumber(idx.toDouble()), arr)))
+        }?.value ?: JsUndefined
+    }
+    "findLastIndex" -> {
+        val fn = args.getOrNull(0) as? JsFunction
+        JsNumber(
+            (arr.elements.toList().withIndex().indexOfLast { (idx, v) ->
+                fn != null && isTruthy(fn.call(interpreter, JsUndefined, listOf(v, JsNumber(idx.toDouble()), arr)))
+            }).toDouble()
+        )
+    }
     "reduce" -> {
         val fn = args.getOrNull(0) as? JsFunction
         var acc: JsValue
@@ -290,7 +317,8 @@ private fun arrayMethod(interpreter: Interpreter, arr: JsArray, key: String, arg
             acc = args[1]
             startIdx = 0
         } else {
-            acc = arr.elements.getOrElse(0) { JsUndefined }
+            if (arr.elements.isEmpty()) throw jsError("Reduce of empty array with no initial value")
+            acc = arr.elements[0]
             startIdx = 1
         }
         for (idx in startIdx until arr.elements.size) {
@@ -312,7 +340,10 @@ private fun arrayMethod(interpreter: Interpreter, arr: JsArray, key: String, arg
         arr.elements.addAll(sorted)
         arr
     }
-    "flat" -> JsArray(arr.elements.flatMap { if (it is JsArray) it.elements else listOf(it) }.toMutableList())
+    "flat" -> {
+        val depth = if (args.isNotEmpty()) toNumber(args[0]).let { if (it.isNaN()) 0 else it.toInt() } else 1
+        JsArray(flattenToDepth(arr.elements, depth).toMutableList())
+    }
     "flatMap" -> {
         val fn = args.getOrNull(0) as? JsFunction
         val mapped = arr.elements.toList().mapIndexed { idx, v -> fn?.call(interpreter, JsUndefined, listOf(v, JsNumber(idx.toDouble()), arr)) ?: JsUndefined }
@@ -342,7 +373,8 @@ private fun arrayMethod(interpreter: Interpreter, arr: JsArray, key: String, arg
             acc = args[1]
             startIdx = arr.elements.size - 1
         } else {
-            acc = arr.elements.lastOrNull() ?: JsUndefined
+            if (arr.elements.isEmpty()) throw jsError("Reduce of empty array with no initial value")
+            acc = arr.elements.last()
             startIdx = arr.elements.size - 2
         }
         for (idx in startIdx downTo 0) {
@@ -385,7 +417,7 @@ private fun stringMethod(interpreter: Interpreter, s: JsString, key: String, arg
             val sep = args.getOrNull(0)
             when {
                 args.isEmpty() || sep == JsUndefined -> JsArray(mutableListOf(JsString(v)))
-                sep is JsRegExp -> JsArray(sep.kotlinRegex.split(v).map { JsString(it) as JsValue }.toMutableList())
+                sep is JsRegExp -> JsArray(splitWithCaptureGroups(v, sep.kotlinRegex).toMutableList())
                 else -> {
                     val sepStr = toJsString(sep!!)
                     val parts = if (sepStr.isEmpty()) v.map { it.toString() } else v.split(sepStr)
@@ -425,6 +457,22 @@ private fun stringMethod(interpreter: Interpreter, s: JsString, key: String, arg
         "concat" -> JsString(v + args.joinToString("") { toJsString(it) })
         else -> null
     }
+}
+
+/** `String.split(regex)`, but per spec (and unlike Kotlin's `Regex.split`), any capture groups in the
+ * separator appear in the result interleaved between the surrounding pieces - e.g.
+ * `"a1b2c".split(/(\d)/)` is `["a","1","b","2","c"]`, not just `["a","b","c"]`. */
+private fun splitWithCaptureGroups(v: String, regex: Regex): List<JsValue> {
+    val result = ArrayList<JsValue>()
+    var last = 0
+    for (m in regex.findAll(v)) {
+        if (m.range.isEmpty() && m.range.first == last && last == v.length) continue
+        result.add(JsString(v.substring(last, m.range.first)))
+        for (g in m.groupValues.drop(1)) result.add(JsString(g))
+        last = m.range.last + 1
+    }
+    result.add(JsString(v.substring(last)))
+    return result
 }
 
 private fun padStr(s: String, targetLen: Int, pad: String, start: Boolean): String {
