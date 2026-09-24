@@ -143,7 +143,17 @@ class CanvasContext2D(val bitmap: Bitmap) : JsObject() {
         "arc" -> NativeFunction("arc", 5) { _, _, a ->
             val anticlockwise = (a.getOrNull(5) as? JsBoolean)?.value ?: false
             computeArcGeometry(f(a, 0), f(a, 1), f(a, 2), f(a, 3), f(a, 4), anticlockwise)?.let { g ->
-                path.addArc(g[0], g[1], g[2], g[3], g[4], g[5])
+                // Path.addArc() always starts a brand-new, disconnected contour (Android/Skia:
+                // "add the arc as a new contour"). The Canvas 2D spec instead requires arc() to
+                // draw a straight connecting line from the current point to the arc's start
+                // when the path already has one (e.g. after moveTo/lineTo/rect), and only
+                // start a fresh subpath when the path is empty. Path.arcTo(..., forceMoveTo =
+                // false) is Android's API for exactly that: it inserts the connecting lineTo
+                // when there's a prior point, and an implicit moveTo when the path is empty.
+                // With addArc, code like `ctx.moveTo(10,10); ctx.arc(50,50,20,0,Math.PI);
+                // ctx.fill()` silently drew two disconnected subpaths instead of one joined
+                // shape.
+                path.arcTo(g[0], g[1], g[2], g[3], g[4], g[5], false)
             }
             JsUndefined
         }
