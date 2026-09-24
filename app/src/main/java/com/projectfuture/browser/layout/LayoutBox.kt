@@ -191,6 +191,46 @@ internal fun resolveCssImageHeight(raw: String?, fontSizePx: Float): Float? {
     return lengthValue(raw, 0f, fontSizePx)
 }
 
+/**
+ * Sums a laid-out line's fragment widths for `text-align` purposes
+ * (extracted from [BlockLayout.flushLine] so it's testable without a real
+ * android.graphics.Paint, which plain JVM unit tests can't drive - see
+ * [resolveImageSize]'s doc for why). Trailing whitespace after the line's
+ * LAST fragment is excluded: CSS collapses/hangs whitespace at a line
+ * break rather than counting it toward the line's content width, so
+ * including it (as this used to) shifts `text-align: right`/`center` lines
+ * left by one space's width versus where the text actually ends. A
+ * trailing space on a fragment that ISN'T last still counts normally - it
+ * sits between two words that are both actually on this line.
+ */
+internal fun sumLineFragmentWidths(widths: List<Float>, trailingSpace: List<Boolean>, spaceWidths: List<Float>): Float {
+    var total = 0f
+    for (i in widths.indices) {
+        total += widths[i]
+        if (trailingSpace[i] && i != widths.lastIndex) total += spaceWidths[i]
+    }
+    return total
+}
+
+/**
+ * Resolves an inline box's effective `text-align` (extracted from
+ * [BlockLayout.layout]'s INLINE branch for testability, same reasoning as
+ * [resolveImageSize]): an explicit value wins outright, except `left` in an
+ * RTL paragraph flips to `right` (mirrors how `text-align: left` is
+ * commonly authored to mean "the start edge" rather than literally the
+ * physical left). With NO explicit value, an RTL paragraph must still
+ * default to `right` - a real browser's UA stylesheet aligns RTL block
+ * content to its start (= right) edge by default, the same way LTR content
+ * defaults to left. Falling through to the plain `"left"` default
+ * regardless of [rtlContext] (the previous behavior) leaves a short RTL
+ * line's reversed-order words flush against the box's LEFT edge - visually
+ * wrong horizontal positioning, not just word order - with an
+ * unaccounted-for gap on the right where the paragraph should start.
+ */
+internal fun resolveTextAlign(explicitTextAlign: String?, rtlContext: Boolean): String =
+    explicitTextAlign?.let { if (it == "left" && rtlContext) "right" else it }
+        ?: if (rtlContext) "right" else "left"
+
 class DocumentLayout(private val root: ElementNode) {
     var width = 0f
         private set
@@ -261,6 +301,17 @@ class BlockLayout(
     private var cursorY = 0f
     private val lineBuffer = ArrayList<LineFragment>()
     private var rtlContext = false
+
+    /**
+     * The most recently flushed line's height (ascent+descent, leaded), used
+     * by [forceLineBreak] to advance `cursorY` for a `<br>` that lands on an
+     * already-empty line buffer (e.g. a second consecutive `<br>`, or a
+     * `<br>` with no preceding text at all) - see its doc for why that case
+     * needs a fallback rather than just calling [flushLine]. Initialized to
+     * a plain default-font-size estimate (no fragment has been measured yet
+     * to derive a real one from).
+     */
+    private var lastLineHeight = 16f * LINE_LEADING
     private var textAlign = "left"
 
     private sealed class LineFragment(val trailingSpace: Boolean, val sourceElement: ElementNode?)
@@ -461,7 +512,7 @@ class BlockLayout(
                 lineBuffer.clear()
                 inlineDisplay.clear()
                 rtlContext = detectParagraphIsRtl(node)
-                textAlign = node.style["text-align"]?.let { if (it == "left" && rtlContext) "right" else it } ?: "left"
+                textAlign = resolveTextAlign(node.style["text-align"], rtlContext)
                 recurse(node, currentLinkHref = null)
                 flushLine()
                 height = forcedHeight ?: (metrics.explicitContentHeight ?: cursorY)
@@ -894,7 +945,7 @@ class BlockLayout(
             is ElementNode -> {
                 if (isSkipped(n)) return
                 if (n.tag == "br") {
-                    flushLine()
+                    forceLineBreak()
                     return
                 }
                 if (n.tag == "img" || n.tag == "svg" || n.tag == "canvas") {
@@ -1118,6 +1169,23 @@ class BlockLayout(
     private fun spaceWidthFor(fragment: LineFragment): Float =
         if (fragment is TextFragment) FontCache.paintFor(fragment.style).measureText(" ") else 0f
 
+    /**
+     * A `<br>` forces a break even when there's nothing queued on the
+     * current line to flush - e.g. a second consecutive `<br>` (which should
+     * produce a blank line between two lines of text) or a `<br>` with no
+     * preceding content at all (which should still occupy one line's
+     * height). [flushLine] is a no-op on an empty buffer (nothing to
+     * position or measure), so without this, back-to-back `<br>`s collapse
+     * into a single break and a `<br>`-only paragraph reports zero height.
+     */
+    private fun forceLineBreak() {
+        if (lineBuffer.isNotEmpty()) {
+            flushLine()
+        } else {
+            cursorY += lastLineHeight
+        }
+    }
+
     private fun flushLine() {
         if (lineBuffer.isEmpty()) return
         // Positions are computed here (not incrementally in addFragment) so
@@ -1148,11 +1216,7 @@ class BlockLayout(
             }
         }
 
-        var lineContentWidth = 0f
-        for ((i, f) in fragments.withIndex()) {
-            lineContentWidth += widths[i]
-            if (f.trailingSpace) lineContentWidth += spaceWidthFor(f)
-        }
+        val lineContentWidth = sumLineFragmentWidths(widths.toList(), fragments.map { it.trailingSpace }, fragments.map { spaceWidthFor(it) })
         val effectiveWidth = width - lineLeftInset - lineRightInset
         val alignOffset = when (textAlign) {
             "right" -> (effectiveWidth - lineContentWidth).coerceAtLeast(0f)
@@ -1254,6 +1318,7 @@ class BlockLayout(
             runningX += widths[i]
             if (f.trailingSpace) runningX += spaceWidthFor(f)
         }
+        lastLineHeight = (maxAscent + maxDescent) * LINE_LEADING
         cursorY = (baseline + maxDescent) + (maxAscent + maxDescent) * (LINE_LEADING - 1f)
         lineBuffer.clear()
         cursorX = 0f
