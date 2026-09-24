@@ -129,7 +129,7 @@ class CssParser(private val source: String, private val viewportWidth: Float = 3
 
     private fun parseDeclarations(body: String): Map<String, String> {
         val props = LinkedHashMap<String, String>()
-        for (decl in body.split(';')) {
+        for (decl in splitDeclarations(body)) {
             val colon = decl.indexOf(':')
             if (colon == -1) continue
             val key = decl.substring(0, colon).trim().lowercase()
@@ -137,6 +137,29 @@ class CssParser(private val source: String, private val viewportWidth: Float = 3
             if (key.isNotEmpty() && value.isNotEmpty()) props[key] = value
         }
         return props
+    }
+
+    /** Splits a declaration block on `;`, skipping semicolons inside quotes or parentheses (`url(data:font/woff2;base64,...)`). */
+    private fun splitDeclarations(body: String): List<String> {
+        if (body.indexOf('(') == -1 && body.indexOf('"') == -1 && body.indexOf('\'') == -1) return body.split(';')
+        val out = ArrayList<String>()
+        var depth = 0
+        var quote = 0.toChar()
+        var start = 0
+        var i = 0
+        while (i < body.length) {
+            val c = body[i]
+            when {
+                quote != 0.toChar() -> if (c == '\\') i++ else if (c == quote) quote = 0.toChar()
+                c == '"' || c == '\'' -> quote = c
+                c == '(' -> depth++
+                c == ')' -> if (depth > 0) depth--
+                c == ';' && depth == 0 -> { out.add(body.substring(start, i)); start = i + 1 }
+            }
+            i++
+        }
+        out.add(body.substring(start))
+        return out
     }
 
     /** Parses one CSS selector independent of any stylesheet body - used by `document.querySelector`. */

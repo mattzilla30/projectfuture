@@ -2,6 +2,9 @@ package com.projectfuture.browser.ipc
 
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Typeface
+import com.projectfuture.browser.layout.FontCache
+import com.projectfuture.browser.layout.remoteFonts
 import com.projectfuture.browser.html.ElementNode
 import com.projectfuture.browser.layout.DisplayCommand
 import com.projectfuture.browser.layout.DrawFormControl
@@ -34,6 +37,10 @@ class UiDisplayListConverter {
     private val images = HashMap<Int, Bitmap>()
     /** tag/inputType for each elementId, learned from MSG_ELEMENT_META - see that message's doc. Looked up lazily when a shadow is first built for an id, so ordering only matters relative to that (guaranteed: the engine always sends an id's meta before/alongside the first display list or reply referencing it). */
     private val metaByElementId = HashMap<Int, Pair<String, String?>>()
+    /** Page font family (lowercased) to its unique key in [remoteFonts]. */
+    private val fontKeys = HashMap<String, String>()
+    private val converterId = nextConverterId.getAndIncrement()
+    private var fontGeneration = 0
 
     /**
      * Clears every per-document cache - the UI-process twin of
@@ -55,6 +62,18 @@ class UiDisplayListConverter {
         idsByShadowElement.clear()
         images.clear()
         metaByElementId.clear()
+        if (fontKeys.isNotEmpty()) {
+            for (key in fontKeys.values) remoteFonts.remove(key)
+            fontKeys.clear()
+            FontCache.clear()
+        }
+        fontGeneration++
+    }
+
+    fun onFontReceived(family: String, typeface: Typeface) {
+        val key = "@remote/$converterId/$fontGeneration/$family"
+        remoteFonts[key] = typeface
+        fontKeys[family.lowercase()] = key
     }
 
     fun onImageReceived(imageId: Int, pngBytes: ByteArray) {
@@ -102,6 +121,11 @@ class UiDisplayListConverter {
 
     private fun textStyle(style: WireTextStyle) = TextStyle(
         style.sizePx, style.bold, style.italic, style.monospace, style.colorArgb,
-        style.underline, style.strikethrough, style.linkHref, style.fontFamilyName
+        style.underline, style.strikethrough, style.linkHref,
+        style.fontFamilyName?.let { fontKeys[it.lowercase()] ?: it }
     )
+
+    private companion object {
+        val nextConverterId = java.util.concurrent.atomic.AtomicInteger(1)
+    }
 }

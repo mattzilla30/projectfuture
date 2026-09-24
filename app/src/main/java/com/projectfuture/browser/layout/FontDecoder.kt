@@ -10,18 +10,8 @@ import java.util.zip.Inflater
  * `java.util.zip.Inflater` - a standard JDK/Android compression utility,
  * the same tier as `BitmapFactory` for images, not "browser engine" logic.
  *
- * WOFF2 is still NOT supported here, even though a Brotli decoder now
- * exists in this codebase (`net/BrotliDecoder.kt`, added for
- * `Content-Encoding: br`) and could in principle decompress a WOFF2
- * file's Brotli stream. WOFF2 needs more than raw decompression, though:
- * it also reorders and re-encodes the `glyf`/`loca` glyph tables into a
- * transposed, delta-coded transform format that has to be reconstructed
- * back into normal SFNT table bytes - a second, separate spec on top of
- * Brotli. Since WOFF2 is the default format most font CDNs (e.g. Google
- * Fonts) serve today, a `@font-face` pointing only at a `.woff2` file will
- * simply fail to load and fall back to the inherited/system font - this is
- * a real, known gap, not a bug, and unlike the Brotli-for-HTTP-bodies case
- * it wasn't in scope for this pass.
+ * WOFF2 goes through [Woff2Decoder]: Brotli decompression plus rebuilding
+ * the transformed glyf, loca and hmtx tables.
  *
  * This conversion is unverified beyond compiling: there's no emulator or
  * device available in this environment to visually confirm a WOFF file
@@ -37,8 +27,9 @@ object FontDecoder {
         val tag = u32(bytes, 0)
         return when (tag) {
             0x774F4646L -> woffToSfnt(bytes) // 'wOFF'
+            0x774F4632L -> Woff2Decoder.decode(bytes) // 'wOF2'
             0x00010000L, 0x4F54544FL, 0x74727565L -> bytes // sfnt v1, 'OTTO', 'true' - already usable directly
-            else -> null // includes 'wOF2' (WOFF2) and anything unrecognized
+            else -> null
         }
     }
 
@@ -91,7 +82,18 @@ object FontDecoder {
             }
             decoded.add(Entry(e, data))
         }
-        decoded.sortBy { it.entry.tag }
+        return assembleSfnt(flavor, decoded.map { it.entry.tag to it.data })
+    }
+
+
+    /**
+     * Writes an sfnt file from (tag, table bytes) pairs: sorted table directory, 4-byte padding,
+     * per-table checksums and the head table's checkSumAdjustment. The head table's
+     * checkSumAdjustment field must already be zeroed.
+     */
+    internal fun assembleSfnt(flavor: Long, tables: List<Pair<Long, ByteArray>>): ByteArray {
+        val sorted = tables.sortedBy { it.first }
+        val numTables = sorted.size
 
         val entrySelector = 31 - Integer.numberOfLeadingZeros(numTables)
         val searchRange = (1 shl entrySelector) * 16
@@ -108,10 +110,9 @@ object FontDecoder {
         var headOffset = -1
         val directory = ByteArrayOutputStream()
         val dataSection = ByteArrayOutputStream()
-        for (d in decoded) {
-            val data = d.data
-            if (d.entry.tag == 0x68656164L) headOffset = dataOffset // 'head'
-            writeU32(directory, d.entry.tag)
+        for ((tag, data) in sorted) {
+            if (tag == 0x68656164L) headOffset = dataOffset // 'head'
+            writeU32(directory, tag)
             writeU32(directory, checksum(data))
             writeU32(directory, dataOffset.toLong())
             writeU32(directory, data.size.toLong())
@@ -183,11 +184,11 @@ object FontDecoder {
 
     private fun byteAt(data: ByteArray, i: Int): Long = if (i < data.size) (data[i].toLong() and 0xFF) else 0L
 
-    private fun u32(b: ByteArray, off: Int): Long =
+    internal fun u32(b: ByteArray, off: Int): Long =
         ((b[off].toLong() and 0xFF) shl 24) or ((b[off + 1].toLong() and 0xFF) shl 16) or
             ((b[off + 2].toLong() and 0xFF) shl 8) or (b[off + 3].toLong() and 0xFF)
 
-    private fun u16(b: ByteArray, off: Int): Int =
+    internal fun u16(b: ByteArray, off: Int): Int =
         ((b[off].toInt() and 0xFF) shl 8) or (b[off + 1].toInt() and 0xFF)
 
     private fun writeU32(out: ByteArrayOutputStream, v: Long) {

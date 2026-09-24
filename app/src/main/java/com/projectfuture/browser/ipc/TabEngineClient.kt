@@ -18,6 +18,7 @@ import com.projectfuture.browser.html.ElementNode
 import com.projectfuture.browser.layout.DisplayCommand
 import com.projectfuture.browser.net.Url
 import java.util.ArrayDeque
+import com.projectfuture.browser.layout.typefaceFromSfnt
 
 /** One `<option>` of a `<select>`, as reported by [TabEngineClient.requestSelectOptions] - [node] is a shadow element to hand straight to [TabEngineClient.setSelectValue]. */
 data class RemoteSelectOption(val node: ElementNode, val label: String, val selected: Boolean)
@@ -130,6 +131,11 @@ class TabEngineClient(private val context: Context, tabIndex: Int, val isPrivate
                     val id = msg.data.getInt(TabEngineProtocol.KEY_IMAGE_ID)
                     val bytes = IpcPayload.take(msg.data, TabEngineProtocol.KEY_IMAGE_BYTES, context.cacheDir) ?: return
                     converter.onImageReceived(id, bytes)
+                }
+                TabEngineProtocol.MSG_FONT_DATA -> {
+                    val family = msg.data.getString(TabEngineProtocol.KEY_FONT_FAMILY) ?: return
+                    val bytes = IpcPayload.take(msg.data, TabEngineProtocol.KEY_FONT_BYTES, context.cacheDir) ?: return
+                    typefaceFromSfnt(bytes, context.cacheDir)?.let { converter.onFontReceived(family, it) }
                 }
                 TabEngineProtocol.MSG_ELEMENT_META -> {
                     val payload = IpcPayload.take(msg.data, TabEngineProtocol.KEY_PAYLOAD, context.cacheDir) ?: return

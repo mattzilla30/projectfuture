@@ -77,6 +77,8 @@ abstract class TabEngineServiceBase : Service() {
     private var isPrivateTab = false
     private val elementIds = ElementIdRegistry()
     private val converter = EngineToUiConverter(elementIds)
+    /** Font data the UI process already has for the current document, by identity so a reloaded font is sent again. */
+    private val sentFonts = java.util.IdentityHashMap<ByteArray, Unit>()
 
     override fun onCreate() {
         super.onCreate()
@@ -205,6 +207,7 @@ abstract class TabEngineServiceBase : Service() {
             // TabEngineClient's MSG_STATE_LOADED handling and UiDisplayListConverter.reset's doc.
             elementIds.reset()
             converter.reset()
+            sentFonts.clear()
             send(stateMessage(TabEngineProtocol.MSG_STATE_LOADED, state.url.toString(), state.title))
             sendDisplayList()
             sendTabInfo()
@@ -287,6 +290,7 @@ abstract class TabEngineServiceBase : Service() {
         try {
             val (wireCommands, newImages, newMeta) = converter.convert(currentTab.displayList)
             for ((id, bitmap) in newImages) sendImage(id, bitmap)
+            sendFonts(currentTab.currentFontData)
             if (newMeta.isNotEmpty()) sendMessage(TabEngineProtocol.MSG_ELEMENT_META) {
                 IpcPayload.put(this, TabEngineProtocol.KEY_PAYLOAD, ElementMetaCodec.encode(newMeta), cacheDir)
             }
@@ -306,6 +310,17 @@ abstract class TabEngineServiceBase : Service() {
             // Report it rather than leave a blank page that looks like it loaded fine.
             val url = currentTab.currentUrl?.toString() ?: return
             send(stateMessage(TabEngineProtocol.MSG_STATE_ERROR, url, "Couldn't display this page: ${e.message ?: e.javaClass.simpleName}"))
+        }
+    }
+
+    private fun sendFonts(fonts: Map<String, ByteArray>) {
+        for ((family, sfnt) in fonts) {
+            if (sentFonts.containsKey(sfnt)) continue
+            sentFonts[sfnt] = Unit
+            sendMessage(TabEngineProtocol.MSG_FONT_DATA) {
+                putString(TabEngineProtocol.KEY_FONT_FAMILY, family)
+                IpcPayload.put(this, TabEngineProtocol.KEY_FONT_BYTES, sfnt, cacheDir)
+            }
         }
     }
 

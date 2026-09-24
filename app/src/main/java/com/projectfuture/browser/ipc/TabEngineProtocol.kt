@@ -75,6 +75,8 @@ object TabEngineProtocol {
     const val MSG_MANIFEST_INFO = 112
     const val MSG_DOWNLOAD_REQUESTED = 113
     const val MSG_LOGIN_FORM_SUBMITTED = 114
+    /** One web font's SFNT bytes ([KEY_FONT_FAMILY], [KEY_FONT_BYTES]), sent once per family per document before the display list that uses it. */
+    const val MSG_FONT_DATA = 115
 
     const val KEY_URL = "url"
     const val KEY_ELEMENT_ID = "element_id"
@@ -85,6 +87,8 @@ object TabEngineProtocol {
     const val KEY_CONTENT_HEIGHT = "content_height"
     const val KEY_IMAGE_ID = "image_id"
     const val KEY_IMAGE_BYTES = "image_bytes"
+    const val KEY_FONT_FAMILY = "font_family"
+    const val KEY_FONT_BYTES = "font_bytes"
     const val KEY_TITLE = "title"
     const val KEY_MESSAGE = "message"
     const val KEY_IS_PRIVATE = "is_private"

@@ -44,6 +44,8 @@ import com.projectfuture.browser.layout.DisplayCommand
 import com.projectfuture.browser.layout.DocumentLayout
 import com.projectfuture.browser.layout.FontDecoder
 import com.projectfuture.browser.layout.customFonts
+import com.projectfuture.browser.layout.typefaceFromSfnt
+import com.projectfuture.browser.net.decodeDataUrl
 import com.projectfuture.browser.layout.textScaleFactor
 import com.projectfuture.browser.net.CertificateExceptions
 import com.projectfuture.browser.net.HttpResponse
@@ -184,6 +186,9 @@ class Tab(
     private var viewportWidth: Float = 0f
     private var viewportHeight: Float = 0f
     private var currentImages: Map<ElementNode, Bitmap> = emptyMap()
+    /** SFNT bytes of the current document's web fonts by lowercased family, for the UI process (see TabEngineServiceBase.sendFonts). */
+    var currentFontData: Map<String, ByteArray> = emptyMap()
+        private set
     private var currentInterpreter: Interpreter? = null
     private var currentDomBridge: DomBridge? = null
     private var currentAuthorRules: List<CssRule> = emptyList()
@@ -749,13 +754,14 @@ class Tab(
                 val fonts = loadFontFaces(authorCss.fontFaces, response.url, csp)
                 BrowserLog.i(
                     "load",
-                    "#$navigation styled: ${authorCss.rules.size} css rules, ${images.size} images, ${fonts.size} fonts at ${ms()}ms"
+                    "#$navigation styled: ${authorCss.rules.size} css rules, ${images.size} images, ${fonts.typefaces.size} fonts at ${ms()}ms"
                 )
                 postMain {
                     currentUrl = response.url
                     currentDoc = root
                     currentImages = images
-                    customFonts = fonts
+                    customFonts = fonts.typefaces
+                    currentFontData = fonts.sfnt
                     currentInterpreter = interpreter
                     currentDomBridge = bridge
                     currentAuthorRules = authorCss.rules
@@ -1938,53 +1944,54 @@ class Tab(
         return AuthorCss(rules, fontFaces)
     }
 
-    /**
-     * Fetches and converts each @font-face's font file to SFNT (see
-     * FontDecoder), then hands it to Typeface via a temp cache file -
-     * Typeface.createFromFile works across all supported API levels,
-     * unlike the newer ByteBuffer-based builder. The first successfully
-     * loaded font for a given family wins; later ones for the same family
-     * (e.g. bold/italic variants declared separately) are ignored, and
-     * FontCache synthesizes bold/italic from whichever one loaded.
-     */
-    private class PendingFont(val family: String, val future: Future<ByteArray?>?)
+    /** Typefaces for layout in this process, and their SFNT bytes for the UI process that draws them. */
+    private class LoadedFonts(val typefaces: Map<String, Typeface>, val sfnt: Map<String, ByteArray>)
 
     /**
-     * Font files are now fetched concurrently (see [subresourceExecutor]'s doc), but "the first
-     * successfully loaded font for a given family wins" is still resolved sequentially afterward,
-     * in the original entries order, so that guarantee holds regardless of which network fetch
-     * happens to finish first.
+     * Loads one font file per `@font-face` family. A family usually has many rules (one per
+     * unicode-range subset, weight and style), and fetching all of them wastes bandwidth, so the
+     * candidates are ranked: Latin coverage first, then weight closest to 400, then upright. The
+     * best candidate of every family is fetched concurrently (see [subresourceExecutor]); if it
+     * fails to fetch or decode, the next one is tried. FontCache synthesizes bold and italic from
+     * the loaded file.
      */
-    private fun loadFontFaces(entries: List<Pair<FontFaceRule, Url>>, pageUrl: Url, csp: ContentSecurityPolicy): Map<String, Typeface> {
-        val pending = entries.map { (rule, styleSheetBase) ->
-            val fontUrl = styleSheetBase.resolveOrNull(rule.srcUrl)
-            val future = if (fontUrl == null || isMixedContent(pageUrl, fontUrl) || !csp.allowsFontSrc(pageUrl, fontUrl) || TrackingProtection.isBlocked(pageUrl, fontUrl)) {
-                null
-            } else {
-                subresourceExecutor.submit(Callable {
-                    try { fontUrl.fetchBytes(allowCookies = !isPrivate).body } catch (_: Exception) { null }
-                })
+    private fun loadFontFaces(entries: List<Pair<FontFaceRule, Url>>, pageUrl: Url, csp: ContentSecurityPolicy): LoadedFonts {
+        // Each candidate is a loader keyed by its URL text, so duplicates collapse.
+        val byFamily = LinkedHashMap<String, LinkedHashMap<String, () -> ByteArray?>>()
+        val ranked = entries.sortedWith(
+            compareBy<Pair<FontFaceRule, Url>>({ !it.first.coversLatin }, { Math.abs(it.first.weight - 400) }, { it.first.italic })
+        )
+        for ((rule, styleSheetBase) in ranked) {
+            val candidates = byFamily.getOrPut(rule.family.lowercase()) { LinkedHashMap() }
+            if (rule.srcUrl.startsWith("data:", ignoreCase = true)) {
+                candidates.getOrPut(rule.srcUrl.take(200) + rule.srcUrl.length) { { decodeDataUrl(rule.srcUrl) } }
+                continue
             }
-            PendingFont(rule.family.lowercase(), future)
+            val fontUrl = styleSheetBase.resolveOrNull(rule.srcUrl) ?: continue
+            if (isMixedContent(pageUrl, fontUrl) || !csp.allowsFontSrc(pageUrl, fontUrl) || TrackingProtection.isBlocked(pageUrl, fontUrl)) continue
+            candidates.getOrPut(fontUrl.toString()) {
+                { try { fontUrl.fetchBytes(allowCookies = !isPrivate).body } catch (_: Exception) { null } }
+            }
         }
-        val result = HashMap<String, Typeface>()
-        for (p in pending) {
-            if (result.containsKey(p.family)) continue
-            val bytes = p.future?.get() ?: continue
-            try {
-                val sfnt = FontDecoder.toSfnt(bytes) ?: continue
-                val tempFile = File.createTempFile("font", ".ttf", context.cacheDir)
-                try {
-                    tempFile.writeBytes(sfnt)
-                    result[p.family] = Typeface.createFromFile(tempFile)
-                } finally {
-                    tempFile.delete()
+        val first = byFamily.filterValues { it.isNotEmpty() }.mapValues { (_, c) -> subresourceExecutor.submit(Callable { c.values.first()() }) }
+
+        val typefaces = HashMap<String, Typeface>()
+        val sfntByFamily = HashMap<String, ByteArray>()
+        for ((family, future) in first) {
+            for ((i, entry) in byFamily.getValue(family).entries.withIndex().take(3)) {
+                val bytes = (if (i == 0) future.get() else entry.value()) ?: continue
+                val sfnt = FontDecoder.toSfnt(bytes)
+                if (sfnt == null) {
+                    BrowserLog.w("fonts", "couldn't decode $family from ${entry.key.take(120)} (${bytes.size}B)")
+                    continue
                 }
-            } catch (_: Exception) {
-                // Unsupported (e.g. WOFF2) or broken font file: skip it, inherited/system font still applies.
+                val typeface = typefaceFromSfnt(sfnt, context.cacheDir) ?: continue
+                typefaces[family] = typeface
+                sfntByFamily[family] = sfnt
+                break
             }
         }
-        return result
+        return LoadedFonts(typefaces, sfntByFamily)
     }
 
     private fun extractTitle(root: ElementNode): String? {

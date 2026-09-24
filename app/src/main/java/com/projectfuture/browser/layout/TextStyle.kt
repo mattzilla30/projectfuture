@@ -55,6 +55,31 @@ fun textStyleForElement(node: ElementNode, linkHref: String?): TextStyle {
  * parameter through every call site) is safe here.
  */
 var customFonts: Map<String, Typeface> = emptyMap()
+    set(value) {
+        field = value
+        // A Paint cached under a family name holds whichever Typeface that name meant at the time.
+        FontCache.clear()
+    }
+
+/**
+ * Web fonts the UI process received from tab engine processes, keyed by the unique names
+ * `UiDisplayListConverter` gives them. Several tabs share the UI process, and two pages may both
+ * use a family called "Roboto" with different files, so the page's own family name can't be the key.
+ */
+val remoteFonts = java.util.concurrent.ConcurrentHashMap<String, Typeface>()
+
+/** Builds a Typeface from SFNT bytes through a temp file (Typeface.createFromFile works on every supported API level). */
+fun typefaceFromSfnt(sfnt: ByteArray, cacheDir: java.io.File): Typeface? {
+    val tempFile = java.io.File.createTempFile("font", ".ttf", cacheDir)
+    return try {
+        tempFile.writeBytes(sfnt)
+        Typeface.createFromFile(tempFile)
+    } catch (_: Exception) {
+        null
+    } finally {
+        tempFile.delete()
+    }
+}
 
 /**
  * A user-controlled text-size multiplier (accessibility "text scaling" /
@@ -71,12 +96,14 @@ var textScaleFactor: Float = 1f
 object FontCache {
     private val cache = HashMap<String, Paint>()
 
+    fun clear() = cache.clear()
+
     fun paintFor(style: TextStyle): Paint {
         val key = "${style.sizePx}-${style.bold}-${style.italic}-${style.monospace}-${style.fontFamilyName}"
         return cache.getOrPut(key) {
             Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 textSize = style.sizePx
-                val customBase = style.fontFamilyName?.let { customFonts[it.lowercase()] }
+                val customBase = style.fontFamilyName?.let { customFonts[it.lowercase()] ?: remoteFonts[it] }
                 val base = customBase ?: if (style.monospace) Typeface.MONOSPACE else Typeface.DEFAULT
                 var flags = 0
                 if (style.bold) flags = flags or Typeface.BOLD
