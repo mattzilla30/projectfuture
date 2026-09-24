@@ -20,30 +20,47 @@ import java.util.IdentityHashMap
 class EngineToUiConverter(private val elementIds: ElementIdRegistry) {
     private val imageIds = IdentityHashMap<Bitmap, Int>()
     private var nextImageId = 1
+    /** Which elementIds have already had a [WireElementMeta] sent for them - each is only ever sent once, the first time it's seen (see [TabEngineProtocol.MSG_ELEMENT_META]'s doc). */
+    private val metaSent = HashSet<Int>()
 
-    /** The wire commands, plus any bitmaps seen here for the first time (send these once, as MSG_IMAGE_DATA, before or alongside the display list). */
-    fun convert(commands: List<DisplayCommand>): Pair<List<WireDisplayCommand>, List<Pair<Int, Bitmap>>> {
+    /** The wire commands, plus any bitmaps and element metadata seen here for the first time (send these once - as MSG_IMAGE_DATA/MSG_ELEMENT_META - before or alongside the display list). */
+    fun convert(commands: List<DisplayCommand>): Triple<List<WireDisplayCommand>, List<Pair<Int, Bitmap>>, List<WireElementMeta>> {
         val newImages = ArrayList<Pair<Int, Bitmap>>()
+        val newMeta = ArrayList<WireElementMeta>()
+        fun idFor(element: com.projectfuture.browser.html.ElementNode?): Int {
+            val id = elementIds.idFor(element)
+            if (id != 0 && metaSent.add(id) && element != null) {
+                newMeta.add(WireElementMeta(id, element.tag, element.attr("type")))
+            }
+            return id
+        }
         val wire = commands.map { cmd ->
             when (cmd) {
                 is DrawText -> WireDrawText(
                     cmd.x, cmd.baselineY, cmd.text, wireStyle(cmd.style),
-                    cmd.left, cmd.right, cmd.boxTop, cmd.boxBottom, cmd.fixed, elementIds.idFor(cmd.sourceElement)
+                    cmd.left, cmd.right, cmd.boxTop, cmd.boxBottom, cmd.fixed, idFor(cmd.sourceElement)
                 )
-                is DrawRect -> WireDrawRect(cmd.left, cmd.top, cmd.right, cmd.bottom, cmd.color, cmd.fixed, elementIds.idFor(cmd.sourceElement))
+                is DrawRect -> WireDrawRect(cmd.left, cmd.top, cmd.right, cmd.bottom, cmd.color, cmd.fixed, idFor(cmd.sourceElement))
                 is DrawImage -> {
                     var isNew = false
                     val id = imageIds.getOrPut(cmd.bitmap) { isNew = true; nextImageId++ }
                     if (isNew) newImages.add(id to cmd.bitmap)
-                    WireDrawImage(cmd.left, cmd.top, cmd.right, cmd.bottom, id, cmd.fixed, elementIds.idFor(cmd.sourceElement))
+                    WireDrawImage(cmd.left, cmd.top, cmd.right, cmd.bottom, id, cmd.fixed, idFor(cmd.sourceElement))
                 }
                 is DrawFormControl -> WireDrawFormControl(
                     cmd.left, cmd.top, cmd.right, cmd.bottom, cmd.controlType.ordinal, cmd.value, cmd.checked,
-                    cmd.placeholder, wireStyle(cmd.style), cmd.fixed, elementIds.idFor(cmd.sourceElement)
+                    cmd.placeholder, wireStyle(cmd.style), cmd.fixed, idFor(cmd.sourceElement)
                 )
             }
         }
-        return wire to newImages
+        return Triple(wire, newImages, newMeta)
+    }
+
+    /** Used outside a display-list conversion - e.g. select options / login-form fields discovered by a direct DOM lookup rather than by appearing in the paint list - to make sure their metadata still gets sent once. */
+    fun metaFor(element: com.projectfuture.browser.html.ElementNode): Pair<Int, WireElementMeta?> {
+        val id = elementIds.idFor(element)
+        val meta = if (metaSent.add(id)) WireElementMeta(id, element.tag, element.attr("type")) else null
+        return id to meta
     }
 
     private fun wireStyle(style: TextStyle) = WireTextStyle(

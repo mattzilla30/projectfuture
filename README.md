@@ -98,17 +98,32 @@ correctness) - see commit history for the detailed limitations of each:
   `AndroidKeyStore` and never exported - see `CredentialStore`'s class doc
   for the exact threat model this defends (disk/backup-level, not
   intra-app) and what it doesn't.
-- A real, working per-tab process sandbox for one demonstration entry
-  point (menu -> "Sandboxed tab (experimental)", `SandboxedTabActivity`):
-  a tab's whole engine - fetch/parse/JS/DOM/layout, the actual `Tab` class
-  - runs in one of 4 pooled separate OS processes (`ipc/
-  TabEngineServiceBase.kt`), reachable only over Messenger/Binder in
-  `ipc/TabEngineProtocol.kt`'s vocabulary; the display list crosses back
-  as a flat, reference-free wire format (`ipc/WireDisplayCommand.kt`,
-  round-trip tested in `DisplayListCodecTest`). This is **not** wired into
-  the default multi-tab browsing flow - see `TabEngineClient`'s class doc
-  for exactly why (most of `Tab`'s ~40-method surface isn't proxied) and
-  what would still be needed to make it the default.
+- A real, working per-tab process sandbox that's now the actual default
+  for every regular tab, not a demo: a tab's whole engine -
+  fetch/parse/JS/DOM/layout, the actual `Tab` class - runs in one of 4
+  pooled separate OS processes (`ipc/TabEngineServiceBase.kt`), reachable
+  only over Messenger/Binder in `ipc/TabEngineProtocol.kt`'s vocabulary.
+  `TabManager`/`MainActivity` talk to every tab through a `TabHandle`
+  interface (`browser/TabHandle.kt`) implemented by either a
+  `RemoteTabHandle` (the default - proxies to a pooled process via
+  `ipc/TabEngineClient.kt`) or a `LocalTabHandle` (the old in-process
+  path, kept as a fallback a "Sandboxed tabs" menu toggle switches to for
+  new tabs). The display list, element metadata, select options, login-
+  form detection, and tab navigation/mode state all cross as flat,
+  reference-free wire formats with JVM-testable codecs (no Robolectric
+  needed - see `DisplayListCodecTest`/`IpcCodecsTest`/
+  `EngineToUiRoundTripTest`). Two things don't cross the process boundary
+  today, both with a real reason documented on `TabEngineClient`'s class
+  doc: cookies/`localStorage` work *within* a sandboxed tab's own process
+  but aren't reliably synchronized *between* processes, since Android's
+  `SharedPreferences` (what those stores are built on) isn't safe to
+  share across processes - a `ContentProvider`-backed store would be the
+  real fix. Printing, thumbnails, find-in-page, and canvas/SVG extraction
+  needed no new proxying at all: they already work off the display list
+  (which already carries baked-in canvas/SVG bitmaps) this class caches
+  on the UI-process side. No Android emulator/device is available in this
+  environment, so none of this has been runtime-verified on an actual
+  device - only JVM unit tests and a Kotlin compile pass.
 - Two independently GPU-composited hardware layers in `BrowserView`
   (`ScrollingContentLayer`/`FixedContentLayer`) instead of one CPU-painted
   Canvas: scrolling only invalidates the scrolling layer, so `position:

@@ -40,9 +40,7 @@ import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.projectfuture.browser.browser.BookmarkStore
 import com.projectfuture.browser.browser.CredentialStore
-import com.projectfuture.browser.browser.LoginFormFields
 import com.projectfuture.browser.browser.SavedCredential
-import com.projectfuture.browser.browser.credentialOrigin
 import com.projectfuture.browser.browser.HistoryStore
 import com.projectfuture.browser.browser.LocalStorageStore
 import com.projectfuture.browser.browser.sharedLocalStorage
@@ -52,13 +50,12 @@ import com.projectfuture.browser.browser.SharedPrefsStorageBacking
 import com.projectfuture.browser.browser.sharedCacheStorageStore
 import com.projectfuture.browser.browser.sharedServiceWorkerRegistry
 import com.projectfuture.browser.browser.Settings
-import com.projectfuture.browser.browser.Tab
+import com.projectfuture.browser.browser.TabHandle
 import com.projectfuture.browser.browser.TabManager
 import com.projectfuture.browser.browser.TabSessionStore
 import com.projectfuture.browser.browser.TabState
 import com.projectfuture.browser.layout.DrawText
 import com.projectfuture.browser.html.ElementNode
-import com.projectfuture.browser.html.TextNode
 import com.projectfuture.browser.net.CookieJar
 import com.projectfuture.browser.net.HttpCache
 import com.projectfuture.browser.net.TrackingProtection
@@ -75,7 +72,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var settings: Settings
     private lateinit var tabSessionStore: TabSessionStore
     private lateinit var credentialStore: CredentialStore
-    private val tabTitles = HashMap<Tab, String>()
+    private val tabTitles = HashMap<TabHandle, String>()
     /** Origins the user picked "never for this site" on, for this process lifetime - suppresses repeat save-password prompts without persisting an explicit blocklist. */
     private val neverSaveOrigins = HashSet<String>()
     private var lastViewportWidth = 0f
@@ -87,10 +84,10 @@ class MainActivity : AppCompatActivity() {
         binding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(binding.root)
 
-        tabManager = TabManager(this, ::onTabStateChanged)
+        settings = Settings(this)
+        tabManager = TabManager(this, { settings.sandboxedTabsEnabled }, ::onTabStateChanged)
         bookmarkStore = BookmarkStore(this)
         historyStore = HistoryStore(this)
-        settings = Settings(this)
         tabSessionStore = TabSessionStore(this)
         credentialStore = CredentialStore(this)
         TrackingProtection.enabled = settings.trackingProtectionEnabled
@@ -243,7 +240,7 @@ class MainActivity : AppCompatActivity() {
         binding.browserView.setFindMatches(findMatches, findIndex)
     }
 
-    private fun onTabStateChanged(tab: Tab, state: TabState) {
+    private fun onTabStateChanged(tab: TabHandle, state: TabState) {
         // Track title/URL for every tab regardless of which one is on screen,
         // so the switcher list stays accurate for background tabs too.
         when (state) {
@@ -390,7 +387,7 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
-    private fun applyWindowTitle(tab: Tab, text: String) {
+    private fun applyWindowTitle(tab: TabHandle, text: String) {
         title = if (tab.isPrivate) getString(R.string.private_tab_title_prefix, text) else text
     }
 
@@ -425,7 +422,7 @@ class MainActivity : AppCompatActivity() {
      * hasn't finished its first layout yet just renders a blank thumbnail
      * (contentHeight is 0) rather than crashing.
      */
-    private fun renderTabThumbnail(tab: Tab, widthPx: Int, heightPx: Int): Bitmap {
+    private fun renderTabThumbnail(tab: TabHandle, widthPx: Int, heightPx: Int): Bitmap {
         val bitmap = Bitmap.createBitmap(widthPx, heightPx, Bitmap.Config.ARGB_8888)
         val canvas = android.graphics.Canvas(bitmap)
         canvas.drawColor(Color.WHITE)
@@ -554,7 +551,14 @@ class MainActivity : AppCompatActivity() {
         popup.menu.add(0, 12, 11, R.string.menu_new_private_tab)
         popup.menu.add(0, 13, 12, R.string.menu_add_to_home_screen).isEnabled = currentUrl != null
         popup.menu.add(0, 14, 13, R.string.menu_passwords)
-        popup.menu.add(0, 15, 14, R.string.menu_sandboxed_tab)
+        // Every new tab runs its engine in a sandboxed pooled process by default (see
+        // TabManager.newTab's doc) - this toggle is the fallback escape hatch (Settings.
+        // sandboxedTabsEnabled's doc), not a demo entry point. It only affects tabs opened from
+        // here on; already-open tabs keep whichever kind they were created as.
+        popup.menu.add(0, 15, 14, R.string.menu_sandboxed_tabs).apply {
+            isCheckable = true
+            isChecked = settings.sandboxedTabsEnabled
+        }
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> {
@@ -596,7 +600,7 @@ class MainActivity : AppCompatActivity() {
                 12 -> { openNewTab(private = true); true }
                 13 -> { addToHomeScreen(); true }
                 14 -> { showPasswordsDialog(); true }
-                15 -> { startActivity(Intent(this, SandboxedTabActivity::class.java)); true }
+                15 -> { settings.sandboxedTabsEnabled = !settings.sandboxedTabsEnabled; true }
                 else -> false
             }
         }
@@ -682,22 +686,27 @@ class MainActivity : AppCompatActivity() {
     }
 
     /** Offers to fill in a saved login the first time a matching login form appears on a freshly loaded page - never re-prompted on every keystroke, since this only runs from TabState.Loaded. */
-    private fun offerAutofillIfAvailable(tab: Tab) {
+    private fun offerAutofillIfAvailable(tab: TabHandle) {
         val origin = tab.currentOrigin() ?: return
-        val fields = tab.detectLoginForm() ?: return
         val saved = credentialStore.credentialsForOrigin(origin).firstOrNull() ?: return
-        // Don't re-offer if the form's already been filled in (e.g. the page itself pre-filled it).
-        if (fields.usernameField.attr("value")?.isNotEmpty() == true) return
-        MaterialAlertDialogBuilder(this)
-            .setTitle(R.string.autofill_login_title)
-            .setMessage(getString(R.string.autofill_login_message, saved.username, origin))
-            .setPositiveButton(R.string.autofill_login_fill) { _, _ ->
-                if (tabManager.activeTab === tab) {
-                    tab.autofillLoginForm(fields, saved.username, saved.password)
+        // Detecting the form (and whether it's already filled in - e.g. by the page itself) is
+        // async for a sandboxed tab (see TabHandle.detectLoginForm's doc), so the dialog only shows
+        // up once the reply actually arrives - by which point the user may have switched tabs, hence
+        // the tabManager.activeTab === tab re-check before acting on it.
+        tab.detectLoginForm { fields ->
+            if (fields == null || fields.usernameAlreadyFilled) return@detectLoginForm
+            if (tabManager.activeTab !== tab) return@detectLoginForm
+            MaterialAlertDialogBuilder(this)
+                .setTitle(R.string.autofill_login_title)
+                .setMessage(getString(R.string.autofill_login_message, saved.username, origin))
+                .setPositiveButton(R.string.autofill_login_fill) { _, _ ->
+                    if (tabManager.activeTab === tab) {
+                        tab.autofillLoginForm(fields, saved.username, saved.password)
+                    }
                 }
-            }
-            .setNegativeButton(R.string.action_close, null)
-            .show()
+                .setNegativeButton(R.string.action_close, null)
+                .show()
+        }
     }
 
     /** Offers to save a just-submitted login (see Tab.onLoginFormSubmitted / LoginFormDetector) into the encrypted CredentialStore. Skips silently if that exact origin+username is already saved, or the user previously said "never" for this origin this session. */
@@ -829,7 +838,7 @@ class MainActivity : AppCompatActivity() {
      * session (see CertificateExceptions/Url.trustAllSocketFactory), never
      * weakening validation anywhere else.
      */
-    private fun showCertificateErrorDialog(tab: Tab, url: Url, message: String) {
+    private fun showCertificateErrorDialog(tab: TabHandle, url: Url, message: String) {
         AlertDialog.Builder(this)
             .setTitle(R.string.certificate_error_title)
             .setMessage(getString(R.string.certificate_error_message, url.host, message))
@@ -924,30 +933,36 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun promptForFieldValue(element: ElementNode, tab: Tab) {
-        val input = EditText(this).apply {
-            setText(tab.currentFieldValue(element))
-            setSelection(text.length)
-            if (element.tag == "input" && (element.attr("type") ?: "").lowercase() == "password") {
-                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+    private fun promptForFieldValue(element: ElementNode, tab: TabHandle) {
+        // Prefilling the dialog needs the field's current value, which for a sandboxed tab is a
+        // round trip to the engine process rather than a synchronous read - see
+        // TabHandle.currentFieldValue's doc.
+        tab.currentFieldValue(element) { currentValue ->
+            val input = EditText(this).apply {
+                setText(currentValue)
+                setSelection(text.length)
+                if (element.tag == "input" && (element.attr("type") ?: "").lowercase() == "password") {
+                    inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+                }
             }
+            AlertDialog.Builder(this)
+                .setView(input)
+                .setPositiveButton(android.R.string.ok) { _, _ -> tab.setFieldValue(element, input.text.toString()) }
+                .setNegativeButton(android.R.string.cancel, null)
+                .show()
         }
-        AlertDialog.Builder(this)
-            .setView(input)
-            .setPositiveButton(android.R.string.ok) { _, _ -> tab.setFieldValue(element, input.text.toString()) }
-            .setNegativeButton(android.R.string.cancel, null)
-            .show()
     }
 
-    private fun promptForSelectValue(element: ElementNode, tab: Tab) {
-        val options = element.children.filterIsInstance<ElementNode>().filter { it.tag == "option" }
-        if (options.isEmpty()) return
-        val labels = options.map { opt ->
-            opt.children.filterIsInstance<TextNode>().joinToString("") { it.text }.trim().ifEmpty { opt.attr("value") ?: "" }
-        }.toTypedArray()
-        AlertDialog.Builder(this)
-            .setItems(labels) { _, which -> tab.setSelectValue(element, options[which]) }
-            .show()
+    private fun promptForSelectValue(element: ElementNode, tab: TabHandle) {
+        // The option list itself lives in the engine process's live DOM for a sandboxed tab, so
+        // this is also async - see TabHandle.requestSelectOptions's doc.
+        tab.requestSelectOptions(element) { options ->
+            if (options.isEmpty()) return@requestSelectOptions
+            val labels = options.map { it.label }.toTypedArray()
+            AlertDialog.Builder(this)
+                .setItems(labels) { _, which -> tab.setSelectValue(element, options[which].node) }
+                .show()
+        }
     }
 
     /** Resolves a Material theme color attribute against the current (light/dark) theme. */

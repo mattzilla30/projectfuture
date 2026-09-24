@@ -9,8 +9,19 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.Message
 import android.os.Messenger
+import com.projectfuture.browser.browser.LoginFormDetector
+import com.projectfuture.browser.browser.LocalStorageStore
+import com.projectfuture.browser.browser.Settings
 import com.projectfuture.browser.browser.Tab
 import com.projectfuture.browser.browser.TabState
+import com.projectfuture.browser.browser.sharedLocalStorage
+import com.projectfuture.browser.html.ElementNode
+import com.projectfuture.browser.html.TextNode
+import com.projectfuture.browser.html.walkElements
+import com.projectfuture.browser.net.CookieJar
+import com.projectfuture.browser.net.TrackingProtection
+import com.projectfuture.browser.net.Url
+import com.projectfuture.browser.net.sharedCookieJar
 import java.io.ByteArrayOutputStream
 
 /**
@@ -24,7 +35,9 @@ import java.io.ByteArrayOutputStream
  * interaction crosses a `Messenger`/Binder call in
  * [TabEngineProtocol]'s vocabulary, and the DOM/JS/layout state this `Tab`
  * builds up is only ever exposed to the other side as the flattened,
- * reference-free [WireDisplayCommand] list ([EngineToUiConverter]).
+ * reference-free [WireDisplayCommand] list ([EngineToUiConverter]) plus a
+ * handful of small typed replies (element metadata, select options, field
+ * values, login-form detection - see [TabEngineProtocol]'s message list).
  *
  * What this buys, concretely: a JS bug (an infinite loop, a native crash
  * in glyph shaping triggered by pathological content, an OOM from a huge
@@ -36,48 +49,142 @@ import java.io.ByteArrayOutputStream
  * per distinct bitmap instead of shared as a texture, and this is
  * meaningfully slower than the in-process path - acceptable for isolation,
  * not tuned for latency.
+ *
+ * Two persistence stores that are process-global `var`s in the
+ * single-process design ([sharedCookieJar], [sharedLocalStorage]) are
+ * (re)initialized here in [onCreate] so cookies/`localStorage` actually
+ * work for a sandboxed tab at all - without this they'd silently stay
+ * `null` in this process and every page would look logged-out/storage-
+ * less every time. That fixes "does it work in this process", but not the
+ * deeper problem: `SharedPreferences` (what [CookieJar]/[LocalStorageStore]
+ * are built on) is documented by Android as unsafe to share across
+ * processes - each process keeps its own in-memory cache of the file and
+ * doesn't observe another process's writes, so a cookie set by tab A's
+ * engine process (`:tabengine0`) is not reliably visible to tab B's
+ * (`:tabengine1`), or even to the UI process's own `CookieJar` instance,
+ * without that other process being restarted. This is a real, un-fixed
+ * gap - the honest fix is a `ContentProvider`-backed store with proper
+ * cross-process notification, which is real, substantial work this pass
+ * didn't attempt. History recording and saved-password prompts don't have
+ * this problem: MainActivity does that work itself, in the UI process,
+ * off the plain (title, url) / (origin, username, password) strings that
+ * already cross via [TabEngineProtocol]'s state and credential messages.
  */
 abstract class TabEngineServiceBase : Service() {
     private var tab: Tab? = null
     private var uiMessenger: Messenger? = null
+    private var isPrivateTab = false
     private val elementIds = ElementIdRegistry()
     private val converter = EngineToUiConverter(elementIds)
+
+    override fun onCreate() {
+        super.onCreate()
+        // See this class's doc for what this does and doesn't fix.
+        if (sharedCookieJar == null) sharedCookieJar = CookieJar(applicationContext)
+        if (sharedLocalStorage == null) sharedLocalStorage = LocalStorageStore(applicationContext)
+        TrackingProtection.enabled = Settings(applicationContext).trackingProtectionEnabled
+    }
 
     private val incomingHandler = object : Handler(Looper.getMainLooper()) {
         override fun handleMessage(msg: Message) {
             when (msg.what) {
                 TabEngineProtocol.MSG_REGISTER_CLIENT -> uiMessenger = msg.replyTo
-                TabEngineProtocol.MSG_LOAD_URL -> msg.data.getString(TabEngineProtocol.KEY_URL)?.let(::loadUrl)
-                TabEngineProtocol.MSG_DISPATCH_TAP -> {
-                    val elementId = msg.data.getInt(TabEngineProtocol.KEY_ELEMENT_ID)
-                    elementIds.elementFor(elementId)?.let { tab?.dispatchClick(it) }
+                TabEngineProtocol.MSG_INIT -> isPrivateTab = msg.data.getBoolean(TabEngineProtocol.KEY_IS_PRIVATE)
+                TabEngineProtocol.MSG_LOAD_URL -> {
+                    val url = msg.data.getString(TabEngineProtocol.KEY_URL) ?: return
+                    val template = msg.data.getString(TabEngineProtocol.KEY_SEARCH_TEMPLATE) ?: Settings.DEFAULT_SEARCH_TEMPLATE
+                    elementIds.reset()
+                    ensureTab().navigate(url, template)
                 }
-                TabEngineProtocol.MSG_DISPATCH_INPUT -> {
-                    val elementId = msg.data.getInt(TabEngineProtocol.KEY_ELEMENT_ID)
-                    val value = msg.data.getString(TabEngineProtocol.KEY_VALUE) ?: ""
-                    elementIds.elementFor(elementId)?.let { tab?.dispatchInputEvent(it, value) }
+                TabEngineProtocol.MSG_DISPATCH_TAP -> withElement(msg) { tab?.dispatchClick(it) }
+                TabEngineProtocol.MSG_DISPATCH_INPUT -> withElement(msg) {
+                    tab?.dispatchInputEvent(it, msg.data.getString(TabEngineProtocol.KEY_VALUE) ?: "")
                 }
                 TabEngineProtocol.MSG_SET_VIEWPORT_SIZE -> {
                     val width = msg.data.getFloat(TabEngineProtocol.KEY_WIDTH)
                     val height = msg.data.getFloat(TabEngineProtocol.KEY_HEIGHT)
                     if (tab?.onViewportSizeChanged(width, height) == true) sendDisplayList()
                 }
+                TabEngineProtocol.MSG_GO_BACK -> { tab?.goBack(); sendTabInfo() }
+                TabEngineProtocol.MSG_GO_FORWARD -> { tab?.goForward(); sendTabInfo() }
+                TabEngineProtocol.MSG_RELOAD -> tab?.reload()
+                TabEngineProtocol.MSG_FOLLOW_LINK -> msg.data.getString(TabEngineProtocol.KEY_URL)?.let { tab?.followLink(it) }
+                TabEngineProtocol.MSG_TOGGLE_DESKTOP_MODE -> { tab?.toggleDesktopMode(); sendTabInfo() }
+                TabEngineProtocol.MSG_TOGGLE_READER_MODE -> { tab?.toggleReaderMode(); sendTabInfo() }
+                TabEngineProtocol.MSG_SET_TEXT_SCALE -> {
+                    tab?.setTextScale(msg.data.getFloat(TabEngineProtocol.KEY_SCALE))
+                    sendDisplayList()
+                    sendTabInfo()
+                }
+                TabEngineProtocol.MSG_DISCARD -> { tab?.discardForMemoryPressure(); sendTabInfo() }
+                TabEngineProtocol.MSG_SET_FIELD_VALUE -> withElement(msg) {
+                    tab?.setFieldValue(it, msg.data.getString(TabEngineProtocol.KEY_VALUE) ?: "")
+                }
+                TabEngineProtocol.MSG_SET_SELECT_VALUE -> {
+                    val select = elementIds.elementFor(msg.data.getInt(TabEngineProtocol.KEY_ELEMENT_ID))
+                    val option = elementIds.elementFor(msg.data.getInt(TabEngineProtocol.KEY_OPTION_ELEMENT_ID))
+                    if (select != null && option != null) tab?.setSelectValue(select, option)
+                }
+                TabEngineProtocol.MSG_REQUEST_FIELD_VALUE -> withElement(msg) { element ->
+                    val id = msg.data.getInt(TabEngineProtocol.KEY_ELEMENT_ID)
+                    sendMessage(TabEngineProtocol.MSG_FIELD_VALUE) {
+                        putInt(TabEngineProtocol.KEY_ELEMENT_ID, id)
+                        putString(TabEngineProtocol.KEY_VALUE, tab?.currentFieldValue(element) ?: "")
+                    }
+                }
+                TabEngineProtocol.MSG_REQUEST_SELECT_OPTIONS -> {
+                    val id = msg.data.getInt(TabEngineProtocol.KEY_ELEMENT_ID)
+                    val select = elementIds.elementFor(id)
+                    sendSelectOptions(id, select)
+                }
+                TabEngineProtocol.MSG_REQUEST_LOGIN_FORM -> sendLoginFormResult()
+                TabEngineProtocol.MSG_AUTOFILL_LOGIN_FORM -> {
+                    val usernameField = elementIds.elementFor(msg.data.getInt(TabEngineProtocol.KEY_USERNAME_FIELD_ID))
+                    val passwordField = elementIds.elementFor(msg.data.getInt(TabEngineProtocol.KEY_PASSWORD_FIELD_ID))
+                    if (usernameField != null) tab?.setFieldValue(usernameField, msg.data.getString(TabEngineProtocol.KEY_USERNAME) ?: "")
+                    if (passwordField != null) tab?.setFieldValue(passwordField, msg.data.getString(TabEngineProtocol.KEY_PASSWORD) ?: "")
+                }
+                TabEngineProtocol.MSG_REQUEST_MANIFEST_INFO -> {
+                    tab?.fetchManifestInfo { name, iconBytes ->
+                        sendMessage(TabEngineProtocol.MSG_MANIFEST_INFO) {
+                            putString(TabEngineProtocol.KEY_TITLE, name)
+                            if (iconBytes != null) putByteArray(TabEngineProtocol.KEY_IMAGE_BYTES, iconBytes)
+                        }
+                    }
+                }
+                TabEngineProtocol.MSG_TRUST_CERTIFICATE -> {
+                    val urlString = msg.data.getString(TabEngineProtocol.KEY_URL) ?: return
+                    try { tab?.trustCertificateAndReload(Url.parse(urlString)) } catch (_: Exception) {}
+                }
             }
         }
     }
     private val incomingMessenger = Messenger(incomingHandler)
 
+    private inline fun withElement(msg: Message, action: (ElementNode) -> Unit) {
+        elementIds.elementFor(msg.data.getInt(TabEngineProtocol.KEY_ELEMENT_ID))?.let(action)
+    }
+
     override fun onBind(intent: Intent?): IBinder = incomingMessenger.binder
 
-    private fun ensureTab(): Tab = tab ?: Tab(this, ::onTabStateChanged).also { tab = it }
-
-    private fun loadUrl(addressBarInput: String) {
-        elementIds.reset()
-        ensureTab().navigate(addressBarInput)
+    private fun ensureTab(): Tab = tab ?: Tab(this, ::onTabStateChanged, isPrivateTab).also {
+        it.onDownloadRequested = { url, filename ->
+            sendMessage(TabEngineProtocol.MSG_DOWNLOAD_REQUESTED) {
+                putString(TabEngineProtocol.KEY_URL, url)
+                if (filename != null) putString(TabEngineProtocol.KEY_TITLE, filename)
+            }
+        }
+        it.onLoginFormSubmitted = { origin, username, password ->
+            sendMessage(TabEngineProtocol.MSG_LOGIN_FORM_SUBMITTED) {
+                putString(TabEngineProtocol.KEY_URL, origin)
+                putString(TabEngineProtocol.KEY_USERNAME, username)
+                putString(TabEngineProtocol.KEY_PASSWORD, password)
+            }
+        }
+        tab = it
     }
 
     private fun onTabStateChanged(state: TabState) {
-        val reply = uiMessenger ?: return
         val message = when (state) {
             is TabState.Loading -> stateMessage(TabEngineProtocol.MSG_STATE_LOADING, state.url.toString())
             is TabState.Loaded -> {
@@ -86,45 +193,98 @@ abstract class TabEngineServiceBase : Service() {
             }
             is TabState.Updated -> {
                 sendDisplayList()
-                null
+                stateMessage(TabEngineProtocol.MSG_STATE_UPDATED, state.url.toString(), state.title)
             }
             is TabState.Error -> stateMessage(TabEngineProtocol.MSG_STATE_ERROR, state.url.toString(), state.message)
-            is TabState.CertificateError -> stateMessage(TabEngineProtocol.MSG_STATE_ERROR, state.url.toString(), state.message)
-        } ?: return
-        try { reply.send(message) } catch (_: Exception) {}
+            is TabState.CertificateError -> stateMessage(TabEngineProtocol.MSG_STATE_CERTIFICATE_ERROR, state.url.toString(), state.message)
+        }
+        send(message)
+        sendTabInfo()
     }
 
     private fun stateMessage(what: Int, url: String, extra: String? = null): Message =
         Message.obtain(null, what).apply {
             data = Bundle().apply {
                 putString(TabEngineProtocol.KEY_URL, url)
-                if (what == TabEngineProtocol.MSG_STATE_LOADED) putString(TabEngineProtocol.KEY_TITLE, extra)
-                if (what == TabEngineProtocol.MSG_STATE_ERROR) putString(TabEngineProtocol.KEY_MESSAGE, extra)
+                if (what == TabEngineProtocol.MSG_STATE_LOADED || what == TabEngineProtocol.MSG_STATE_UPDATED) putString(TabEngineProtocol.KEY_TITLE, extra)
+                if (what == TabEngineProtocol.MSG_STATE_ERROR || what == TabEngineProtocol.MSG_STATE_CERTIFICATE_ERROR) putString(TabEngineProtocol.KEY_MESSAGE, extra)
             }
         }
 
-    private fun sendDisplayList() {
-        val reply = uiMessenger ?: return
+    private fun sendTabInfo() {
         val currentTab = tab ?: return
-        val (wireCommands, newImages) = converter.convert(currentTab.displayList)
-        for ((id, bitmap) in newImages) sendImage(reply, id, bitmap)
-        val message = Message.obtain(null, TabEngineProtocol.MSG_DISPLAY_LIST).apply {
-            data = Bundle().apply {
-                putByteArray(TabEngineProtocol.KEY_PAYLOAD, DisplayListCodec.encode(wireCommands))
-                putFloat(TabEngineProtocol.KEY_CONTENT_HEIGHT, currentTab.contentHeight)
-            }
-        }
-        try { reply.send(message) } catch (_: Exception) {}
+        val info = WireTabInfo(
+            url = currentTab.currentUrl?.toString(),
+            title = currentTab.currentDoc?.let { extractTitleFor(it) },
+            canGoBack = currentTab.canGoBack(),
+            canGoForward = currentTab.canGoForward(),
+            desktopMode = currentTab.desktopMode,
+            readerModeActive = currentTab.readerModeActive,
+            textScale = currentTab.textScale,
+            isDiscarded = currentTab.isDiscarded
+        )
+        sendMessage(TabEngineProtocol.MSG_TAB_INFO) { putByteArray(TabEngineProtocol.KEY_PAYLOAD, TabInfoCodec.encode(info)) }
     }
 
-    private fun sendImage(reply: Messenger, imageId: Int, bitmap: Bitmap) {
-        val bytes = ByteArrayOutputStream().apply { bitmap.compress(Bitmap.CompressFormat.PNG, 100, this) }.toByteArray()
-        val message = Message.obtain(null, TabEngineProtocol.MSG_IMAGE_DATA).apply {
-            data = Bundle().apply {
-                putInt(TabEngineProtocol.KEY_IMAGE_ID, imageId)
-                putByteArray(TabEngineProtocol.KEY_IMAGE_BYTES, bytes)
+    /** Same `<title>` lookup `Tab` does internally (private there) - fine to duplicate rather than exposing it, since it's a two-line pure DOM walk. */
+    private fun extractTitleFor(root: ElementNode): String? {
+        var title: String? = null
+        root.walkElements { el ->
+            if (el.tag == "title" && title == null) {
+                val text = el.children.filterIsInstance<TextNode>().joinToString("") { it.text }.trim()
+                if (text.isNotEmpty()) title = text
             }
         }
+        return title
+    }
+
+    private fun sendSelectOptions(selectId: Int, select: ElementNode?) {
+        val options = select?.children?.filterIsInstance<ElementNode>()?.filter { it.tag == "option" } ?: emptyList()
+        val wireOptions = options.map { opt ->
+            val label = opt.children.filterIsInstance<TextNode>().joinToString("") { it.text }.trim().ifEmpty { opt.attr("value") ?: "" }
+            WireSelectOption(elementIds.idFor(opt), label, opt.attr("selected") != null)
+        }
+        sendMessage(TabEngineProtocol.MSG_SELECT_OPTIONS) {
+            putInt(TabEngineProtocol.KEY_ELEMENT_ID, selectId)
+            putByteArray(TabEngineProtocol.KEY_PAYLOAD, SelectOptionsCodec.encode(wireOptions))
+        }
+    }
+
+    private fun sendLoginFormResult() {
+        val doc = tab?.currentDoc
+        val fields = doc?.let { LoginFormDetector.findLoginForm(it) }
+        sendMessage(TabEngineProtocol.MSG_LOGIN_FORM_RESULT) {
+            putInt(TabEngineProtocol.KEY_USERNAME_FIELD_ID, fields?.usernameField?.let { elementIds.idFor(it) } ?: 0)
+            putInt(TabEngineProtocol.KEY_PASSWORD_FIELD_ID, fields?.passwordField?.let { elementIds.idFor(it) } ?: 0)
+            putBoolean(TabEngineProtocol.KEY_USERNAME_PREFILLED, fields?.usernameField?.attr("value")?.isNotEmpty() == true)
+        }
+    }
+
+    private fun sendDisplayList() {
+        val currentTab = tab ?: return
+        val (wireCommands, newImages, newMeta) = converter.convert(currentTab.displayList)
+        for ((id, bitmap) in newImages) sendImage(id, bitmap)
+        if (newMeta.isNotEmpty()) sendMessage(TabEngineProtocol.MSG_ELEMENT_META) { putByteArray(TabEngineProtocol.KEY_PAYLOAD, ElementMetaCodec.encode(newMeta)) }
+        sendMessage(TabEngineProtocol.MSG_DISPLAY_LIST) {
+            putByteArray(TabEngineProtocol.KEY_PAYLOAD, DisplayListCodec.encode(wireCommands))
+            putFloat(TabEngineProtocol.KEY_CONTENT_HEIGHT, currentTab.contentHeight)
+        }
+    }
+
+    private fun sendImage(imageId: Int, bitmap: Bitmap) {
+        val bytes = ByteArrayOutputStream().apply { bitmap.compress(Bitmap.CompressFormat.PNG, 100, this) }.toByteArray()
+        sendMessage(TabEngineProtocol.MSG_IMAGE_DATA) {
+            putInt(TabEngineProtocol.KEY_IMAGE_ID, imageId)
+            putByteArray(TabEngineProtocol.KEY_IMAGE_BYTES, bytes)
+        }
+    }
+
+    private inline fun sendMessage(what: Int, crossinline buildData: Bundle.() -> Unit) {
+        send(Message.obtain(null, what).apply { data = Bundle().apply(buildData) })
+    }
+
+    private fun send(message: Message) {
+        val reply = uiMessenger ?: return
         try { reply.send(message) } catch (_: Exception) {}
     }
 
