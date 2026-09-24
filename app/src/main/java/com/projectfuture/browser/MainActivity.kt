@@ -39,6 +39,8 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.projectfuture.browser.browser.BookmarkStore
+import com.projectfuture.browser.browser.sanitizeDownloadFilename
+import com.projectfuture.browser.browser.uniqueDownloadFilename
 import com.projectfuture.browser.browser.CredentialStore
 import com.projectfuture.browser.browser.SavedCredential
 import com.projectfuture.browser.browser.HistoryStore
@@ -660,7 +662,7 @@ class MainActivity : AppCompatActivity() {
         // Re-set on every refresh (cheap, idempotent) rather than only once per Tab, since Tab
         // instances come and go (new tabs, tab-switching) and this is the one place guaranteed to
         // run before the active tab could plausibly have a download triggered against it.
-        tab.onDownloadRequested = { url, filename -> startDownload(url, filename) }
+        tab.onDownloadRequested = { url, filename -> startDownload(url, filename, tab.isPrivate) }
         tab.onLoginFormSubmitted = { origin, username, password -> offerSavePassword(origin, username, password) }
         binding.browserView.setContent(tab.displayList, tab.contentHeight)
     }
@@ -873,14 +875,43 @@ class MainActivity : AppCompatActivity() {
         shortcutManager.requestPinShortcut(shortcut, null)
     }
 
-    /** Hands the URL off to Android's own DownloadManager - a platform primitive (like BitmapFactory for images), not "browser engine" logic. */
-    private fun startDownload(url: String, suggestedFilename: String?) {
+    /**
+     * Hands the URL off to Android's own DownloadManager - a platform
+     * primitive (like BitmapFactory for images), not "browser engine"
+     * logic. [suggestedFilename] is attacker-controlled page content (the
+     * clicked `<a download="...">`'s value - see [Tab.dispatchClick]), so
+     * it's run through [sanitizeDownloadFilename] first: unsanitized, a
+     * value containing "../" segments is a path-traversal attempt at
+     * writing outside the public Downloads directory, and an unbounded
+     * length blows past the filename limit most filesystems enforce,
+     * turning the download into a silent failure caught below.
+     * [uniqueDownloadFilename] then avoids silently overwriting an
+     * existing file of the same name, the way desktop browsers dedupe with
+     * a "(1)", "(2)", ... suffix - `setDestinationInExternalPublicDir`
+     * does not do this itself.
+     *
+     * [isPrivate] downgrades the download notification so it doesn't
+     * linger in the notification shade/lock screen with the downloaded
+     * page's filename after completion - one bound on the privacy leak of
+     * routing every download (private tab or not) through the OS-wide
+     * DownloadManager: the file's existence in the system Downloads app
+     * itself can't be hidden from here (see this app's private-tab
+     * storage isolation for what *can* be fully contained -
+     * PrivateBrowsingStorage.kt).
+     */
+    private fun startDownload(url: String, suggestedFilename: String?, isPrivate: Boolean) {
         try {
             val uri = Uri.parse(url)
-            val filename = suggestedFilename ?: uri.lastPathSegment?.takeIf { it.isNotBlank() } ?: "download"
+            val rawName = suggestedFilename ?: uri.lastPathSegment?.takeIf { it.isNotBlank() } ?: "download"
+            val safeName = sanitizeDownloadFilename(rawName)
+            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            val filename = uniqueDownloadFilename(safeName) { candidate -> java.io.File(downloadsDir, candidate).exists() }
             val request = DownloadManager.Request(uri)
                 .setTitle(filename)
-                .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+                .setNotificationVisibility(
+                    if (isPrivate) DownloadManager.Request.VISIBILITY_VISIBLE
+                    else DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED
+                )
                 .setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, filename)
             val manager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
             manager.enqueue(request)
