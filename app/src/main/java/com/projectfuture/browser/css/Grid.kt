@@ -61,46 +61,81 @@ private fun parseTrackList(raw: String?, containingWidth: Float, fontSizePx: Flo
     return tracks.ifEmpty { listOf(GridTrackSize.Fraction(1f)) }
 }
 
-/** Expands `repeat(N, <tracks>)` by literal repetition. `auto-fill`/`auto-fit` counts aren't supported (treated as 1). */
-private fun expandRepeat(raw: String): List<String> {
-    val result = ArrayList<String>()
-    var i = 0
-    while (i < raw.length) {
-        if (raw.startsWith("repeat(", i)) {
-            val close = findMatchingParen(raw, i + 6)
-            if (close == -1) break
-            val inner = raw.substring(i + 7, close)
-            val comma = inner.indexOf(',')
-            if (comma != -1) {
-                val count = inner.substring(0, comma).trim().toIntOrNull() ?: 1
-                val trackPart = inner.substring(comma + 1).trim()
-                repeat(count) { result.addAll(trackPart.split(Regex("\\s+")).filter { it.isNotEmpty() }) }
+/**
+ * Splits a track list on whitespace, but NOT inside parens - so a function
+ * like `minmax(100px, 1fr)` or `repeat(2, 1fr)` stays one token instead of
+ * being shredded into fragments (`minmax(100px,` / `1fr)`) that fail to
+ * parse as anything and get silently dropped, corrupting the column count.
+ */
+private fun splitTopLevel(s: String): List<String> {
+    val tokens = ArrayList<String>()
+    val buf = StringBuilder()
+    var depth = 0
+    for (c in s) {
+        when {
+            c == '(' -> { depth++; buf.append(c) }
+            c == ')' -> { depth--; buf.append(c) }
+            c.isWhitespace() && depth == 0 -> {
+                if (buf.isNotEmpty()) { tokens.add(buf.toString()); buf.setLength(0) }
             }
-            i = close + 1
-        } else {
-            val nextSpace = raw.indexOf(' ', i)
-            val token = if (nextSpace == -1) raw.substring(i) else raw.substring(i, nextSpace)
-            if (token.isNotEmpty()) result.add(token)
-            i = if (nextSpace == -1) raw.length else nextSpace + 1
+            else -> buf.append(c)
         }
     }
-    return result
+    if (buf.isNotEmpty()) tokens.add(buf.toString())
+    return tokens
 }
 
-private fun findMatchingParen(s: String, openIdx: Int): Int {
+/** Index of the first comma at paren-depth 0, or -1 - so `minmax(1px, 2px)` inside a `repeat(...)`'s track list isn't mistaken for the repeat's own count/track-list separator. */
+private fun topLevelCommaIndex(s: String): Int {
     var depth = 0
-    for (i in openIdx until s.length) {
+    for (i in s.indices) {
         when (s[i]) {
             '(' -> depth++
-            ')' -> { depth--; if (depth == 0) return i }
+            ')' -> depth--
+            ',' -> if (depth == 0) return i
         }
     }
     return -1
 }
 
+/** Expands `repeat(N, <tracks>)` by literal repetition. `auto-fill`/`auto-fit` counts aren't supported (treated as 1). */
+private fun expandRepeat(raw: String): List<String> {
+    val result = ArrayList<String>()
+    for (tok in splitTopLevel(raw)) {
+        if (tok.startsWith("repeat(") && tok.endsWith(")")) {
+            val inner = tok.substring(7, tok.length - 1)
+            val comma = topLevelCommaIndex(inner)
+            if (comma != -1) {
+                val count = inner.substring(0, comma).trim().toIntOrNull() ?: 1
+                val trackPart = inner.substring(comma + 1).trim()
+                repeat(count) { result.addAll(splitTopLevel(trackPart)) }
+            }
+        } else {
+            result.add(tok)
+        }
+    }
+    return result
+}
+
+/**
+ * `minmax(min, max)` isn't given a true min/max-content-aware clamp (this
+ * engine doesn't do intrinsic sizing passes for grid tracks) - as a
+ * reasonable approximation, the flexible side wins when one bound is an
+ * `fr`, otherwise the larger fixed bound is used. Without this, minmax()
+ * fell through to plain whitespace tokenization (see [splitTopLevel]) and
+ * was silently dropped entirely rather than cleanly rejected.
+ */
 private fun parseTrackToken(token: String, containingWidth: Float, fontSizePx: Float): GridTrackSize? {
     val t = token.trim()
     if (t.isEmpty()) return null
+    if (t.startsWith("minmax(") && t.endsWith(")")) {
+        val inner = t.substring(7, t.length - 1)
+        val comma = topLevelCommaIndex(inner)
+        if (comma == -1) return null
+        val minTrack = parseTrackToken(inner.substring(0, comma).trim(), containingWidth, fontSizePx)
+        val maxTrack = parseTrackToken(inner.substring(comma + 1).trim(), containingWidth, fontSizePx)
+        return if (maxTrack is GridTrackSize.Fraction) maxTrack else (maxTrack ?: minTrack)
+    }
     if (t.endsWith("fr")) return t.removeSuffix("fr").toFloatOrNull()?.let { GridTrackSize.Fraction(it) }
     if (t == "auto" || t == "min-content" || t == "max-content") return GridTrackSize.Fraction(1f)
     return lengthValue(t, containingWidth, fontSizePx)?.let { GridTrackSize.Fixed(it) }
