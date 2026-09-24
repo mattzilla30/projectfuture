@@ -14,6 +14,8 @@ import com.projectfuture.browser.js.JsBoolean
 import com.projectfuture.browser.js.JsEvent
 import com.projectfuture.browser.js.JsFunction
 import com.projectfuture.browser.js.JsNull
+import com.projectfuture.browser.js.JsNumber
+import com.projectfuture.browser.js.JsPromise
 import com.projectfuture.browser.js.JsObject
 import com.projectfuture.browser.js.JsString
 import com.projectfuture.browser.js.JsUndefined
@@ -48,14 +50,62 @@ import com.projectfuture.browser.js.toJsString
  */
 class DomBridge(private val root: ElementNode) {
     private val wrappers = HashMap<ElementNode, DomElement>()
-    private val domContentLoadedListeners = ArrayList<JsFunction>()
+    private val textWrappers = HashMap<TextNode, DomText>()
     private val canvasContexts = HashMap<ElementNode, CanvasContext2D>()
-    private val windowListeners = HashMap<String, MutableList<JsFunction>>()
     private val mutationObservers = ArrayList<ObserverRegistration>()
+    val windowListeners = ListenerSet()
+    val documentListeners = ListenerSet()
+
+    // Prototype objects behind `el instanceof HTMLElement` and anything a page adds to `HTMLElement.prototype`.
+    val nodeProto = JsObject()
+    val elementProto = JsObject().also { it.proto = nodeProto }
+    val htmlElementProto = JsObject().also { it.proto = elementProto }
+    val textProto = JsObject().also { it.proto = nodeProto }
+    val documentProto = JsObject().also { it.proto = nodeProto }
+
+    var documentObject: DomDocument? = null
+        private set
+    var windowObject: JsObject? = null
+        private set
+
+    /** `document.readyState`: "loading" while page scripts run, then "interactive", then "complete". */
+    var readyState = "loading"
+
+    /** The `<script>` element currently running, for `document.currentScript`. Set by Tab. */
+    var currentScript: ElementNode? = null
+
+    /** Backs `document.cookie`; Tab wires these to its cookie jar. */
+    var cookieReader: () -> String = { "" }
+    var cookieWriter: (String) -> Unit = {}
+
+    /** Callbacks deferred until page scripts finish (IntersectionObserver's first report, `load` handlers). */
+    val pendingCallbacks = ArrayList<(Interpreter) -> Unit>()
 
     private class ObserverRegistration(val callback: JsFunction, val target: ElementNode, val subtree: Boolean)
 
-    fun wrap(node: ElementNode): DomElement = wrappers.getOrPut(node) { DomElement(node, this) }
+    fun wrap(node: ElementNode): DomElement = wrappers.getOrPut(node) { DomElement(node, this).also { it.proto = htmlElementProto } }
+
+    fun wrapNode(node: Node): JsValue = when (node) {
+        is ElementNode -> wrap(node)
+        is TextNode -> textWrappers.getOrPut(node) { DomText(node, this).also { it.proto = textProto } }
+    }
+
+    fun siblingOf(node: Node, step: Int, elementsOnly: Boolean): JsValue {
+        val siblings = node.parent?.children ?: return JsNull
+        var i = siblings.indexOf(node) + step
+        while (i in siblings.indices) {
+            val s = siblings[i]
+            if (!elementsOnly || s is ElementNode) return wrapNode(s)
+            i += step
+        }
+        return JsNull
+    }
+
+    fun isConnected(node: Node): Boolean {
+        var cur: Node? = node
+        while (cur != null) { if (cur === root) return true; cur = cur.parent }
+        return false
+    }
 
     /** `<canvas>` uses width/height HTML attributes for its bitmap resolution (default 300x150 per spec), not CSS. */
     fun getOrCreateCanvasContext(node: ElementNode): CanvasContext2D = canvasContexts.getOrPut(node) {
@@ -67,46 +117,56 @@ class DomBridge(private val root: ElementNode) {
     /** For Tab to merge into its image map, since canvases render via the same inline-image path as `<img>`/`<svg>`. */
     fun canvasBitmaps(): Map<ElementNode, Bitmap> = canvasContexts.mapValues { it.value.bitmap }
 
-    /**
-     * Bubbles an event of [type] from [startNode] up through every ancestor
-     * (inclusive), running each one's inline `on<type>="..."` attribute (if
-     * any, with an implicit `event` variable in scope - a sloppy-mode-JS-
-     * style simplification, not a real closure over the handler's own
-     * scope) and any `addEventListener(type, ...)` listeners, `this`-bound
-     * to that ancestor. There's no `stopPropagation()` - once dispatched,
-     * an event always reaches the root. Returns the constructed
-     * [JsEvent] so the caller can check `defaultPrevented` (e.g. to decide
-     * whether a link navigation or form submission should proceed) and
-     * whether anything ran at all (worth a re-style/re-layout).
-     */
     fun dispatchClick(startNode: ElementNode, interpreter: Interpreter): JsEvent =
         dispatchEvent(startNode, "click", interpreter)
 
+    /**
+     * Bubbles an event of [type] from [startNode] up through every ancestor, running each one's
+     * inline `on<type>="..."` attribute (with an implicit `event` variable in scope) and its
+     * `addEventListener` listeners, until a listener calls `stopPropagation()`. Returns the event so
+     * the caller can check `defaultPrevented` and whether anything ran.
+     */
     fun dispatchEvent(startNode: ElementNode, type: String, interpreter: Interpreter): JsEvent {
         val event = JsEvent(type, wrap(startNode))
+        dispatchEventObject(startNode, event, interpreter)
+        return event
+    }
+
+    fun dispatchEventObject(startNode: ElementNode, event: JsValue, interpreter: Interpreter): Boolean {
+        val type = eventType(event)
+        (event as? JsObject)?.let { if (it.get("target") == JsUndefined || it.get("target") == JsNull) it.set("target", wrap(startNode)) }
         interpreter.globalEnv.declare("event", event)
+        var ran = false
         var current: ElementNode? = startNode
         while (current != null) {
+            (event as? JsObject)?.set("currentTarget", wrap(current))
             val onAttr = current.attr("on$type")
             if (!onAttr.isNullOrBlank()) {
                 try {
                     interpreter.run(Parser(Lexer(onAttr).tokenize()).parseProgram())
-                    event.listenersRan = true
+                    ran = true
                 } catch (_: Exception) {
                     // A broken inline handler shouldn't block bubbling to ancestors.
                 }
             }
-            if (wrappers[current]?.runListeners(type, interpreter, event) == true) event.listenersRan = true
+            if (wrappers[current]?.runListeners(type, interpreter, event) == true) ran = true
+            if ((event as? JsEvent)?.propagationStopped == true) break
             current = current.parent
         }
-        return event
+        if ((event as? JsEvent)?.propagationStopped != true) {
+            if (documentListeners.run(type, interpreter, documentObject ?: JsUndefined, event)) ran = true
+            if (windowListeners.run(type, interpreter, windowObject ?: JsUndefined, event)) ran = true
+        }
+        if (ran) (event as? JsEvent)?.listenersRan = true
+        return ran
     }
 
     fun install(env: Environment) {
         installMutationObserver(env)
-        val document = DomDocument(root)
+        val document = DomDocument(root, this)
+        document.proto = documentProto
+        documentObject = document
         document.set("documentElement", wrap(root))
-        document.set("body", findFirst(root, "body")?.let { wrap(it) } ?: JsNull)
         document.set("getElementById", NativeFunction("getElementById", 1) { _, _, args ->
             val id = toJsString(args.getOrElse(0) { JsUndefined })
             var found: ElementNode? = null
@@ -114,78 +174,123 @@ class DomBridge(private val root: ElementNode) {
             found?.let { wrap(it) } ?: JsNull
         })
         document.set("querySelector", NativeFunction("querySelector", 1) { _, _, args ->
-            querySelectorAll(toJsString(args.getOrElse(0) { JsUndefined })).firstOrNull()?.let { wrap(it) } ?: JsNull
+            querySelectorAll(root, toJsString(args.getOrElse(0) { JsUndefined })).firstOrNull()?.let { wrap(it) } ?: JsNull
         })
         document.set("querySelectorAll", NativeFunction("querySelectorAll", 1) { _, _, args ->
-            JsArray(querySelectorAll(toJsString(args.getOrElse(0) { JsUndefined })).map { wrap(it) as JsValue }.toMutableList())
+            wrapList(querySelectorAll(root, toJsString(args.getOrElse(0) { JsUndefined })))
+        })
+        document.set("getElementsByTagName", NativeFunction("getElementsByTagName", 1) { _, _, args ->
+            wrapList(listOf(root).filter { t -> toJsString(args.getOrElse(0) { JsUndefined }).lowercase().let { it == "*" || it == t.tag } } + elementsByTag(root, toJsString(args.getOrElse(0) { JsUndefined })))
+        })
+        document.set("getElementsByClassName", NativeFunction("getElementsByClassName", 1) { _, _, args ->
+            wrapList(elementsByClass(root, toJsString(args.getOrElse(0) { JsUndefined })))
+        })
+        document.set("getElementsByName", NativeFunction("getElementsByName", 1) { _, _, args ->
+            val n = toJsString(args.getOrElse(0) { JsUndefined })
+            val out = ArrayList<ElementNode>(); root.walkElements { if (it.attr("name") == n) out.add(it) }
+            wrapList(out)
         })
         document.set("createElement", NativeFunction("createElement", 1) { _, _, args ->
             wrap(ElementNode(toJsString(args.getOrElse(0) { JsString("div") }).lowercase()))
         })
-        document.set("addEventListener", NativeFunction("addEventListener", 2) { _, _, args ->
-            val type = toJsString(args.getOrElse(0) { JsUndefined })
-            val fn = args.getOrNull(1) as? JsFunction
-            if (type == "DOMContentLoaded" && fn != null) domContentLoadedListeners.add(fn)
-            JsUndefined
+        document.set("createElementNS", NativeFunction("createElementNS", 2) { _, _, args ->
+            wrap(ElementNode(toJsString(args.getOrElse(1) { JsString("div") }).lowercase()))
         })
+        document.set("createTextNode", NativeFunction("createTextNode", 1) { _, _, args ->
+            wrapNode(TextNode(toJsString(args.getOrElse(0) { JsUndefined })))
+        })
+        // Comments aren't kept in this DOM; an empty text node stands in so insertion calls still work.
+        document.set("createComment", NativeFunction("createComment", 1) { _, _, _ -> wrapNode(TextNode("")) })
+        document.set("createDocumentFragment", NativeFunction("createDocumentFragment", 0) { _, _, _ -> wrap(ElementNode(FRAGMENT_TAG)) })
+        document.set("createEvent", NativeFunction("createEvent", 1) { _, _, _ ->
+            JsEvent("", JsNull).also { ev ->
+                ev.set("initEvent", NativeFunction("initEvent", 3) { _, _, a -> ev.set("type", JsString(toJsString(a.getOrElse(0) { JsUndefined }))); JsUndefined })
+                ev.set("initCustomEvent", NativeFunction("initCustomEvent", 4) { _, _, a ->
+                    ev.set("type", JsString(toJsString(a.getOrElse(0) { JsUndefined }))); ev.set("detail", a.getOrElse(3) { JsNull }); JsUndefined
+                })
+            }
+        })
+        for ((name, fn) in documentListeners.methods(document) { ev, i -> dispatchToDocument(ev, i) }) document.set(name, fn)
+        document.set("hasFocus", NativeFunction("hasFocus", 0) { _, _, _ -> JsBoolean(true) })
+        document.set("elementFromPoint", NativeFunction("elementFromPoint", 2) { _, _, _ -> JsNull })
+        document.set("execCommand", NativeFunction("execCommand", 1) { _, _, _ -> JsBoolean(false) })
+        document.set("fonts", JsObject().also { fonts ->
+            fonts.set("ready", JsPromise().also { it.resolve(fonts) })
+            fonts.set("load", NativeFunction("load", 1) { _, _, _ -> JsPromise().also { it.resolve(JsArray()) } })
+            fonts.set("check", NativeFunction("check", 1) { _, _, _ -> JsBoolean(true) })
+            fonts.set("add", NativeFunction("add", 1) { _, _, _ -> JsUndefined })
+            fonts.set("status", JsString("loaded"))
+        })
+        document.set("implementation", JsObject().also { it.set("hasFeature", NativeFunction("hasFeature", 0) { _, _, _ -> JsBoolean(true) }) })
         env.declare("document", document)
 
-        val window = JsObject()
+        val window = env.get("globalThis") as? JsObject ?: JsObject()
+        windowObject = window
+        env.declare("window", window)
+        for (alias in listOf("self", "top", "parent", "frames")) env.declare(alias, window)
         window.set("document", document)
+        document.set("defaultView", window)
         window.set("alert", NativeFunction("alert", 1) { _, _, args ->
             println("[alert] " + toJsString(args.getOrElse(0) { JsUndefined }))
             JsUndefined
         })
-        window.set("addEventListener", NativeFunction("addEventListener", 2) { _, _, args ->
-            val type = toJsString(args.getOrElse(0) { JsUndefined })
-            (args.getOrNull(1) as? JsFunction)?.let { windowListeners.getOrPut(type) { ArrayList() }.add(it) }
-            JsUndefined
-        })
-        env.declare("window", window)
+        for ((name, fn) in windowListeners.methods(window) { ev, i -> windowListeners.run(eventType(ev), i, window, ev) }) window.set(name, fn)
+        installBrowserApis(env, this, window)
     }
 
-    /** Fires a `window`-level event (currently just `popstate`, from Tab's pushState/back-forward handling) with no bubbling concept - there's only one window. */
+    private fun dispatchToDocument(event: JsValue, interp: Interpreter): Boolean {
+        val type = eventType(event)
+        val ran = documentListeners.run(type, interp, documentObject ?: JsUndefined, event)
+        return windowListeners.run(type, interp, windowObject ?: JsUndefined, event) || ran
+    }
+
+    fun wrapList(nodes: List<ElementNode>): JsArray = JsArray(nodes.map { wrap(it) as JsValue }.toMutableList())
+
+    /** Fires a `window`-level event (`popstate` from Tab's history handling, `load`, `resize`...). */
     fun dispatchWindowEvent(type: String, interpreter: Interpreter, event: JsEvent) {
-        for (fn in (windowListeners[type] ?: emptyList()).toList()) fn.call(interpreter, JsUndefined, listOf(event))
-    }
-
-    fun fireDomContentLoaded(interpreter: Interpreter) {
-        for (fn in domContentLoadedListeners) fn.call(interpreter, JsUndefined, emptyList())
+        windowListeners.run(type, interpreter, windowObject ?: JsUndefined, event)
     }
 
     /**
-     * `new MutationObserver(callback)` / `.observe(target, options)` /
-     * `.disconnect()`. A real, working subset: every mutation is reported
-     * the instant it happens, as a single-record callback call, rather
-     * than the spec's microtask-batched multi-record delivery - consistent
-     * with this interpreter's Promises also resolving synchronously rather
-     * than through a real microtask queue. `options` is accepted but not
-     * used to filter mutation types (any observed target reports
-     * attribute/childList/characterData changes alike) - only
-     * `subtree` is honored. Only the method-style mutations
-     * (`setAttribute`/`removeAttribute`/`appendChild`/`remove`) notify -
-     * those run as NativeFunction calls, which receive an Interpreter to
-     * invoke the observer callback with. Property-style mutations
-     * (`el.textContent = x`, `el.innerHTML = x`, `el.className = x`,
-     * `classList.add(...)`) go through `DomElement.set()`, a plain
-     * property setter with no Interpreter parameter to call an observer
-     * callback with at all - a real, accepted gap rather than
-     * restructuring JsObject's base `set()` signature project-wide for
-     * this one caller's benefit.
+     * Runs after every page script: `DOMContentLoaded` on document and window, then `readyState`
+     * "complete", `readystatechange`, window `load`, and anything scripts deferred (an
+     * IntersectionObserver's first report) until the page had finished loading.
+     */
+    fun fireDomContentLoaded(interpreter: Interpreter) {
+        readyState = "interactive"
+        dispatchToDocument(JsEvent("DOMContentLoaded", documentObject ?: JsNull), interpreter)
+        readyState = "complete"
+        documentListeners.run("readystatechange", interpreter, documentObject ?: JsUndefined, JsEvent("readystatechange", documentObject ?: JsNull))
+        (documentObject?.get("onreadystatechange") as? JsFunction)?.let { try { it.call(interpreter, documentObject!!, emptyList()) } catch (_: Exception) {} }
+        val loadEvent = JsEvent("load", windowObject ?: JsNull)
+        windowListeners.run("load", interpreter, windowObject ?: JsUndefined, loadEvent)
+        (windowObject?.get("onload") as? JsFunction)?.let { try { it.call(interpreter, windowObject!!, listOf(loadEvent)) } catch (_: Exception) {} }
+        flushPendingCallbacks(interpreter)
+    }
+
+    fun flushPendingCallbacks(interpreter: Interpreter) {
+        while (pendingCallbacks.isNotEmpty()) {
+            val batch = pendingCallbacks.toList()
+            pendingCallbacks.clear()
+            for (cb in batch) try { cb(interpreter) } catch (_: Exception) {}
+        }
+    }
+
+    /**
+     * `new MutationObserver(callback)` / `.observe(target, options)` / `.disconnect()`. Every
+     * mutation is reported the instant it happens, as a single-record callback call. `options` is
+     * accepted but only `subtree` is honored. Only method-style mutations notify (they run with an
+     * Interpreter to call the observer with); property-style ones (`el.textContent = x`) don't.
      */
     fun installMutationObserver(env: Environment) {
         val ctor = NativeFunction("MutationObserver", 1) { _, thisArg, args ->
             val callback = args.getOrNull(0) as? JsFunction
             val obj = thisArg as? JsObject ?: JsObject()
             obj.set("observe", NativeFunction("observe", 2) { _, _, observeArgs ->
-                val target = (observeArgs.getOrNull(0) as? DomElement)?.node
+                val target = (observeArgs.getOrNull(0) as? DomElement)?.node ?: (observeArgs.getOrNull(0) as? DomDocument)?.let { root }
                 val options = observeArgs.getOrNull(1) as? JsObject
                 if (target != null && callback != null) {
                     val subtree = options?.get("subtree")?.let { isTruthy(it) } ?: false
-                    // Per spec, observing a target that's already observed by this same
-                    // observer replaces the existing registration rather than adding a
-                    // second one - otherwise every future mutation on that target would
-                    // deliver the callback once per redundant observe() call.
                     mutationObservers.removeAll { it.callback === callback && it.target === target }
                     mutationObservers.add(ObserverRegistration(callback, target, subtree))
                 }
@@ -195,6 +300,7 @@ class DomBridge(private val root: ElementNode) {
                 mutationObservers.removeAll { it.callback === callback }
                 JsUndefined
             })
+            obj.set("takeRecords", NativeFunction("takeRecords", 0) { _, _, _ -> JsArray() })
             obj
         }
         env.declare("MutationObserver", ctor)
@@ -218,6 +324,8 @@ class DomBridge(private val root: ElementNode) {
             record.set("type", JsString(type))
             record.set("target", wrap(target))
             record.set("attributeName", attributeName?.let { JsString(it) } ?: JsNull)
+            record.set("addedNodes", JsArray())
+            record.set("removedNodes", JsArray())
             try {
                 reg.callback.call(interpreter, JsUndefined, listOf(JsArray(mutableListOf(record))))
             } catch (_: Exception) {
@@ -226,117 +334,232 @@ class DomBridge(private val root: ElementNode) {
         }
     }
 
-    private fun findFirst(node: ElementNode, tag: String): ElementNode? {
+    fun findFirst(node: ElementNode, tag: String): ElementNode? {
         var found: ElementNode? = null
         node.walkElements { if (found == null && it.tag == tag) found = it }
         return found
     }
 
-    private fun querySelectorAll(selectorText: String): List<ElementNode> {
-        val selector = CssParser("").parseSingleSelector(selectorText) ?: return emptyList()
+    /** Descendants of [scope] matching a selector list (`a, .b > c`). An unsupported selector matches nothing. */
+    fun querySelectorAll(scope: ElementNode, selectorText: String): List<ElementNode> {
+        val selectors = splitSelectorList(selectorText).mapNotNull { CssParser("").parseSingleSelector(it) }
+        if (selectors.isEmpty()) return emptyList()
         val results = ArrayList<ElementNode>()
-        root.walkElements { if (selector.matches(it)) results.add(it) }
+        scope.walkElements { el -> if (el !== scope && selectors.any { it.matches(el) }) results.add(el) }
         return results
+    }
+
+    private fun splitSelectorList(text: String): List<String> {
+        val parts = ArrayList<String>()
+        var depth = 0
+        val cur = StringBuilder()
+        for (c in text) {
+            when (c) {
+                '(', '[' -> depth++
+                ')', ']' -> depth--
+            }
+            if (c == ',' && depth == 0) { parts.add(cur.toString().trim()); cur.setLength(0) } else cur.append(c)
+        }
+        if (cur.isNotBlank()) parts.add(cur.toString().trim())
+        return parts.filter { it.isNotEmpty() }
     }
 }
 
 class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObject() {
-    private val listeners = HashMap<String, MutableList<JsFunction>>()
+    private val listenerSet = ListenerSet()
 
     /** Invokes every listener registered for [type] (see DomBridge.dispatchEvent), `this`-bound to this element. */
-    fun runListeners(type: String, interpreter: Interpreter, event: JsEvent): Boolean {
-        val fns = listeners[type] ?: return false
-        for (fn in fns.toList()) fn.call(interpreter, this, listOf(event))
-        return fns.isNotEmpty()
+    fun runListeners(type: String, interpreter: Interpreter, event: JsValue): Boolean {
+        val ran = listenerSet.run(type, interpreter, this, event)
+        val handler = super.get("on$type") as? JsFunction
+        if (handler != null) {
+            try { handler.call(interpreter, this, listOf(event)) } catch (_: Exception) {}
+            return true
+        }
+        return ran
     }
 
-    /** True if this element (or an ancestor of the same tag) has any listener/attribute wired for [type]. */
-    fun hasListenerFor(type: String): Boolean = listeners[type]?.isNotEmpty() == true || !node.attr("on$type").isNullOrBlank()
+    /** True if this element has any listener/attribute wired for [type]. */
+    fun hasListenerFor(type: String): Boolean =
+        listenerSet.listeners[type]?.isNotEmpty() == true || !node.attr("on$type").isNullOrBlank() || super.get("on$type") is JsFunction
+
+    private fun fn(name: String, arity: Int, impl: (Interpreter, List<JsValue>) -> JsValue) = NativeFunction(name, arity) { i, _, a -> impl(i, a) }
+
+    private fun nodeArg(v: JsValue): Node? = when (v) {
+        is DomElement -> v.node
+        is DomText -> v.node
+        is JsString -> TextNode(v.value)
+        else -> null
+    }
+
+    private fun changed(i: Interpreter) = bridge.notifyMutation(i, node, "childList")
 
     override fun get(name: String): JsValue = when (name) {
-        "tagName" -> JsString(node.tag.uppercase())
+        "tagName", "nodeName" -> JsString(if (node.tag == FRAGMENT_TAG) "#document-fragment" else node.tag.uppercase())
+        "localName" -> JsString(node.tag)
+        "nodeType" -> JsNumber(if (node.tag == FRAGMENT_TAG) 11.0 else 1.0)
         "id" -> JsString(node.attr("id") ?: "")
         "className" -> JsString(node.attr("class") ?: "")
-        "textContent" -> JsString(collectText(node))
+        "textContent", "innerText" -> JsString(collectText(node))
         "innerHTML" -> JsString(node.children.joinToString("") { serializeHtml(it) })
+        "outerHTML" -> JsString(serializeHtml(node))
         "style" -> DomStyle(node)
+        "dataset" -> DomDataset(node)
         "children" -> JsArray(node.children.filterIsInstance<ElementNode>().map { bridge.wrap(it) as JsValue }.toMutableList())
+        "childNodes" -> JsArray(node.children.map { bridge.wrapNode(it) }.toMutableList())
+        "childElementCount" -> JsNumber(node.children.count { it is ElementNode }.toDouble())
+        "firstChild" -> node.children.firstOrNull()?.let { bridge.wrapNode(it) } ?: JsNull
+        "lastChild" -> node.children.lastOrNull()?.let { bridge.wrapNode(it) } ?: JsNull
+        "firstElementChild" -> node.children.firstOrNull { it is ElementNode }?.let { bridge.wrapNode(it) } ?: JsNull
+        "lastElementChild" -> node.children.lastOrNull { it is ElementNode }?.let { bridge.wrapNode(it) } ?: JsNull
         "parentNode", "parentElement" -> node.parent?.let { bridge.wrap(it) } ?: JsNull
-        "nextElementSibling" -> adjacentElementSibling(1)
-        "previousElementSibling" -> adjacentElementSibling(-1)
+        "nextElementSibling" -> bridge.siblingOf(node, 1, elementsOnly = true)
+        "previousElementSibling" -> bridge.siblingOf(node, -1, elementsOnly = true)
+        "nextSibling" -> bridge.siblingOf(node, 1, elementsOnly = false)
+        "previousSibling" -> bridge.siblingOf(node, -1, elementsOnly = false)
+        "ownerDocument" -> bridge.documentObject ?: JsNull
+        "isConnected" -> JsBoolean(bridge.isConnected(node))
         "classList" -> makeClassList(node)
-        "hasAttribute" -> NativeFunction("hasAttribute", 1) { _, _, args ->
-            JsBoolean(node.attr(toJsString(args.getOrElse(0) { JsUndefined })) != null)
+        "attributes" -> JsArray(node.attributes.entries.map { (k, v) -> JsObject().also { a -> a.set("name", JsString(k)); a.set("value", JsString(v)) } as JsValue }.toMutableList())
+        "hidden" -> JsBoolean(node.attributes.containsKey("hidden"))
+        "href", "src", "action", "rel", "target", "alt", "title", "lang", "dir", "placeholder", "content", "role" ->
+            node.attr(name)?.let { JsString(it) } ?: JsString("")
+        "hasAttribute" -> fn("hasAttribute", 1) { _, a -> JsBoolean(node.attr(toJsString(a.getOrElse(0) { JsUndefined })) != null) }
+        "getAttributeNames" -> fn("getAttributeNames", 0) { _, _ -> JsArray(node.attributes.keys.map { JsString(it) as JsValue }.toMutableList()) }
+        "hasAttributes" -> fn("hasAttributes", 0) { _, _ -> JsBoolean(node.attributes.isNotEmpty()) }
+        "hasChildNodes" -> fn("hasChildNodes", 0) { _, _ -> JsBoolean(node.children.isNotEmpty()) }
+        "matches", "webkitMatchesSelector" -> fn("matches", 1) { _, a ->
+            JsBoolean(bridge.querySelectorAll(node.parent ?: node, toJsString(a.getOrElse(0) { JsUndefined })).any { it === node })
         }
-        "matches" -> NativeFunction("matches", 1) { _, _, args ->
-            val selector = CssParser("").parseSingleSelector(toJsString(args.getOrElse(0) { JsUndefined }))
-            JsBoolean(selector?.matches(node) ?: false)
-        }
-        "closest" -> NativeFunction("closest", 1) { _, _, args ->
-            val selector = CssParser("").parseSingleSelector(toJsString(args.getOrElse(0) { JsUndefined }))
+        "closest" -> fn("closest", 1) { _, a ->
+            val sel = toJsString(a.getOrElse(0) { JsUndefined })
             var current: ElementNode? = node
             var result: JsValue = JsNull
-            while (current != null && selector != null) {
-                if (selector.matches(current)) { result = bridge.wrap(current); break }
+            while (current != null) {
+                val scope = current.parent ?: current
+                if (bridge.querySelectorAll(scope, sel).any { it === current }) { result = bridge.wrap(current); break }
                 current = current.parent
             }
             result
         }
-        "setAttribute" -> NativeFunction("setAttribute", 2) { interp, _, args ->
-            val attrName = toJsString(args.getOrElse(0) { JsUndefined })
-            node.attributes[attrName] = toJsString(args.getOrElse(1) { JsUndefined })
-            bridge.notifyMutation(interp, node, "attributes", attrName)
+        "querySelector" -> fn("querySelector", 1) { _, a -> bridge.querySelectorAll(node, toJsString(a.getOrElse(0) { JsUndefined })).firstOrNull()?.let { bridge.wrap(it) } ?: JsNull }
+        "querySelectorAll" -> fn("querySelectorAll", 1) { _, a -> bridge.wrapList(bridge.querySelectorAll(node, toJsString(a.getOrElse(0) { JsUndefined }))) }
+        "getElementsByTagName" -> fn("getElementsByTagName", 1) { _, a -> bridge.wrapList(elementsByTag(node, toJsString(a.getOrElse(0) { JsUndefined }))) }
+        "getElementsByClassName" -> fn("getElementsByClassName", 1) { _, a -> bridge.wrapList(elementsByClass(node, toJsString(a.getOrElse(0) { JsUndefined }))) }
+        "setAttribute" -> fn("setAttribute", 2) { i, a ->
+            val attrName = toJsString(a.getOrElse(0) { JsUndefined }).lowercase()
+            node.attributes[attrName] = toJsString(a.getOrElse(1) { JsUndefined })
+            bridge.notifyMutation(i, node, "attributes", attrName)
             JsUndefined
         }
-        "getAttribute" -> NativeFunction("getAttribute", 1) { _, _, args ->
-            node.attr(toJsString(args.getOrElse(0) { JsUndefined }))?.let { JsString(it) } ?: JsNull
-        }
-        "removeAttribute" -> NativeFunction("removeAttribute", 1) { interp, _, args ->
-            val attrName = toJsString(args.getOrElse(0) { JsUndefined })
+        "setAttributeNS" -> fn("setAttributeNS", 3) { _, a -> node.attributes[toJsString(a.getOrElse(1) { JsUndefined })] = toJsString(a.getOrElse(2) { JsUndefined }); JsUndefined }
+        "getAttribute" -> fn("getAttribute", 1) { _, a -> node.attr(toJsString(a.getOrElse(0) { JsUndefined }).lowercase())?.let { JsString(it) } ?: JsNull }
+        "removeAttribute" -> fn("removeAttribute", 1) { i, a ->
+            val attrName = toJsString(a.getOrElse(0) { JsUndefined }).lowercase()
             node.attributes.remove(attrName)
-            bridge.notifyMutation(interp, node, "attributes", attrName)
+            bridge.notifyMutation(i, node, "attributes", attrName)
             JsUndefined
         }
-        "appendChild" -> NativeFunction("appendChild", 1) { interp, _, args ->
-            val child = args.getOrNull(0) as? DomElement
-            // Guard the two cases real DOM rejects outright: appending a
-            // node to itself, or to one of its own descendants (which would
-            // make the appended node both an ancestor and a child of `node`
-            // - a cycle that would hang any tree walk).
-            if (child != null && child.node !== node && !isAncestor(child.node, node)) {
-                val oldParent = child.node.parent
-                if (oldParent != null && oldParent !== node) {
-                    // appendChild MOVES a node that's already attached elsewhere -
-                    // it must not be left listed as a child of its old parent too.
-                    oldParent.children.remove(child.node)
-                    bridge.notifyMutation(interp, oldParent, "childList")
-                } else if (oldParent === node) {
-                    node.children.remove(child.node)
-                }
-                child.node.parent = node
-                node.children.add(child.node)
-                bridge.notifyMutation(interp, node, "childList")
-            }
-            args.getOrElse(0) { JsUndefined }
+        "toggleAttribute" -> fn("toggleAttribute", 2) { _, a ->
+            val attrName = toJsString(a.getOrElse(0) { JsUndefined }).lowercase()
+            val force = a.getOrNull(1)?.takeIf { it != JsUndefined }?.let { isTruthy(it) }
+            val on = force ?: !node.attributes.containsKey(attrName)
+            if (on) node.attributes.putIfAbsent(attrName, "") else node.attributes.remove(attrName)
+            JsBoolean(on)
         }
-        "remove" -> NativeFunction("remove", 0) { interp, _, _ ->
+        "appendChild" -> fn("appendChild", 1) { i, a ->
+            nodeArg(a.getOrElse(0) { JsUndefined })?.let { insertChild(node, it, null); changed(i) }
+            a.getOrElse(0) { JsUndefined }
+        }
+        "append" -> fn("append", 1) { i, a -> a.mapNotNull { nodeArg(it) }.forEach { insertChild(node, it, null) }; changed(i); JsUndefined }
+        "prepend" -> fn("prepend", 1) { i, a ->
+            val first = node.children.firstOrNull()
+            a.mapNotNull { nodeArg(it) }.forEach { insertChild(node, it, first) }
+            changed(i); JsUndefined
+        }
+        "insertBefore" -> fn("insertBefore", 2) { i, a ->
+            val child = nodeArg(a.getOrElse(0) { JsUndefined })
+            val ref = a.getOrNull(1)?.let { nodeArg(it) }?.takeIf { it.parent === node }
+            if (child != null) { insertChild(node, child, ref); changed(i) }
+            a.getOrElse(0) { JsUndefined }
+        }
+        "removeChild" -> fn("removeChild", 1) { i, a ->
+            nodeArg(a.getOrElse(0) { JsUndefined })?.takeIf { it.parent === node }?.let { detachNode(it); changed(i) }
+            a.getOrElse(0) { JsUndefined }
+        }
+        "replaceChild" -> fn("replaceChild", 2) { i, a ->
+            val newChild = nodeArg(a.getOrElse(0) { JsUndefined })
+            val old = a.getOrNull(1)?.let { nodeArg(it) }?.takeIf { it.parent === node }
+            if (newChild != null && old != null) { insertChild(node, newChild, old); detachNode(old); changed(i) }
+            a.getOrElse(1) { JsUndefined }
+        }
+        "replaceChildren" -> fn("replaceChildren", 0) { i, a ->
+            for (c in node.children.toList()) detachNode(c)
+            a.mapNotNull { nodeArg(it) }.forEach { insertChild(node, it, null) }
+            changed(i); JsUndefined
+        }
+        "remove" -> fn("remove", 0) { i, _ ->
             val parent = node.parent
-            parent?.children?.remove(node)
-            node.parent = null
-            if (parent != null) bridge.notifyMutation(interp, parent, "childList")
+            detachNode(node)
+            if (parent != null) bridge.notifyMutation(i, parent, "childList")
             JsUndefined
         }
-        "addEventListener" -> NativeFunction("addEventListener", 2) { _, _, args ->
-            val type = toJsString(args.getOrElse(0) { JsUndefined })
-            (args.getOrNull(1) as? JsFunction)?.let { listeners.getOrPut(type) { ArrayList() }.add(it) }
+        "before", "after", "replaceWith" -> fn(name, 1) { i, a ->
+            val parent = node.parent
+            if (parent != null) {
+                val ref = if (name == "after") parent.children.getOrNull(parent.children.indexOf(node) + 1) else node
+                a.mapNotNull { nodeArg(it) }.forEach { insertChild(parent, it, ref) }
+                if (name == "replaceWith") detachNode(node)
+                bridge.notifyMutation(i, parent, "childList")
+            }
             JsUndefined
         }
-        "getContext" -> NativeFunction("getContext", 1) { _, _, args ->
-            if (toJsString(args.getOrElse(0) { JsUndefined }) == "2d") bridge.getOrCreateCanvasContext(node) else JsNull
+        "insertAdjacentHTML", "insertAdjacentElement", "insertAdjacentText" -> fn(name, 2) { i, a ->
+            val where = toJsString(a.getOrElse(0) { JsUndefined }).lowercase()
+            val payload = a.getOrElse(1) { JsUndefined }
+            val nodes: List<Node> = when (name) {
+                "insertAdjacentHTML" -> parseFragment(toJsString(payload))
+                "insertAdjacentText" -> listOf(TextNode(toJsString(payload)))
+                else -> listOfNotNull(nodeArg(payload))
+            }
+            val parent = node.parent
+            when (where) {
+                "beforebegin" -> if (parent != null) nodes.forEach { insertChild(parent, it, node) }
+                "afterbegin" -> { val first = node.children.firstOrNull(); nodes.forEach { insertChild(node, it, first) } }
+                "beforeend" -> nodes.forEach { insertChild(node, it, null) }
+                "afterend" -> if (parent != null) { val next = parent.children.getOrNull(parent.children.indexOf(node) + 1); nodes.forEach { insertChild(parent, it, next) } }
+            }
+            changed(i)
+            if (name == "insertAdjacentElement") payload else JsUndefined
+        }
+        "cloneNode" -> fn("cloneNode", 1) { _, a -> bridge.wrapNode(cloneNodeTree(node, truthy(a.getOrNull(0)))) }
+        "contains" -> fn("contains", 1) { _, a ->
+            val other = nodeArg(a.getOrElse(0) { JsUndefined })
+            var cur: Node? = other
+            var found = false
+            while (cur != null) { if (cur === node) { found = true; break }; cur = cur.parent }
+            JsBoolean(found)
+        }
+        "getRootNode" -> fn("getRootNode", 0) { _, _ -> if (bridge.isConnected(node)) bridge.documentObject ?: JsNull else this }
+        "addEventListener", "removeEventListener", "dispatchEvent" ->
+            listenerSet.methods(this) { ev, i -> node.let { bridge.dispatchEventObject(it, ev, i) } }.getValue(name)
+        "click" -> fn("click", 0) { i, _ -> bridge.dispatchEvent(node, "click", i); JsUndefined }
+        "focus", "blur", "scrollIntoView", "scrollTo", "scrollBy", "scroll", "select", "setPointerCapture", "releasePointerCapture" ->
+            fn(name, 0) { _, _ -> JsUndefined }
+        "getBoundingClientRect" -> fn("getBoundingClientRect", 0) { _, _ -> emptyRect() }
+        "getClientRects" -> fn("getClientRects", 0) { _, _ -> JsArray() }
+        "animate" -> fn("animate", 2) { _, _ -> JsObject().also { anim ->
+            anim.set("finished", JsPromise().also { it.resolve(anim) })
+            anim.set("cancel", NativeFunction("cancel", 0) { _, _, _ -> JsUndefined })
+        } }
+        "offsetWidth", "offsetHeight", "offsetTop", "offsetLeft", "clientWidth", "clientHeight", "clientTop", "clientLeft",
+        "scrollWidth", "scrollHeight", "scrollTop", "scrollLeft" -> super.get(name).takeIf { it != JsUndefined } ?: JsNumber(0.0)
+        "getContext" -> fn("getContext", 1) { _, a ->
+            if (toJsString(a.getOrElse(0) { JsUndefined }) == "2d") bridge.getOrCreateCanvasContext(node) else JsNull
         }
         "value" -> JsString(if (node.tag == "textarea") collectText(node) else (node.attr("value") ?: ""))
         "checked" -> JsBoolean(node.attributes.containsKey("checked"))
-        "type" -> JsString(node.attr("type") ?: if (node.tag == "textarea") "textarea" else "text")
+        "type" -> JsString(node.attr("type") ?: if (node.tag == "textarea") "textarea" else if (node.tag == "input") "text" else "")
         "name" -> JsString(node.attr("name") ?: "")
         "disabled" -> JsBoolean(node.attributes.containsKey("disabled"))
         else -> super.get(name)
@@ -344,13 +567,15 @@ class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObjec
 
     override fun set(name: String, value: JsValue) {
         when (name) {
-            "textContent" -> {
+            "textContent", "innerText" -> {
+                for (c in node.children) c.parent = null
                 node.children.clear()
-                node.children.add(TextNode(toJsString(value), node))
+                toJsString(value).takeIf { it.isNotEmpty() }?.let { node.children.add(TextNode(it, node)) }
             }
             "id" -> node.attributes["id"] = toJsString(value)
             "className" -> node.attributes["class"] = toJsString(value)
             "innerHTML" -> setInnerHtml(toJsString(value))
+            "outerHTML" -> node.parent?.let { parent -> parseFragment(toJsString(value)).forEach { insertChild(parent, it, node) }; detachNode(node) }
             "value" -> if (node.tag == "textarea") {
                 node.children.clear()
                 node.children.add(TextNode(toJsString(value), node))
@@ -359,41 +584,27 @@ class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObjec
             }
             "checked" -> if (isTruthy(value)) node.attributes["checked"] = "checked" else node.attributes.remove("checked")
             "disabled" -> if (isTruthy(value)) node.attributes["disabled"] = "disabled" else node.attributes.remove("disabled")
+            "hidden" -> if (isTruthy(value)) node.attributes["hidden"] = "" else node.attributes.remove("hidden")
+            "href", "src", "alt", "title", "lang", "dir", "placeholder", "rel", "target", "type", "name", "action", "role" ->
+                node.attributes[name] = toJsString(value)
+            "style" -> node.attributes["style"] = toJsString(value)
             else -> super.set(name, value)
         }
     }
 
     private fun setInnerHtml(html: String) {
-        // Detach the old children properly - they may still be reachable
-        // from JS (a variable holding a node fetched before this reset), and
-        // must report a null parentNode/parentElement once they're gone
-        // rather than keep pointing at an element they're no longer inside.
+        // Old children may still be reachable from JS and must report a null parentNode once gone.
         for (old in node.children) old.parent = null
         node.children.clear()
-        // Parse as a full document and pull the fragment back out of the implicit html>body>div wrapper.
-        val doc = HtmlParser("<div>$html</div>").parse()
-        val body = doc.children.filterIsInstance<ElementNode>().firstOrNull { it.tag == "body" }
-        val wrapper = body?.children?.filterIsInstance<ElementNode>()?.firstOrNull { it.tag == "div" }
-        wrapper?.children?.forEach { child ->
-            if (child is ElementNode) child.parent = node
-            if (child is TextNode) child.parent = node
+        for (child in parseFragment(html)) {
+            child.parent = node
             node.children.add(child)
         }
     }
 
     private fun collectText(n: Node): String = when (n) {
         is TextNode -> n.text
-        is ElementNode -> n.children.joinToString("") { collectText(it) }
-    }
-
-    private fun adjacentElementSibling(step: Int): JsValue {
-        val siblings = node.parent?.children ?: return JsNull
-        var i = siblings.indexOf(node) + step
-        while (i in siblings.indices) {
-            (siblings[i] as? ElementNode)?.let { return bridge.wrap(it) }
-            i += step
-        }
-        return JsNull
+        is ElementNode -> if (n.tag == "script" || n.tag == "style") "" else n.children.joinToString("") { collectText(it) }
     }
 
     private fun makeClassList(node: ElementNode): JsObject {
@@ -402,69 +613,128 @@ class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObjec
         fun save(list: List<String>) { node.attributes["class"] = list.joinToString(" ") }
         obj.set("add", NativeFunction("add", 1) { _, _, args ->
             val c = classes()
-            val name = toJsString(args.getOrElse(0) { JsUndefined })
-            if (name !in c) c.add(name)
+            for (a in args) { val n = toJsString(a); if (n !in c) c.add(n) }
             save(c)
             JsUndefined
         })
         obj.set("remove", NativeFunction("remove", 1) { _, _, args ->
             val c = classes()
-            c.remove(toJsString(args.getOrElse(0) { JsUndefined }))
+            for (a in args) c.remove(toJsString(a))
             save(c)
             JsUndefined
         })
-        obj.set("toggle", NativeFunction("toggle", 1) { _, _, args ->
+        obj.set("toggle", NativeFunction("toggle", 2) { _, _, args ->
             val c = classes()
             val name = toJsString(args.getOrElse(0) { JsUndefined })
-            if (!c.remove(name)) c.add(name)
+            val force = args.getOrNull(1)?.takeIf { it != JsUndefined }?.let { isTruthy(it) }
+            val on = force ?: (name !in c)
+            c.remove(name)
+            if (on) c.add(name)
             save(c)
-            JsBoolean(name in c)
+            JsBoolean(on)
+        })
+        obj.set("replace", NativeFunction("replace", 2) { _, _, args ->
+            val c = classes()
+            val i = c.indexOf(toJsString(args.getOrElse(0) { JsUndefined }))
+            if (i >= 0) c[i] = toJsString(args.getOrElse(1) { JsUndefined })
+            save(c)
+            JsBoolean(i >= 0)
         })
         obj.set("contains", NativeFunction("contains", 1) { _, _, args ->
             JsBoolean(toJsString(args.getOrElse(0) { JsUndefined }) in classes())
         })
+        obj.set("item", NativeFunction("item", 1) { _, _, args ->
+            classes().getOrNull(com.projectfuture.browser.js.toNumber(args.getOrElse(0) { JsUndefined }).toInt())?.let { JsString(it) } ?: JsNull
+        })
+        obj.set("length", JsNumber(classes().size.toDouble()))
+        obj.set("value", JsString(node.attr("class") ?: ""))
         return obj
     }
 }
 
 /** `element.style.property = value` writes into the inline `style="..."` attribute, so it survives the next cascade re-run. */
 class DomStyle(private val node: ElementNode) : JsObject() {
-    override fun get(name: String): JsValue = currentDeclarations()[cssPropertyName(name)]?.let { JsString(it) } ?: JsString("")
+    override fun get(name: String): JsValue = when (name) {
+        "cssText" -> JsString(node.attr("style") ?: "")
+        "length" -> JsNumber(currentDeclarations().size.toDouble())
+        "setProperty" -> NativeFunction("setProperty", 3) { _, _, a ->
+            write(toJsString(a.getOrElse(0) { JsUndefined }), a.getOrNull(1)?.takeIf { it != JsNull && it != JsUndefined }?.let { toJsString(it) })
+            JsUndefined
+        }
+        "getPropertyValue" -> NativeFunction("getPropertyValue", 1) { _, _, a -> JsString(currentDeclarations()[toJsString(a.getOrElse(0) { JsUndefined })] ?: "") }
+        "removeProperty" -> NativeFunction("removeProperty", 1) { _, _, a ->
+            val key = toJsString(a.getOrElse(0) { JsUndefined })
+            val old = currentDeclarations()[key] ?: ""
+            write(key, null)
+            JsString(old)
+        }
+        "getPropertyPriority" -> NativeFunction("getPropertyPriority", 1) { _, _, _ -> JsString("") }
+        else -> currentDeclarations()[cssPropertyName(name)]?.let { JsString(it) } ?: JsString("")
+    }
 
     override fun set(name: String, value: JsValue) {
+        if (name == "cssText") { node.attributes["style"] = toJsString(value); return }
+        val v = if (value == JsNull || value == JsUndefined) null else toJsString(value)
+        write(cssPropertyName(name), v?.takeIf { it.isNotEmpty() })
+    }
+
+    private fun write(property: String, value: String?) {
         val decls = currentDeclarations().toMutableMap()
-        decls[cssPropertyName(name)] = toJsString(value)
+        if (value == null) decls.remove(property) else decls[property] = value
         node.attributes["style"] = decls.entries.joinToString("; ") { (k, v) -> "$k: $v" }
     }
 
     private fun currentDeclarations(): Map<String, String> = CssParser.parseInlineDeclarations(node.attr("style") ?: "")
 
-    /** JS uses camelCase (backgroundColor); CSS uses kebab-case (background-color). */
-    private fun cssPropertyName(js: String): String = js.replace(Regex("[A-Z]")) { "-" + it.value.lowercase() }
+    /** JS uses camelCase (backgroundColor); CSS uses kebab-case (background-color). Custom properties pass through. */
+    private fun cssPropertyName(js: String): String = if (js.startsWith("--")) js else js.replace(Regex("[A-Z]")) { "-" + it.value.lowercase() }
 }
 
-/** `document`: mostly a flat property bag (see DomBridge.install), except `title`, which reads/writes the live `<title>` element. */
-class DomDocument(private val root: ElementNode) : JsObject() {
+/** `document`: a property bag plus the live parts: `title`, `head`, `body`, `cookie`, `readyState`, `currentScript`. */
+class DomDocument(private val root: ElementNode, private val bridge: DomBridge) : JsObject() {
     override fun get(name: String): JsValue = when (name) {
-        "title" -> JsString(findTitle(root)?.let { collectTextStatic(it) } ?: "")
+        "title" -> JsString(findTitle(root)?.let { collectTextStatic(it) }?.trim() ?: "")
+        "head" -> bridge.findFirst(root, "head")?.let { bridge.wrap(it) } ?: JsNull
+        "body" -> bridge.findFirst(root, "body")?.let { bridge.wrap(it) } ?: JsNull
+        "cookie" -> JsString(bridge.cookieReader())
+        "readyState" -> JsString(bridge.readyState)
+        "currentScript" -> bridge.currentScript?.let { bridge.wrap(it) } ?: JsNull
+        "nodeType" -> JsNumber(9.0)
+        "nodeName" -> JsString("#document")
+        "visibilityState" -> JsString("visible")
+        "hidden" -> JsBoolean(false)
+        "compatMode" -> JsString("CSS1Compat")
+        "characterSet", "charset" -> JsString("UTF-8")
+        "contentType" -> JsString("text/html")
+        "referrer" -> JsString("")
+        "activeElement", "scrollingElement" -> bridge.findFirst(root, "body")?.let { bridge.wrap(it) } ?: JsNull
+        "forms" -> bridge.wrapList(elementsByTag(root, "form"))
+        "images" -> bridge.wrapList(elementsByTag(root, "img"))
+        "links" -> bridge.wrapList(elementsByTag(root, "a").filter { it.attr("href") != null })
+        "scripts" -> bridge.wrapList(elementsByTag(root, "script"))
+        "styleSheets" -> JsArray()
+        "childNodes", "children" -> JsArray(mutableListOf(bridge.wrap(root)))
+        "firstElementChild", "firstChild" -> bridge.wrap(root)
         else -> super.get(name)
     }
 
     override fun set(name: String, value: JsValue) {
-        if (name == "title") {
-            val text = toJsString(value)
-            val existing = findTitle(root)
-            if (existing != null) {
-                existing.children.clear()
-                existing.children.add(TextNode(text, existing))
-            } else {
-                val head = root.children.filterIsInstance<ElementNode>().firstOrNull { it.tag == "head" } ?: return
-                val newTitle = ElementNode("title", parent = head)
-                newTitle.children.add(TextNode(text, newTitle))
-                head.children.add(newTitle)
+        when (name) {
+            "title" -> {
+                val text = toJsString(value)
+                val existing = findTitle(root)
+                if (existing != null) {
+                    existing.children.clear()
+                    existing.children.add(TextNode(text, existing))
+                } else {
+                    val head = root.children.filterIsInstance<ElementNode>().firstOrNull { it.tag == "head" } ?: return
+                    val newTitle = ElementNode("title", parent = head)
+                    newTitle.children.add(TextNode(text, newTitle))
+                    head.children.add(newTitle)
+                }
             }
-        } else {
-            super.set(name, value)
+            "cookie" -> bridge.cookieWriter(toJsString(value))
+            else -> super.set(name, value)
         }
     }
 

@@ -87,6 +87,7 @@ fun installGlobals(env: Environment, interpreter: Interpreter) {
     numberCtor.set("isNaN", NativeFunction("isNaN", 1) { _, _, args -> val v = args.getOrNull(0); JsBoolean(v is JsNumber && v.value.isNaN()) })
     env.declare("Number", numberCtor)
     env.declare("Boolean", NativeFunction("Boolean", 1) { _, _, args -> JsBoolean(isTruthy(arg(args, 0))) })
+    installCompat(env, interpreter)
 }
 
 private fun arg(args: List<JsValue>, i: Int): JsValue = args.getOrElse(i) { JsUndefined }
@@ -227,9 +228,9 @@ private fun makeArrayCtor(): JsFunction = object : JsFunction("Array") {
 
 /** Resolves `obj.key(...)` for built-in Array/String methods; null means "not a built-in, fall back to normal property lookup". */
 fun builtinMethodCall(interpreter: Interpreter, obj: JsValue, key: String, args: List<JsValue>): JsValue? = when (obj) {
-    is JsArray -> arrayMethod(interpreter, obj, key, args)
-    is JsString -> stringMethod(interpreter, obj, key, args)
-    is JsNumber -> numberMethod(obj, key, args)
+    is JsArray -> arrayMethod(interpreter, obj, key, args) ?: extraArrayMethod(interpreter, obj, key, args)
+    is JsString -> stringMethod(interpreter, obj, key, args) ?: extraStringMethod(obj, key, args)
+    is JsNumber -> numberMethod(obj, key, args) ?: extraNumberMethod(obj, key)
     is JsTypedArray -> typedArrayMethod(interpreter, obj, key, args)
     else -> null
 }

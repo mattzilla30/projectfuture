@@ -13,7 +13,10 @@ data class Cookie(
     // makes it "host-only": it must be sent back only to the exact host that set it, never a
     // subdomain. Only a cookie that *does* carry a `Domain` attribute (with or without the
     // leading dot RFC 6265 says to strip) is a "domain cookie" that also matches subdomains.
-    val hostOnly: Boolean = true
+    val hostOnly: Boolean = true,
+    // Set by the `HttpOnly` attribute: sent on requests but never visible to or replaceable by
+    // page scripts through `document.cookie`.
+    val httpOnly: Boolean = false
 )
 
 /**
@@ -25,9 +28,8 @@ data class Cookie(
  * BookmarkStore rather than a JSON library. `Expires` (an HTTP-date) isn't
  * parsed, only `Max-Age` - HTTP-date parsing correctly is its own small
  * time-sink and `Max-Age` covers the common case modern servers send.
- * `HttpOnly`/`SameSite` aren't enforced, since nothing in this engine
- * currently exposes `document.cookie` to scripts for them to guard
- * against - there's no theft surface yet to defend.
+ * `HttpOnly` is enforced for `document.cookie` (see [scriptCookieString]/
+ * [storeFromScript]); `SameSite` isn't.
  */
 class CookieJar(context: Context) {
     private val prefs = context.getSharedPreferences("cookies", Context.MODE_PRIVATE)
@@ -49,6 +51,26 @@ class CookieJar(context: Context) {
         return matching.joinToString("; ") { "${it.name}=${it.value}" }
     }
 
+    /** `document.cookie` reads: the cookies for [url] minus HttpOnly ones. */
+    @Synchronized
+    fun scriptCookieString(url: Url): String {
+        val now = System.currentTimeMillis()
+        return cookies.filter {
+            val domainOk = if (it.hostOnly) url.host == it.domain else domainMatches(it.domain, url.host)
+            !it.httpOnly && domainOk && url.path.startsWith(it.path) && (!it.secure || url.isHttps) && (it.expiresAt == null || it.expiresAt >= now)
+        }.joinToString("; ") { "${it.name}=${it.value}" }
+    }
+
+    /** `document.cookie = "..."`: a script can't set an HttpOnly cookie or replace one. */
+    @Synchronized
+    fun storeFromScript(url: Url, cookieString: String) {
+        val cookie = parseSetCookie(cookieString, url.host)?.copy(httpOnly = false) ?: return
+        if (cookies.any { it.httpOnly && it.name == cookie.name && it.domain == cookie.domain && it.path == cookie.path }) return
+        cookies.removeAll { it.name == cookie.name && it.domain == cookie.domain && it.path == cookie.path }
+        if (cookie.expiresAt == null || cookie.expiresAt > System.currentTimeMillis()) cookies.add(cookie)
+        save()
+    }
+
     @Synchronized
     fun store(url: Url, setCookieHeaders: List<String>) {
         if (setCookieHeaders.isEmpty()) return
@@ -68,7 +90,7 @@ class CookieJar(context: Context) {
             // A 7th (hostOnly) field was added later; entries written by an older version of this
             // store only have 6, and are treated as domain cookies (this store's old behavior) for
             // backward compatibility rather than dropped.
-            if (parts.size != 6 && parts.size != 7) continue
+            if (parts.size !in 6..8) continue
             cookies.add(
                 Cookie(
                     name = parts[0],
@@ -77,7 +99,8 @@ class CookieJar(context: Context) {
                     path = parts[3],
                     expiresAt = parts[4].toLongOrNull().takeIf { parts[4] != "-" },
                     secure = parts[5] == "1",
-                    hostOnly = if (parts.size == 7) parts[6] == "1" else false
+                    hostOnly = if (parts.size >= 7) parts[6] == "1" else false,
+                    httpOnly = parts.size == 8 && parts[7] == "1"
                 )
             )
         }
@@ -85,7 +108,7 @@ class CookieJar(context: Context) {
 
     private fun save() {
         val raw = cookies.joinToString("\n") {
-            "${it.name}\t${it.value}\t${it.domain}\t${it.path}\t${it.expiresAt ?: "-"}\t${if (it.secure) "1" else "0"}\t${if (it.hostOnly) "1" else "0"}"
+            "${it.name}\t${it.value}\t${it.domain}\t${it.path}\t${it.expiresAt ?: "-"}\t${if (it.secure) "1" else "0"}\t${if (it.hostOnly) "1" else "0"}\t${if (it.httpOnly) "1" else "0"}"
         }
         prefs.edit().putString(KEY, raw).apply()
     }
@@ -121,6 +144,7 @@ fun parseSetCookie(header: String, requestHost: String): Cookie? {
     var expiresAt: Long? = null
     var secure = false
     var hostOnly = true
+    var httpOnly = false
     for (attr in parts.drop(1)) {
         val kv = attr.split("=", limit = 2)
         when (kv[0].trim().lowercase()) {
@@ -130,9 +154,10 @@ fun parseSetCookie(header: String, requestHost: String): Cookie? {
             "path" -> kv.getOrNull(1)?.trim()?.let { if (it.isNotEmpty()) path = it }
             "max-age" -> kv.getOrNull(1)?.trim()?.toLongOrNull()?.let { expiresAt = System.currentTimeMillis() + it * 1000 }
             "secure" -> secure = true
+            "httponly" -> httpOnly = true
         }
     }
-    return Cookie(nameValue[0].trim(), nameValue[1].trim(), domain, path, expiresAt, secure, hostOnly)
+    return Cookie(nameValue[0].trim(), nameValue[1].trim(), domain, path, expiresAt, secure, hostOnly, httpOnly)
 }
 
 fun domainMatches(cookieDomain: String, host: String): Boolean =

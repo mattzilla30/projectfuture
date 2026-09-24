@@ -201,7 +201,7 @@ class CssParser(private val source: String, private val viewportWidth: Float = 3
         private val ONLY_PREFIX = Regex("^only\\s+", RegexOption.IGNORE_CASE)
 
         /** OR across comma-separated queries. */
-        private fun mediaQueryMatches(condition: String, viewportWidth: Float): Boolean =
+        fun mediaQueryMatches(condition: String, viewportWidth: Float): Boolean =
             condition.split(',').map { it.trim() }.any { matchesSingleQuery(it, viewportWidth) }
 
         /**

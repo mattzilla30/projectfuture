@@ -24,7 +24,18 @@ data class JsNumber(val value: Double) : JsValue()
 data class JsString(val value: String) : JsValue()
 
 open class JsObject(val properties: MutableMap<String, JsValue> = LinkedHashMap()) : JsValue() {
-    open fun get(name: String): JsValue = properties[name] ?: JsUndefined
+    /** The [[Prototype]]: a lookup that misses this object's own properties continues here. Never cyclic (see setPrototype). */
+    var proto: JsObject? = null
+
+    /** Sets [proto] unless that would create a cycle, which would make every missed lookup recurse forever. */
+    fun setPrototype(p: JsObject?): Boolean {
+        var cur = p
+        while (cur != null) { if (cur === this) return false; cur = cur.proto }
+        proto = p
+        return true
+    }
+
+    open fun get(name: String): JsValue = properties[name] ?: proto?.get(name) ?: JsUndefined
     open fun set(name: String, value: JsValue) {
         properties[name] = value
     }
@@ -100,6 +111,16 @@ class Closure(
 ) : JsFunction(name) {
     override fun call(interpreter: Interpreter, thisArg: JsValue, args: List<JsValue>): JsValue =
         interpreter.callClosure(this, thisArg, args)
+
+    /** Every non-arrow function gets a `prototype` object on first use, with `constructor` pointing back. */
+    override fun get(name: String): JsValue {
+        if (name == "prototype" && !isArrow && !properties.containsKey("prototype")) {
+            properties["prototype"] = JsObject().also { it.properties["constructor"] = this }
+        }
+        if (name == "name" && !properties.containsKey("name")) return JsString(this.name)
+        if (name == "length" && !properties.containsKey("length")) return JsNumber(params.count { !it.rest && it.pattern.default == null }.toDouble())
+        return super.get(name)
+    }
 }
 
 /**

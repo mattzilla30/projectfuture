@@ -49,6 +49,7 @@ import com.projectfuture.browser.net.CertificateExceptions
 import com.projectfuture.browser.net.HttpResponse
 import com.projectfuture.browser.net.TrackingProtection
 import com.projectfuture.browser.net.Url
+import com.projectfuture.browser.net.sharedCookieJar
 import com.projectfuture.browser.net.WebSocketClient
 import com.projectfuture.browser.net.ContentSecurityPolicy
 import com.projectfuture.browser.net.corsAllows
@@ -88,7 +89,7 @@ private val JAVASCRIPT_TYPES = setOf(
 // this project's own fetch/HTML/CSS pipeline worked correctly on the (non-)response it got.
 // Identifying as Chrome (both variants below) is what lets those sites serve their real,
 // normal markup, exactly like any other browser has to do to be treated as one.
-private const val MOBILE_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+internal const val MOBILE_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
 private const val DESKTOP_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 private const val DESKTOP_MEDIA_VIEWPORT_WIDTH = 1024f
 
@@ -959,6 +960,14 @@ class Tab(
     private fun runScripts(root: ElementNode, baseUrl: Url, csp: ContentSecurityPolicy, navigation: Int): Pair<Interpreter, DomBridge> {
         val interpreter = Interpreter()
         val bridge = DomBridge(root)
+        val density = context.resources.displayMetrics.density.takeIf { it > 0f } ?: 1f
+        if (viewportWidth > 0f) scriptViewportWidth = (viewportWidth / density).toDouble()
+        if (viewportHeight > 0f) scriptViewportHeight = (viewportHeight / density).toDouble()
+        // A private tab never shares cookies with scripts, matching its requests (see Url.fetch's allowCookies).
+        if (!isPrivate) {
+            bridge.cookieReader = { sharedCookieJar?.scriptCookieString(baseUrl) ?: "" }
+            bridge.cookieWriter = { cookie -> sharedCookieJar?.storeFromScript(baseUrl, cookie) }
+        }
         bridge.install(interpreter.globalEnv)
         installBrowserRuntime(interpreter, root, baseUrl, csp, navigation)
 
@@ -985,6 +994,7 @@ class Tab(
             if (code.isNullOrBlank()) continue
             val label = if (src.isNullOrBlank()) "inline script (${code.length} chars)" else "script ${if (isPrivate) "[private]" else src.take(120)}"
             val scriptStart = System.nanoTime()
+            bridge.currentScript = scriptEl
             try {
                 interpreter.run(Parser(Lexer(code).tokenize()).parseProgram())
                 scriptsRun++
@@ -999,6 +1009,7 @@ class Tab(
             if (scriptMs > 500) BrowserLog.w("js", "$label took ${scriptMs}ms")
         }
 
+        bridge.currentScript = null
         try {
             bridge.fireDomContentLoaded(interpreter)
         } catch (e: Throwable) {
@@ -1030,6 +1041,7 @@ class Tab(
     private fun installBrowserRuntime(interpreter: Interpreter, pageRoot: ElementNode, baseUrl: Url, csp: ContentSecurityPolicy, navigation: Int) {
         fun afterAsyncWork() {
             if (currentDoc !== pageRoot) return
+            currentDomBridge?.flushPendingCallbacks(interpreter)
             computeStyles(pageRoot, currentAuthorRules)
             relayout()
             currentUrl?.let { onStateChanged(TabState.Updated(it, extractTitle(pageRoot))) }

@@ -34,6 +34,11 @@ class Environment(val parent: Environment?) {
         top.vars[name] = value // implicit global, matching sloppy-mode JS rather than throwing
     }
 
+    fun hasOwn(name: String): Boolean = vars.containsKey(name)
+
+    /** Names declared directly in this scope. */
+    fun names(): Set<String> = vars.keys
+
     fun has(name: String): Boolean {
         var env: Environment? = this
         while (env != null) {
@@ -62,6 +67,7 @@ private class ContinueException : RuntimeException(null, null, false, false)
  */
 class Interpreter {
     val globalEnv = Environment(null)
+    val prototypes = BuiltinPrototypes()
 
     init {
         globalEnv.declare("this", JsUndefined)
@@ -69,21 +75,60 @@ class Interpreter {
     }
 
     fun run(program: List<Stmt>) {
-        for (stmt in program) execStmt(stmt, globalEnv)
+        hoistVars(program, globalEnv)
+        execBlock(program, globalEnv)
     }
 
+    /**
+     * Function declarations are created before any statement in their block runs, so a function
+     * can be called above the line that declares it.
+     */
     fun execBlock(stmts: List<Stmt>, env: Environment) {
-        for (stmt in stmts) execStmt(stmt, env)
+        var hasFunctions = false
+        for (stmt in stmts) if (stmt is FunctionDecl) { hasFunctions = true; execStmt(stmt, env) }
+        for (stmt in stmts) if (!hasFunctions || stmt !is FunctionDecl) execStmt(stmt, env)
+    }
+
+    private val hoistCache = java.util.IdentityHashMap<List<Stmt>, List<String>>()
+
+    /** Declares every `var` in [body] (outside nested functions) as undefined in [env], as JS hoisting does. */
+    private fun hoistVars(body: List<Stmt>, env: Environment) {
+        val names = synchronized(hoistCache) { hoistCache.getOrPut(body) { LinkedHashSet<String>().also { collectVarNames(body, it) }.toList() } }
+        for (name in names) if (!env.hasOwn(name)) env.declare(name, JsUndefined)
+    }
+
+    private fun collectVarNames(stmts: List<Stmt>, out: MutableSet<String>) { for (s in stmts) collectVarNames(s, out) }
+
+    private fun collectVarNames(stmt: Stmt?, out: MutableSet<String>) {
+        when (stmt) {
+            is VarDecl -> if (stmt.kind == "var") stmt.declarations.forEach { out.addAll(patternNames(it.first)) }
+            is Block -> collectVarNames(stmt.body, out)
+            is If -> { collectVarNames(stmt.consequent, out); collectVarNames(stmt.alternate, out) }
+            is While -> collectVarNames(stmt.body, out)
+            is DoWhile -> collectVarNames(stmt.body, out)
+            is For -> { collectVarNames(stmt.init, out); collectVarNames(stmt.body, out) }
+            is ForIn -> { if (stmt.declKind == "var") out.addAll(patternNames(stmt.pattern)); collectVarNames(stmt.body, out) }
+            is TryStmt -> { collectVarNames(stmt.block, out); collectVarNames(stmt.catchBlock, out); collectVarNames(stmt.finallyBlock, out) }
+            is SwitchStmt -> stmt.cases.forEach { collectVarNames(it.body, out) }
+            else -> {}
+        }
     }
 
     fun execStmt(stmt: Stmt, env: Environment) {
         when (stmt) {
             is ExprStmt -> evalExpr(stmt.expr, env)
             is VarDecl -> for ((pattern, initExpr) in stmt.declarations) {
+                if (stmt.kind == "var" && pattern is IdentifierPattern && pattern.default == null) {
+                    // A hoisted `var`: assign the function-level binding; `var x;` alone never resets it.
+                    if (initExpr != null) env.assign(pattern.name, evalExpr(initExpr, env))
+                    else if (!env.has(pattern.name)) env.declare(pattern.name, JsUndefined)
+                    continue
+                }
                 val value = initExpr?.let { evalExpr(it, env) } ?: JsUndefined
                 bindPattern(pattern, value, env, stmt.kind)
             }
             is Block -> execBlock(stmt.body, Environment(env))
+            is Labeled -> try { execStmt(stmt.body, env) } catch (_: BreakException) {}
             is If -> if (isTruthy(evalExpr(stmt.test, env))) execStmt(stmt.consequent, env) else stmt.alternate?.let { execStmt(it, env) }
             is While -> {
                 while (isTruthy(evalExpr(stmt.test, env))) {
@@ -220,7 +265,10 @@ class Interpreter {
         }
         for (v in iterationValues) {
             val loopEnv = Environment(env)
-            bindPattern(stmt.pattern, v, loopEnv, stmt.declKind ?: "let")
+            val pattern = stmt.pattern
+            // `for (k in o)` / `for (var k in o)` assign the existing (hoisted) variable; `let`/`const` get a fresh one per iteration.
+            if ((stmt.declKind == null || stmt.declKind == "var") && pattern is IdentifierPattern) env.assign(pattern.name, v)
+            else bindPattern(pattern, v, loopEnv, stmt.declKind ?: "let")
             try {
                 execStmt(stmt.body, loopEnv)
             } catch (b: BreakException) {
@@ -346,7 +394,24 @@ class Interpreter {
     private fun memberKey(expr: Member, env: Environment): String =
         if (expr.computed) propertyKeyOf(evalExpr(expr.property, env)) else (expr.property as StringLit).value
 
-    fun getProperty(obj: JsValue, key: String): JsValue = when (obj) {
+    fun getProperty(obj: JsValue, key: String): JsValue {
+        val own = ownOrChainProperty(obj, key)
+        if (own != JsUndefined) return own
+        // Nothing on the value itself or its prototype chain: fall back to the built-in prototype for
+        // its kind (`fn.call`, `"".trim`, `obj.hasOwnProperty`, methods a page added to Array.prototype).
+        if (obj is JsObject && obj.has(key)) return own
+        val builtin = prototypes.forValue(obj) ?: return own
+        return if (builtin === obj) own else builtin.get(key)
+    }
+
+    private fun protoChainContains(obj: JsObject, target: JsValue): Boolean {
+        if (target !is JsObject) return false
+        var p = obj.proto
+        while (p != null) { if (p === target) return true; p = p.proto }
+        return prototypes.forValue(obj) === target
+    }
+
+    private fun ownOrChainProperty(obj: JsValue, key: String): JsValue = when (obj) {
         is JsString -> {
             if (key == "length") JsNumber(obj.value.length.toDouble())
             else key.toIntOrNull()?.let { idx -> obj.value.getOrNull(idx)?.let { JsString(it.toString()) } } ?: JsUndefined
@@ -466,6 +531,8 @@ class Interpreter {
         val args = evalArgs(expr.args, env)
         if (callee !is JsFunction) throw jsError("not a constructor", "TypeError")
         val instance = JsObject()
+        // A plain constructor function's instances inherit from its `prototype` (classes set up their own instances).
+        if (callee !is ClassConstructor) (getProperty(callee, "prototype") as? JsObject)?.let { instance.setPrototype(it) }
         val result = callee.call(this, instance, args)
         return if (result is JsObject) result else instance
     }
@@ -474,7 +541,9 @@ class Interpreter {
         val callEnv = Environment(closure.closureEnv)
         val effectiveThis = if (closure.isArrow) (closure.capturedThis ?: JsUndefined) else thisArg
         callEnv.declare("this", effectiveThis)
+        if (!closure.isArrow) callEnv.declare("arguments", JsArray(args.toMutableList()))
         bindParams(closure.params, args, callEnv)
+        hoistVars(closure.body, callEnv)
         return when {
             closure.isGenerator -> makeGenerator(closure, callEnv)
             closure.isAsync -> runAsync(closure, callEnv)
@@ -726,7 +795,7 @@ class Interpreter {
         ">" -> compareValues(l, r) { a, b -> a > b }
         "<=" -> compareValues(l, r) { a, b -> a <= b }
         ">=" -> compareValues(l, r) { a, b -> a >= b }
-        "instanceof" -> JsBoolean(r is JsFunction && l is JsObject && r in l.classChain) // real for `class` instances and Error-family constructors (see ErrorConstructor in JsValue.kt), both of which stamp classChain; always false against a plain constructor function (no prototype chain)
+        "instanceof" -> JsBoolean(r is JsFunction && l is JsObject && (r in l.classChain || protoChainContains(l, getProperty(r, "prototype")))) // real for `class` instances and Error-family constructors (see ErrorConstructor in JsValue.kt), both of which stamp classChain; always false against a plain constructor function (no prototype chain)
         "in" -> JsBoolean(r is JsObject && r.has(propertyKeyOf(l)))
         "&" -> JsNumber((toInt32(toNumber(l)) and toInt32(toNumber(r))).toDouble())
         "|" -> JsNumber((toInt32(toNumber(l)) or toInt32(toNumber(r))).toDouble())

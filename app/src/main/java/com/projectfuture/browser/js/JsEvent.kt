@@ -21,9 +21,16 @@ class JsEvent(type: String, target: JsValue) : JsObject() {
         set("currentTarget", target)
     }
 
+    /** Set by `stopPropagation()`; DomBridge stops bubbling to further ancestors once it's true. */
+    var propagationStopped: Boolean = false
+
     override fun get(name: String): JsValue = when (name) {
         "preventDefault" -> NativeFunction("preventDefault", 0) { _, _, _ -> defaultPrevented = true; JsUndefined }
+        "stopPropagation", "stopImmediatePropagation" -> NativeFunction(name, 0) { _, _, _ -> propagationStopped = true; JsUndefined }
+        "composedPath" -> NativeFunction("composedPath", 0) { _, _, _ -> JsArray(mutableListOf(super.get("target"))) }
         "defaultPrevented" -> JsBoolean(defaultPrevented)
+        "bubbles", "cancelable" -> super.get(name).takeIf { it != JsUndefined } ?: JsBoolean(true)
+        "timeStamp" -> JsNumber(System.currentTimeMillis().toDouble())
         else -> super.get(name)
     }
 }

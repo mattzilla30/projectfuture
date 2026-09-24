@@ -82,7 +82,12 @@ class Parser(private val tokens: List<Token>) {
         // Labels are parsed but not tracked: `break label`/`continue label` act on the innermost loop.
         if (checkKeyword("break")) { advance(); skipJumpLabel(); consumeSemicolon(); return BreakStmt }
         if (checkKeyword("continue")) { advance(); skipJumpLabel(); consumeSemicolon(); return ContinueStmt }
-        if (check(TokenType.IDENT) && peek(1).type == TokenType.PUNCT && peek(1).text == ":") { advance(); advance(); return parseStatement() }
+        if (check(TokenType.IDENT) && peek(1).type == TokenType.PUNCT && peek(1).text == ":") {
+            advance(); advance()
+            val isLoop = checkKeyword("for") || checkKeyword("while") || checkKeyword("do")
+            val body = parseStatement()
+            return if (isLoop) body else Labeled(body)
+        }
         if (checkKeyword("try")) return parseTry()
         if (checkKeyword("throw")) return parseThrow()
         if (checkIdentText("switch")) return parseSwitch()

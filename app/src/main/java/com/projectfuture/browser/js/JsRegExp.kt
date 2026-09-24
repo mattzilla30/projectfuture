@@ -14,7 +14,11 @@ package com.projectfuture.browser.js
  * which is the one real behavioral gap versus the spec.
  */
 class JsRegExp(val source: String, val flags: String) : JsObject() {
-    val kotlinRegex: Regex = Regex(source, regexOptions(flags))
+    val kotlinRegex: Regex = try {
+        Regex(translateJsRegex(source, flags.contains('u')), regexOptions(flags))
+    } catch (_: IllegalArgumentException) {
+        throw jsError("Invalid regular expression: /$source/", "SyntaxError")
+    }
     val global: Boolean = flags.contains('g')
 
     override fun get(name: String): JsValue = when (name) {
@@ -46,6 +50,63 @@ class JsRegExp(val source: String, val flags: String) : JsObject() {
 
     companion object {
         private val NAMED_GROUP = Regex("\\(\\?<([A-Za-z_$][A-Za-z0-9_$]*)>")
+
+        private val QUANTIFIER = Regex("^\\{\\d+(,\\d*)?\\}")
+
+        /**
+         * Rewrites JS regex syntax that Java's engine reads differently: an unescaped `[` inside a
+         * character class (JS takes it literally, Java opens a nested class), `[^]` (any character)
+         * and `[]` (never matches), a `{` that isn't a quantifier, `&&` inside a class (Java's
+         * intersection operator), and `\u{...}` code point escapes.
+         */
+        fun translateJsRegex(src: String, unicode: Boolean): String {
+            val out = StringBuilder()
+            var i = 0
+            var inClass = false
+            while (i < src.length) {
+                val c = src[i]
+                if (c == '\\' && i + 1 < src.length) {
+                    if (unicode && src[i + 1] == 'u' && i + 2 < src.length && src[i + 2] == '{') {
+                        val end = src.indexOf('}', i + 3)
+                        if (end != -1) { out.append("\\x{").append(src, i + 3, end).append('}'); i = end + 1; continue }
+                    }
+                    // `\0` is NUL in JS; Java reads `\0` as the start of an octal escape and needs digits after it.
+                    if (src[i + 1] == '0' && (i + 2 >= src.length || !src[i + 2].isDigit())) { out.append("\\x00"); i += 2; continue }
+                    out.append(c).append(src[i + 1])
+                    i += 2
+                    continue
+                }
+                if (inClass) {
+                    when {
+                        c == '[' -> out.append("\\[")
+                        c == '&' && i + 1 < src.length && src[i + 1] == '&' -> { out.append("\\&\\&"); i++ }
+                        c == ']' -> { inClass = false; out.append(c) }
+                        else -> out.append(c)
+                    }
+                    i++
+                    continue
+                }
+                when {
+                    src.startsWith("[^]", i) -> { out.append("[\\s\\S]"); i += 3; continue }
+                    src.startsWith("[]", i) -> { out.append("(?!)"); i += 2; continue }
+                    c == '[' -> {
+                        inClass = true
+                        out.append('[')
+                        if (i + 1 < src.length && src[i + 1] == '^') { out.append('^'); i++ }
+                    }
+                    c == '{' && !QUANTIFIER.containsMatchIn(src.substring(i)) -> out.append("\\{")
+                    c == '}' && !isQuantifierEnd(src, i) -> out.append("\\}")
+                    else -> out.append(c)
+                }
+                i++
+            }
+            return out.toString()
+        }
+
+        private fun isQuantifierEnd(src: String, i: Int): Boolean {
+            val open = src.lastIndexOf('{', i)
+            return open != -1 && QUANTIFIER.matches(src.substring(open, i + 1))
+        }
 
         private fun regexOptions(flags: String): Set<RegexOption> {
             val options = HashSet<RegexOption>()

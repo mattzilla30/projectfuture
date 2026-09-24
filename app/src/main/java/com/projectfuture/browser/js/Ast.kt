@@ -73,6 +73,8 @@ sealed class Stmt
 data class ExprStmt(val expr: Expr) : Stmt()
 data class VarDecl(val kind: String, val declarations: List<Pair<Pattern, Expr?>>) : Stmt()
 data class Block(val body: List<Stmt>) : Stmt()
+/** A labeled statement that isn't a loop (`out: { ... break out; }`): a `break` inside ends it. */
+data class Labeled(val body: Stmt) : Stmt()
 data class If(val test: Expr, val consequent: Stmt, val alternate: Stmt?) : Stmt()
 data class While(val test: Expr, val body: Stmt) : Stmt()
 data class DoWhile(val body: Stmt, val test: Expr) : Stmt()
