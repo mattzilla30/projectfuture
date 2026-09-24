@@ -194,6 +194,34 @@ class DomBridgeTest {
         assertEquals(0.0, (f.eval("count") as JsNumber).value, 0.0)
     }
 
+    /**
+     * Regression test for a real bug: calling `observe()` twice on the same
+     * observer/target pair (a common real-world pattern - e.g. a component
+     * re-running its setup effect) used to add a second, independent
+     * registration instead of replacing the first, per spec ("if target and
+     * options are the same as a previous call, replace the existing
+     * registered observer"). Every subsequent mutation then delivered the
+     * callback twice for a single mutation.
+     */
+    @Test fun observingTheSameTargetTwiceDoesNotDuplicateNotifications() {
+        val f = Fixture("<html><body><div id='child'></div></body></html>")
+        f.run(
+            """
+            var count = 0;
+            var observer = new MutationObserver(function(records) { count = count + 1; });
+            observer.observe(document.getElementById('child'));
+            observer.observe(document.getElementById('child'));
+            """.trimIndent()
+        )
+        f.run("document.getElementById('child').setAttribute('data-x', '1');")
+        assertEquals(
+            "re-observing the same target with the same observer must not deliver the callback twice",
+            1.0,
+            (f.eval("count") as JsNumber).value,
+            0.0
+        )
+    }
+
     @Test fun appendChildMovesANodeAlreadyAttachedElsewhereInsteadOfDuplicatingIt() {
         val f = Fixture("<html><body><div id='a'><span id='s'>x</span></div><div id='b'></div></body></html>")
         f.run("document.getElementById('b').appendChild(document.getElementById('s'));")

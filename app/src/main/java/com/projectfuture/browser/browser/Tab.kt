@@ -270,14 +270,26 @@ class Tab(
         val url = currentUrl ?: return
         if (readerModeActive) {
             currentDoc = docBeforeReaderMode ?: doc
-            computeStyles(currentDoc!!, authorRulesBeforeReaderMode)
+            // Restore currentAuthorRules too, not just the doc - it drives every
+            // later computeStyles() call this Tab makes off the user's own
+            // interactions (dispatchClick/dispatchInputEvent). Leaving it set to
+            // readerModeRules after leaving reader mode would silently apply the
+            // reader stylesheet to the real page's DOM on the next click/keystroke.
+            currentAuthorRules = authorRulesBeforeReaderMode
+            computeStyles(currentDoc!!, currentAuthorRules)
             readerModeActive = false
         } else {
             val extracted = extractReaderContent(doc) ?: return
             docBeforeReaderMode = doc
             authorRulesBeforeReaderMode = currentAuthorRules
             currentDoc = extracted
-            computeStyles(extracted, readerModeRules)
+            // Same reasoning in the other direction: while reader mode is active,
+            // currentAuthorRules must reflect readerModeRules so that any
+            // in-place restyle triggered by interacting with the reader-mode
+            // document (e.g. tapping a preserved link/checkbox) doesn't reapply
+            // the original page's author CSS to the extracted reader DOM.
+            currentAuthorRules = readerModeRules
+            computeStyles(extracted, currentAuthorRules)
             readerModeActive = true
         }
         relayout()
@@ -654,6 +666,25 @@ class Tab(
         executor.execute {
             try {
                 val response = url.fetch(method, body, requestHeaders, allowCookies = !isPrivate)
+                if (isDownloadResponse(response.headers["content-type"], response.headers["content-disposition"])) {
+                    // Not an `<a download>` tap - a navigation (JS-driven, or a redirect chain)
+                    // that landed on a non-HTML/attachment response. Route it to the download
+                    // path instead of running HtmlParser over binary/garbage bytes; the page
+                    // already on screen (if any) stays put, exactly like a real browser doesn't
+                    // navigate away from the current page for a download.
+                    val suggestedName = parseContentDispositionFilename(response.headers["content-disposition"])
+                        ?: response.url.path.substringAfterLast('/').takeIf { it.isNotBlank() }
+                    postMain {
+                        onDownloadRequested?.invoke(response.url.toString(), suggestedName)
+                        val stayUrl = currentUrl
+                        if (stayUrl != null) {
+                            onStateChanged(TabState.Loaded(stayUrl, currentDoc?.let { extractTitle(it) }))
+                        } else {
+                            onStateChanged(TabState.Error(url, "Download started"))
+                        }
+                    }
+                    return@execute
+                }
                 val csp = ContentSecurityPolicy.parse(response.headers["content-security-policy"])
                 val root = HtmlParser(response.body).parse()
                 warmPreconnectHints(root, response.url)
@@ -1345,8 +1376,14 @@ class Tab(
                                 event.set("data", msg.value)
                                 try {
                                     (workerEnv.get("onmessage") as? JsFunction)?.call(workerInterpreter, JsUndefined, listOf(event))
-                                } catch (_: Exception) {
-                                    // A worker with no onmessage handler, or one that throws, shouldn't kill the worker thread.
+                                } catch (e: Exception) {
+                                    // An uncaught exception inside onmessage shouldn't kill the worker
+                                    // thread (it keeps servicing later messages, matching a real
+                                    // Worker), but it must still surface to the page via `onerror`
+                                    // instead of vanishing silently - this used to just be swallowed.
+                                    postMain {
+                                        if (currentDoc === pageRoot) (obj.get("onerror") as? JsFunction)?.call(interp, obj, listOf(makeError(e.message ?: "Worker error")))
+                                    }
                                 }
                             }
                             else -> return@Thread // Terminate
