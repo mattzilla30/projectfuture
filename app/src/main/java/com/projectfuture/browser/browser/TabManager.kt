@@ -24,6 +24,29 @@ import com.projectfuture.browser.ipc.RemoteTabHandle
  * leaving zero tabs, matching how mobile browsers usually behave rather
  * than leaving the app with nothing to show.
  */
+/**
+ * Which tab should be active in a list that just had the tab at
+ * [removedIndex] closed, given [oldActiveIndex] was active beforehand and
+ * [newSize] is the list's size *after* removal. Pure index arithmetic
+ * extracted out of [TabManager.closeTab] so it can be exercised directly on
+ * the host JVM - `TabManager` itself can't be constructed in a plain JUnit
+ * test, since `newTab()` always builds a real [Tab] (via [LocalTabHandle])
+ * or a real [com.projectfuture.browser.ipc.RemoteTabHandle], both of which
+ * touch Android APIs unavailable off-device (same reasoning as
+ * `FormSubmission.kt`'s doc for [Tab]).
+ *
+ * Closing a tab that comes *before* the active one shifts every later
+ * index down by one - the active tab's *identity* doesn't change, but its
+ * *index* does, so the active index must shift down with it or the wrong
+ * (now off-by-one) tab silently becomes active. Closing the active tab
+ * itself, or one after it, leaves the index unchanged (modulo being
+ * clamped back into range, e.g. when the last tab was the one closed).
+ */
+fun nextActiveIndexAfterClose(oldActiveIndex: Int, removedIndex: Int, newSize: Int): Int {
+    val shifted = if (removedIndex < oldActiveIndex) oldActiveIndex - 1 else oldActiveIndex
+    return shifted.coerceIn(0, (newSize - 1).coerceAtLeast(0))
+}
+
 class TabManager(
     private val context: Context,
     private val sandboxedTabsEnabled: () -> Boolean,
@@ -62,9 +85,9 @@ class TabManager(
         if (index in tabs.indices) {
             tabs[index].destroy()
             tabs.removeAt(index)
+            activeIndex = nextActiveIndexAfterClose(activeIndex, index, tabs.size)
         }
         if (tabs.isEmpty()) return newTab()
-        activeIndex = activeIndex.coerceIn(0, tabs.size - 1)
         return tabs[activeIndex]
     }
 

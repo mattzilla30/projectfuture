@@ -31,6 +31,7 @@ import com.projectfuture.browser.js.JsUndefined
 import com.projectfuture.browser.js.JsValue
 import com.projectfuture.browser.js.Lexer
 import com.projectfuture.browser.js.NativeFunction
+import com.projectfuture.browser.js.StorageBacking
 import com.projectfuture.browser.js.Parser
 import com.projectfuture.browser.js.jsError
 import com.projectfuture.browser.js.jsonStringify
@@ -55,7 +56,6 @@ import com.projectfuture.browser.rtc.PeerConnectionCore
 import com.projectfuture.browser.rtc.RTCDataChannelCore
 import com.projectfuture.browser.rtc.SdpSession
 import java.io.File
-import java.net.URLEncoder
 import java.util.concurrent.Executors
 import javax.net.ssl.SSLException
 
@@ -112,6 +112,30 @@ class Tab(
     private var historyIndex = -1
     private val executor = Executors.newSingleThreadExecutor()
     private val mainHandler = Handler(Looper.getMainLooper())
+    /**
+     * Set by [destroy]. Background work (network fetches, timers, the Service
+     * Worker/WebSocket/WebRTC callbacks below) is all dispatched back to the
+     * main thread via [postMain]/[postMainDelayed] rather than raw
+     * `mainHandler.post`/`postDelayed`, specifically so a callback that was
+     * already in flight when the tab was destroyed - a `fetch()` that was
+     * mid-request, a `setInterval` tick already queued, a WebSocket message
+     * that arrived a moment later - checks this flag before touching any of
+     * this (by-then-stale) tab's state or invoking [onStateChanged] again.
+     * Without this, a background task racing [destroy] could fire after
+     * `TabManager` has already dropped this tab from its list, mutating dead
+     * state and delivering a state update for a tab the UI no longer shows.
+     */
+    private var destroyed = false
+
+    /** See [destroyed]'s doc: runs [block] on the main thread, but only if this tab hasn't been destroyed by the time it's due to run. */
+    private fun postMain(block: () -> Unit) {
+        mainHandler.post { if (!destroyed) block() }
+    }
+
+    /** Delayed variant of [postMain], used by `setTimeout`/`setInterval`/`requestAnimationFrame`. */
+    private fun postMainDelayed(delayMs: Long, block: () -> Unit) {
+        mainHandler.postDelayed({ if (!destroyed) block() }, delayMs)
+    }
 
     var currentUrl: Url? = null
         private set
@@ -131,18 +155,37 @@ class Tab(
     private val canceledTimers = HashSet<Int>()
     /** `sessionStorage` is per-tab (unlike `localStorage`, which is shared via [sharedLocalStorage]) - see JsStorage's doc. */
     private val sessionStorageBacking = InMemoryStorageBacking()
+    /**
+     * `localStorage`'s backing - see [tabStorageBacking]'s doc for why a
+     * private tab always gets its own throwaway instance here rather than
+     * ever touching the real, disk-persisted [sharedLocalStorage] every
+     * regular tab shares. One instance for this tab's whole lifetime (not
+     * re-picked per page load), same as [sessionStorageBacking] - origin-
+     * keyed backings like this are shared safely across every origin the
+     * tab visits (see [com.projectfuture.browser.js.JsStorage]).
+     */
+    private val localStorageBacking: StorageBacking =
+        tabStorageBacking(isPrivate, sharedLocalStorage) { InMemoryStorageBacking() }
     private val indexedDbStore = IndexedDbStore()
     /**
      * Service Worker registrations and Cache Storage are shared across
-     * every tab of the same origin and persist across app restarts (real
-     * per-origin, cross-session state, unlike sessionStorage/IndexedDbStore
-     * above) - via the module-level [sharedServiceWorkerRegistry]/
-     * [sharedCacheStorageStore], falling back to a private in-memory
-     * instance only if MainActivity hasn't set those up yet (e.g. in a
-     * test harness that constructs a Tab directly).
+     * every *regular* tab of the same origin and persist across app
+     * restarts (real per-origin, cross-session state, unlike
+     * sessionStorage/IndexedDbStore above) - via the module-level
+     * [sharedServiceWorkerRegistry]/[sharedCacheStorageStore]. A private
+     * tab must never use those: same reasoning as
+     * [privateLocalStorageBacking] above - a Service Worker registered (or
+     * a Cache Storage entry written) from a private tab would otherwise
+     * leak into every regular tab's same-origin state and persist to disk
+     * after the private tab closes, defeating private browsing entirely.
+     * It gets its own throwaway in-memory instance instead (also used as
+     * the non-private fallback when MainActivity hasn't set the shared
+     * ones up yet, e.g. in a test harness that constructs a Tab directly).
      */
-    private val serviceWorkerRegistry: ServiceWorkerRegistry = sharedServiceWorkerRegistry ?: ServiceWorkerRegistry(InMemoryStorageBacking())
-    private val cacheStorageStore: CacheStorageStore = sharedCacheStorageStore ?: CacheStorageStore(InMemoryStorageBacking())
+    private val serviceWorkerRegistry: ServiceWorkerRegistry =
+        tabStorageBacking(isPrivate, sharedServiceWorkerRegistry) { ServiceWorkerRegistry(InMemoryStorageBacking()) }
+    private val cacheStorageStore: CacheStorageStore =
+        tabStorageBacking(isPrivate, sharedCacheStorageStore) { CacheStorageStore(InMemoryStorageBacking()) }
 
     /**
      * True once this (background) tab's heavy in-memory state has been
@@ -272,9 +315,9 @@ class Tab(
                 val iconBytes = iconSrc?.let {
                     try { manifestUrl.resolve(it).fetchBytes(allowCookies = !isPrivate).body } catch (_: Exception) { null }
                 }
-                mainHandler.post { callback(name, iconBytes) }
+                postMain { callback(name, iconBytes) }
             } catch (_: Exception) {
-                mainHandler.post { callback(fallbackName, null) }
+                postMain { callback(fallbackName, null) }
             }
         }
     }
@@ -536,29 +579,8 @@ class Tab(
             }
         }
 
-        val params = ArrayList<Pair<String, String>>()
-        form.walkElements { el ->
-            if (el === form) return@walkElements
-            val name = el.attr("name") ?: return@walkElements
-            if (el.attributes.containsKey("disabled")) return@walkElements
-            when (el.tag) {
-                "input" -> when ((el.attr("type") ?: "text").lowercase()) {
-                    "submit", "button", "reset", "image", "file" -> {}
-                    "checkbox", "radio" -> if (el.attr("checked") != null) params.add(name to (el.attr("value") ?: "on"))
-                    else -> params.add(name to (el.attr("value") ?: ""))
-                }
-                "textarea" -> params.add(name to currentFieldValue(el))
-                "select" -> {
-                    val options = el.children.filterIsInstance<ElementNode>().filter { it.tag == "option" }
-                    val chosen = options.firstOrNull { it.attr("selected") != null } ?: options.firstOrNull()
-                    if (chosen != null) {
-                        val value = chosen.attr("value") ?: chosen.children.filterIsInstance<TextNode>().joinToString("") { it.text }
-                        params.add(name to value)
-                    }
-                }
-            }
-        }
-        val encoded = params.joinToString("&") { (k, v) -> "${urlEncode(k)}=${urlEncode(v)}" }
+        val params = collectFormParams(form)
+        val encoded = encodeFormParams(params)
 
         if (method == "post") {
             load(action, HistoryAction.PUSH, method = "POST", body = encoded.toByteArray(Charsets.UTF_8))
@@ -568,8 +590,6 @@ class Tab(
             load(action.copy(path = basePath + query), HistoryAction.PUSH)
         }
     }
-
-    private fun urlEncode(s: String) = URLEncoder.encode(s, "UTF-8")
 
     private fun findAncestorForm(element: ElementNode): ElementNode? {
         var current: ElementNode? = element
@@ -644,7 +664,7 @@ class Tab(
                 val title = extractTitle(root)
                 val images = collectAndDecodeImages(root, response.url, csp) + collectAndRenderSvgs(root) + bridge.canvasBitmaps()
                 val fonts = loadFontFaces(authorCss.fontFaces, response.url, csp)
-                mainHandler.post {
+                postMain {
                     currentUrl = response.url
                     currentDoc = root
                     currentImages = images
@@ -679,7 +699,7 @@ class Tab(
                     onStateChanged(TabState.Loaded(response.url, title))
                 }
             } catch (e: Exception) {
-                mainHandler.post {
+                postMain {
                     if (e is SSLException) {
                         onStateChanged(TabState.CertificateError(url, e.message ?: e.toString()))
                     } else {
@@ -846,7 +866,7 @@ class Tab(
         // localStorage is shared across every tab (via the module-level sharedLocalStorage); sessionStorage
         // is this tab's own InMemoryStorageBacking - both keyed by the page's own origin, matching the spec.
         val origin = "${baseUrl.scheme}://${baseUrl.host}:${baseUrl.port}"
-        val localStorageObj = JsStorage(origin, sharedLocalStorage ?: InMemoryStorageBacking())
+        val localStorageObj = JsStorage(origin, localStorageBacking)
         val sessionStorageObj = JsStorage(origin, sessionStorageBacking)
         interpreter.globalEnv.declare("localStorage", localStorageObj)
         interpreter.globalEnv.declare("sessionStorage", sessionStorageObj)
@@ -901,14 +921,14 @@ class Tab(
                         // never touches the network, matching the real Fetch/Service Worker spec's ordering.
                         val swResponse = interceptWithServiceWorker(origin, requestUrl, method)
                         if (swResponse != null) {
-                            mainHandler.post {
+                            postMain {
                                 promise.resolve(makeFetchResponse(HttpResponse(swResponse.status, emptyMap(), swResponse.body, requestUrl)))
                                 afterAsyncWork()
                             }
                             return@execute
                         }
                         val response = requestUrl.fetch(method, bodyText?.toByteArray(Charsets.UTF_8), headers, allowCookies = !isPrivate)
-                        mainHandler.post {
+                        postMain {
                             if (isSameOrigin(baseUrl, response.url) || corsAllows(baseUrl, response.headers)) {
                                 promise.resolve(makeFetchResponse(response))
                             } else {
@@ -921,7 +941,7 @@ class Tab(
                             afterAsyncWork()
                         }
                     } catch (e: Exception) {
-                        mainHandler.post {
+                        postMain {
                             promise.reject(makeError(e.message ?: "Network request failed"))
                             afterAsyncWork()
                         }
@@ -938,12 +958,12 @@ class Tab(
             val delay = (args.getOrNull(1) as? JsNumber)?.value?.toLong()?.coerceAtLeast(0L) ?: 0L
             val id = ++timerIdCounter
             if (fn != null) {
-                mainHandler.postDelayed({
+                postMainDelayed(delay) {
                     if (id !in canceledTimers && currentDoc === pageRoot) {
                         try { fn.call(interpreter, JsUndefined, emptyList()) } catch (_: Exception) { }
                         afterAsyncWork()
                     }
-                }, delay)
+                }
             }
             JsNumber(id.toDouble())
         })
@@ -962,10 +982,10 @@ class Tab(
                     if (id !in canceledTimers && currentDoc === pageRoot) {
                         try { fn.call(interpreter, JsUndefined, emptyList()) } catch (_: Exception) { }
                         afterAsyncWork()
-                        mainHandler.postDelayed(tick, delay)
+                        postMainDelayed(delay) { tick() }
                     }
                 }
-                mainHandler.postDelayed(tick, delay)
+                postMainDelayed(delay) { tick() }
             }
             JsNumber(id.toDouble())
         })
@@ -981,12 +1001,12 @@ class Tab(
             val fn = args.getOrNull(0) as? JsFunction
             val id = ++timerIdCounter
             if (fn != null) {
-                mainHandler.postDelayed({
+                postMainDelayed(16L) {
                     if (id !in canceledTimers && currentDoc === pageRoot) {
                         try { fn.call(interpreter, JsUndefined, listOf(JsNumber(System.nanoTime() / 1_000_000.0))) } catch (_: Exception) { }
                         afterAsyncWork()
                     }
-                }, 16L)
+                }
             }
             JsNumber(id.toDouble())
         })
@@ -1028,8 +1048,8 @@ class Tab(
             val scope = scopeOption ?: scriptUrl.path.substringBeforeLast('/', "").let { if (it.isEmpty()) "/" else "$it/" }
             executor.execute {
                 val reg = serviceWorkerRegistry.register(origin, scope, scriptUrl.toString())
-                mainHandler.post {
-                    if (currentDoc !== pageRoot) return@post
+                postMain {
+                    if (currentDoc !== pageRoot) return@postMain
                     val regObj = JsObject()
                     regObj.set("scope", JsString(reg.scope))
                     regObj.set("active", JsObject().apply { set("scriptURL", JsString(reg.scriptUrl)) })
@@ -1146,7 +1166,7 @@ class Tab(
             dc.set("send", NativeFunction("send", 1) { _, _, args -> core.send(toJsString(args.getOrElse(0) { JsUndefined })); JsUndefined })
             dc.set("close", NativeFunction("close", 0) { _, _, _ -> core.close(); JsUndefined })
             core.onOpen = {
-                mainHandler.post {
+                postMain {
                     if (currentDoc === pageRoot) {
                         dc.set("readyState", JsString("open"))
                         (dc.get("onopen") as? JsFunction)?.call(interp, dc, listOf(JsEvent("open", dc)))
@@ -1154,7 +1174,7 @@ class Tab(
                 }
             }
             core.onMessage = { text ->
-                mainHandler.post {
+                postMain {
                     if (currentDoc === pageRoot) {
                         val event = JsEvent("message", dc)
                         event.set("data", JsString(text))
@@ -1164,7 +1184,7 @@ class Tab(
                 }
             }
             core.onClose = {
-                mainHandler.post {
+                postMain {
                     if (currentDoc === pageRoot) {
                         dc.set("readyState", JsString("closed"))
                         (dc.get("onclose") as? JsFunction)?.call(interp, dc, listOf(JsEvent("close", dc)))
@@ -1200,9 +1220,9 @@ class Tab(
                     executor.execute {
                         try {
                             core.setLocalDescription(SdpSession.parse(sdpText))
-                            mainHandler.post { promise.resolve(JsUndefined) }
+                            postMain { promise.resolve(JsUndefined) }
                         } catch (e: Exception) {
-                            mainHandler.post { promise.reject(makeError(e.message ?: "Invalid SDP")) }
+                            postMain { promise.reject(makeError(e.message ?: "Invalid SDP")) }
                         }
                     }
                 }
@@ -1218,9 +1238,9 @@ class Tab(
                     executor.execute {
                         try {
                             core.setRemoteDescription(SdpSession.parse(sdpText))
-                            mainHandler.post { promise.resolve(JsUndefined) }
+                            postMain { promise.resolve(JsUndefined) }
                         } catch (e: Exception) {
-                            mainHandler.post { promise.reject(makeError(e.message ?: "Invalid SDP")) }
+                            postMain { promise.reject(makeError(e.message ?: "Invalid SDP")) }
                         }
                     }
                 }
@@ -1234,7 +1254,7 @@ class Tab(
             obj.set("close", NativeFunction("close", 0) { _, _, _ -> core.close(); JsUndefined })
 
             core.onConnectionStateChange = {
-                mainHandler.post {
+                postMain {
                     if (currentDoc === pageRoot) {
                         obj.set("connectionState", JsString(core.connectionState))
                         obj.set("iceConnectionState", JsString(if (core.connectionState == "connected") "connected" else core.connectionState))
@@ -1243,7 +1263,7 @@ class Tab(
                 }
             }
             core.onDataChannel = { channelCore ->
-                mainHandler.post {
+                postMain {
                     if (currentDoc === pageRoot) {
                         val event = JsObject()
                         event.set("channel", makeDataChannelObject(interp, channelCore))
@@ -1308,7 +1328,7 @@ class Tab(
                     val workerEnv = workerInterpreter.globalEnv
                     workerEnv.declare("postMessage", NativeFunction("postMessage", 1) { _, _, args ->
                         val cloned = cloneForThread(args.getOrElse(0) { JsUndefined })
-                        mainHandler.post {
+                        postMain {
                             if (currentDoc === pageRoot) {
                                 val event = JsObject()
                                 event.set("data", cloned)
@@ -1333,7 +1353,7 @@ class Tab(
                         }
                     }
                 } catch (e: Exception) {
-                    mainHandler.post {
+                    postMain {
                         if (currentDoc === pageRoot) (obj.get("onerror") as? JsFunction)?.call(interp, obj, listOf(makeError(e.message ?: "Worker error")))
                     }
                 }
@@ -1356,11 +1376,11 @@ class Tab(
      */
     private fun installIndexedDb(interpreter: Interpreter, pageRoot: ElementNode) {
         fun <T : JsValue> deferRequest(interp: Interpreter, request: JsObject, resultProvider: () -> T) {
-            mainHandler.post {
-                if (currentDoc !== pageRoot) return@post
+            postMain {
+                if (currentDoc !== pageRoot) return@postMain
                 val result = try { resultProvider() } catch (e: Exception) {
                     (request.get("onerror") as? JsFunction)?.call(interp, request, listOf(makeError(e.message ?: "IndexedDB error")))
-                    return@post
+                    return@postMain
                 }
                 val event = JsObject()
                 val target = JsObject()
@@ -1425,8 +1445,8 @@ class Tab(
         indexedDbObj.set("open", NativeFunction("open", 2) { interp, _, args ->
             val dbName = toJsString(args.getOrElse(0) { JsUndefined })
             val request = JsObject()
-            mainHandler.post {
-                if (currentDoc !== pageRoot) return@post
+            postMain {
+                if (currentDoc !== pageRoot) return@postMain
                 val dbObj = makeDbObject(dbName, interp)
                 if (indexedDbStore.isFirstOpen(dbName)) {
                     val event = JsObject()
@@ -1473,7 +1493,7 @@ class Tab(
             val client = WebSocketClient(wsUrl)
             webSockets[obj] = client
             client.onOpen = {
-                mainHandler.post {
+                postMain {
                     if (currentDoc === pageRoot) {
                         obj.set("readyState", JsNumber(1.0))
                         (obj.get("onopen") as? JsFunction)?.call(interp, obj, listOf(JsEvent("open", obj)))
@@ -1481,7 +1501,7 @@ class Tab(
                 }
             }
             client.onMessage = { data ->
-                mainHandler.post {
+                postMain {
                     val event = JsEvent("message", obj)
                     event.set("data", JsString(data))
                     (obj.get("onmessage") as? JsFunction)?.call(interp, obj, listOf(event))
@@ -1489,7 +1509,7 @@ class Tab(
                 }
             }
             client.onClose = { code, reason ->
-                mainHandler.post {
+                postMain {
                     obj.set("readyState", JsNumber(3.0))
                     val event = JsEvent("close", obj)
                     event.set("code", JsNumber(code.toDouble()))
@@ -1499,7 +1519,7 @@ class Tab(
                 }
             }
             client.onError = { message ->
-                mainHandler.post {
+                postMain {
                     (obj.get("onerror") as? JsFunction)?.call(interp, obj, listOf(JsEvent("error", obj)))
                     println("[WebSocket error] $message")
                 }
@@ -1580,7 +1600,7 @@ class Tab(
                 executor.execute {
                     try {
                         val response = url.fetch(method, bodyText?.toByteArray(Charsets.UTF_8), requestHeaders, allowCookies = !isPrivate)
-                        mainHandler.post {
+                        postMain {
                             if (isSameOrigin(baseUrl, response.url) || corsAllows(baseUrl, response.headers)) {
                                 xhr.set("status", JsNumber(response.statusCode.toDouble()))
                                 xhr.set("responseText", JsString(response.body))
@@ -1593,7 +1613,7 @@ class Tab(
                             afterAsyncWork()
                         }
                     } catch (e: Exception) {
-                        mainHandler.post {
+                        postMain {
                             xhr.set("readyState", JsNumber(4.0))
                             fire("error")
                             afterAsyncWork()
@@ -1692,7 +1712,19 @@ class Tab(
         return title
     }
 
+    /**
+     * See [destroyed]'s doc. Order matters: [destroyed] is set first so any
+     * background task that's already mid-flight and about to call
+     * [postMain]/[postMainDelayed] finds it set the moment it runs on the
+     * main thread; [Handler.removeCallbacksAndMessages] then drops every
+     * already-queued (not yet run) post/delayed-post on this tab's own
+     * `mainHandler` - timers, an in-flight fetch's continuation, a WebSocket
+     * message - since a background thread can still queue one concurrently
+     * with this call, both guards matter, not just one.
+     */
     fun destroy() {
+        destroyed = true
+        mainHandler.removeCallbacksAndMessages(null)
         executor.shutdownNow()
     }
 }
