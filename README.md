@@ -23,10 +23,10 @@ project.
   paragraph direction heuristic), flexbox, a bounded CSS Grid, table
   layout, floats/clear, and CSS positioning (relative/absolute/fixed,
   z-index) - all producing an absolute-coordinate `DisplayCommand` list.
-- **Rendering** (`view/BrowserView.kt`) - a custom `View` that paints that
-  display list directly with `Canvas`/`Paint`, handles `fixed` content
-  staying pinned through a second unscrolled paint pass, and turns touch
-  input into scrolling and link taps.
+- **Rendering** (`view/BrowserView.kt`) - the display list is painted across
+  two independently GPU-composited hardware layers, one for scrolling
+  content and one for `fixed` content that never repaints on scroll, and
+  turns touch input into scrolling and link taps.
 
 This project relies on the platform for two things, the same way any
 renderer ultimately hands work to lower-level system facilities: glyph
@@ -59,6 +59,31 @@ correctness) - see commit history for the detailed limitations of each:
 - Address bar with a plain-text/search fallback
 - JavaScript execution (a from-scratch interpreter), the DOM/window bridge,
   `fetch`/`setTimeout`/`setInterval`
+- Modern JS language features: `async`/`await` and generators
+  (`function*`/`yield`/`yield*`, both built on one coroutine primitive in
+  `js/Coroutines.kt`), `Symbol` (including well-known `Symbol.iterator`),
+  `Proxy`/`Reflect`, typed arrays (`Int8Array` through `Float64Array`) over
+  `ArrayBuffer`, and `super.method()` calls in class methods - see each
+  file's doc comment in `js/` for the handful of named simplifications
+  (e.g. no `Proxy` `apply`/`construct` traps, no async generators)
+- Service Workers (`browser/ServiceWorkerRegistry.kt`,
+  `browser/ServiceWorkerHost.kt`): `register`/`unregister`, `install`/
+  `activate` run-once-ever semantics, `fetch` event interception via
+  `respondWith`, and a Cache Storage API - registrations and cached
+  responses are persisted and genuinely survive killing and reopening the
+  app. Each dispatch re-runs the worker script fresh rather than keeping a
+  long-lived worker context alive between calls (see `ServiceWorkerHost`'s
+  class doc) - fine for cache-on-install/serve-from-cache, not full parity
+  with a persistent worker's own state.
+- WebRTC (`rtc/`): real SDP offer/answer generation and parsing, and a
+  working `RTCDataChannel` that exchanges ordered, reliably-delivered
+  messages between two peers over plain UDP. No ICE/STUN/TURN (only a
+  single local candidate - both peers must already be reachable), no
+  DTLS/SRTP (data channel traffic is unencrypted on the wire), no real
+  SCTP framing (a hand-written reliable-UDP protocol stands in for it),
+  and no media (`getUserMedia`, audio/video, codecs) at all - see
+  `PeerConnectionCore`'s class doc for exactly what's real versus
+  API-surface-only and what a full implementation would still need.
 - Web fonts (`@font-face`), SVG, `<canvas>` 2D, CSS `calc()`/custom
   properties/media queries
 - Forms: `<input>`/`<textarea>`/`<select>`/`<button>` render as real
@@ -118,6 +143,78 @@ has to tolerate out-of-order delivery) or connection migration. Rather than
 ship a partial QUIC stack that silently falls over on real servers, or a
 "HTTP/3 support" that's actually just HTTP/2 or HTTP/1.1 underneath, this
 project sticks to HTTP/2 with an HTTP/1.1 fallback for now.
+
+## Accessibility
+
+Screen-reader support here is a from-scratch reimplementation, the same as
+everything else in this project - there's no `WebView` accessibility bridge
+to fall back on.
+
+**Implemented today:**
+
+- Overlaid form-control fields (`<input type=text/password>`, `<textarea>`)
+  are real platform `EditText` views, not Canvas-painted pixels, so TalkBack
+  already reads/edits them correctly for free - this comes from
+  `view/BrowserView.kt`'s design, not any accessibility-specific code.
+- A page-load announcement (`View.announceForAccessibility`) fires on every
+  navigation, per `MainActivity.onTabStateChanged`.
+- A virtual-view `AccessibilityNodeProvider`
+  (`view/BrowserAccessibilityNodeProvider.kt`) exposes the rendered page's
+  real structure - headings (with level), links, form controls, images with
+  non-empty `alt` text, and landmarks (`nav`/`main`/`header`/`footer`/
+  `aside`) - as accessibility nodes, built from the DOM plus the exact
+  layout bounds the rendering engine already computed
+  (`accessibility/AccessibilityTreeBuilder.kt`). This is meant to let
+  TalkBack's swipe gesture move focus between these nodes in document order
+  and double-tap activate the focused one (`ACTION_CLICK`, wired back to the
+  same element-tap handling a real touch uses).
+- The tree-building logic (`AccessibilityTreeBuilder.kt`) is pure Kotlin
+  with no Android dependency and has JVM unit test coverage
+  (`app/src/test/java/com/projectfuture/browser/accessibility/AccessibilityTreeBuilderTest.kt`)
+  asserting correct roles, labels, bounds (including bounds unioned across
+  descendant elements), and document-order traversal for representative
+  sample DOM/layout trees.
+
+**What this explicitly has NOT been verified to do:** work with real
+TalkBack on a device or emulator. Neither is available in this development
+environment. The provider is written defensively for exactly that reason -
+a flat (non-nested) virtual hierarchy, real overlaid `EditText` children
+preserved alongside the virtual nodes, and every entry point the
+accessibility framework calls into fails closed (logs and returns
+null/false) rather than risking a crash - but "implemented and unit-tested"
+is the honest claim, not "works". A malformed accessibility tree can hang
+or crash TalkBack for the exact users depending on it, which is why this
+was not shipped as a verified feature; whoever can test on-device should
+treat that as the single highest-priority verification task for this
+feature before relying on it. See the doc comments on
+`BrowserAccessibilityNodeProvider` and `AccessibilityTreeBuilder` for the
+detailed reasoning.
+
+**Known limitations even setting device verification aside:** traversal
+order is document order, not true visual-geometry order, so a page that
+uses CSS positioning/floats/flex `order` to visually reorder content won't
+get a matching reading order; an `<img>` with no non-empty `alt` (missing
+or `alt=""`) is treated as decorative and left out entirely rather than
+exposed as an unlabeled node.
+
+## Roadmap items this codebase alone can't finish
+
+A few items on this project's roadmap aren't things a code change can
+complete, regardless of how much engineering time goes into them, and are
+listed here plainly rather than as "not attempted" with no explanation:
+
+- **Sync** needs a backend service to sync to - there is nothing to build
+  client-side against until one exists.
+- **An extensions marketplace and DevTools** are ongoing tooling
+  investments (an extension API/runtime plus a store, and a real
+  inspector/debugger protocol and UI), not one-off features - they need
+  sustained work, not a single implementation pass.
+- **WPT (Web Platform Tests) conformance testing** needs the actual W3C
+  test suite wired into this project's CI, not just spec-reading; without
+  that wiring, "conformance" is unverified by construction.
+- **A security response program** (a disclosure process, a triage/patch
+  SLA, a published policy) is an organizational process, not code - it
+  can't be "implemented" in a commit.
 
 ## Building
 
