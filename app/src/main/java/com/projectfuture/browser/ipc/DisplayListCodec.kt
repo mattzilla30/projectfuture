@@ -50,7 +50,7 @@ object DisplayListCodec {
                 out.writeByte(TAG_TEXT)
                 out.writeFloat(cmd.x)
                 out.writeFloat(cmd.baselineY)
-                out.writeUTF(cmd.text)
+                out.writeLongString(cmd.text)
                 writeStyle(out, cmd.style)
                 out.writeFloat(cmd.left)
                 out.writeFloat(cmd.right)
@@ -86,9 +86,9 @@ object DisplayListCodec {
                 out.writeFloat(cmd.right)
                 out.writeFloat(cmd.bottom)
                 out.writeInt(cmd.controlType)
-                out.writeUTF(cmd.value)
+                out.writeLongString(cmd.value)
                 out.writeBoolean(cmd.checked)
-                out.writeUTF(cmd.placeholder)
+                out.writeLongString(cmd.placeholder)
                 writeStyle(out, cmd.style)
                 out.writeBoolean(cmd.fixed)
                 out.writeInt(cmd.elementId)
@@ -101,7 +101,7 @@ object DisplayListCodec {
             TAG_TEXT -> {
                 val x = input.readFloat()
                 val baselineY = input.readFloat()
-                val text = input.readUTF()
+                val text = input.readLongString()
                 val style = readStyle(input)
                 val left = input.readFloat()
                 val right = input.readFloat()
@@ -137,9 +137,9 @@ object DisplayListCodec {
                 val right = input.readFloat()
                 val bottom = input.readFloat()
                 val controlType = input.readInt()
-                val value = input.readUTF()
+                val value = input.readLongString()
                 val checked = input.readBoolean()
-                val placeholder = input.readUTF()
+                val placeholder = input.readLongString()
                 val style = readStyle(input)
                 val fixed = input.readBoolean()
                 val elementId = input.readInt()
@@ -176,8 +176,8 @@ object DisplayListCodec {
 
     private fun writeNullableUtf(out: DataOutputStream, value: String?) {
         out.writeBoolean(value != null)
-        if (value != null) out.writeUTF(value)
+        if (value != null) out.writeLongString(value)
     }
 
-    private fun readNullableUtf(input: DataInputStream): String? = if (input.readBoolean()) input.readUTF() else null
+    private fun readNullableUtf(input: DataInputStream): String? = if (input.readBoolean()) input.readLongString() else null
 }

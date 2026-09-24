@@ -120,18 +120,18 @@ class TabEngineClient(private val context: Context, tabIndex: Int, val isPrivate
         override fun handleMessage(msg: Message) {
             when (msg.what) {
                 TabEngineProtocol.MSG_DISPLAY_LIST -> {
-                    val payload = msg.data.getByteArray(TabEngineProtocol.KEY_PAYLOAD) ?: return
+                    val payload = IpcPayload.take(msg.data, TabEngineProtocol.KEY_PAYLOAD, context.cacheDir) ?: return
                     contentHeight = msg.data.getFloat(TabEngineProtocol.KEY_CONTENT_HEIGHT)
                     displayList = converter.convert(DisplayListCodec.decode(payload))
                     onDisplayListChanged?.invoke(displayList, contentHeight)
                 }
                 TabEngineProtocol.MSG_IMAGE_DATA -> {
                     val id = msg.data.getInt(TabEngineProtocol.KEY_IMAGE_ID)
-                    val bytes = msg.data.getByteArray(TabEngineProtocol.KEY_IMAGE_BYTES) ?: return
+                    val bytes = IpcPayload.take(msg.data, TabEngineProtocol.KEY_IMAGE_BYTES, context.cacheDir) ?: return
                     converter.onImageReceived(id, bytes)
                 }
                 TabEngineProtocol.MSG_ELEMENT_META -> {
-                    val payload = msg.data.getByteArray(TabEngineProtocol.KEY_PAYLOAD) ?: return
+                    val payload = IpcPayload.take(msg.data, TabEngineProtocol.KEY_PAYLOAD, context.cacheDir) ?: return
                     converter.onElementMetaReceived(ElementMetaCodec.decode(payload))
                 }
                 TabEngineProtocol.MSG_TAB_INFO -> {
@@ -178,7 +178,7 @@ class TabEngineClient(private val context: Context, tabIndex: Int, val isPrivate
                 }
                 TabEngineProtocol.MSG_MANIFEST_INFO -> {
                     val name = msg.data.getString(TabEngineProtocol.KEY_TITLE) ?: ""
-                    pendingManifestInfo.poll()?.invoke(name, msg.data.getByteArray(TabEngineProtocol.KEY_IMAGE_BYTES))
+                    pendingManifestInfo.poll()?.invoke(name, IpcPayload.take(msg.data, TabEngineProtocol.KEY_IMAGE_BYTES, context.cacheDir))
                 }
                 TabEngineProtocol.MSG_DOWNLOAD_REQUESTED -> {
                     val url = msg.data.getString(TabEngineProtocol.KEY_URL) ?: return

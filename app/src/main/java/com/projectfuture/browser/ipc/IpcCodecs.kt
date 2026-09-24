@@ -46,7 +46,7 @@ object ElementMetaCodec {
         out.writeInt(entries.size)
         for (entry in entries) {
             out.writeInt(entry.elementId)
-            out.writeUTF(entry.tag)
+            out.writeLongString(entry.tag)
             writeNullableUtf(out, entry.inputType)
         }
         out.flush()
@@ -57,7 +57,7 @@ object ElementMetaCodec {
         val input = DataInputStream(ByteArrayInputStream(data))
         val count = input.readInt()
         return (0 until count).map {
-            WireElementMeta(input.readInt(), input.readUTF(), readNullableUtf(input))
+            WireElementMeta(input.readInt(), input.readLongString(), readNullableUtf(input))
         }
     }
 }
@@ -69,7 +69,7 @@ object SelectOptionsCodec {
         out.writeInt(options.size)
         for (option in options) {
             out.writeInt(option.elementId)
-            out.writeUTF(option.label)
+            out.writeLongString(option.label)
             out.writeBoolean(option.selected)
         }
         out.flush()
@@ -80,7 +80,7 @@ object SelectOptionsCodec {
         val input = DataInputStream(ByteArrayInputStream(data))
         val count = input.readInt()
         return (0 until count).map {
-            WireSelectOption(input.readInt(), input.readUTF(), input.readBoolean())
+            WireSelectOption(input.readInt(), input.readLongString(), input.readBoolean())
         }
     }
 }
@@ -117,7 +117,7 @@ object TabInfoCodec {
 
 private fun writeNullableUtf(out: DataOutputStream, value: String?) {
     out.writeBoolean(value != null)
-    if (value != null) out.writeUTF(value)
+    if (value != null) out.writeLongString(value)
 }
 
-private fun readNullableUtf(input: DataInputStream): String? = if (input.readBoolean()) input.readUTF() else null
+private fun readNullableUtf(input: DataInputStream): String? = if (input.readBoolean()) input.readLongString() else null

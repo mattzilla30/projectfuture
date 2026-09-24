@@ -147,7 +147,7 @@ abstract class TabEngineServiceBase : Service() {
                     tab?.fetchManifestInfo { name, iconBytes ->
                         sendMessage(TabEngineProtocol.MSG_MANIFEST_INFO) {
                             putString(TabEngineProtocol.KEY_TITLE, name)
-                            if (iconBytes != null) putByteArray(TabEngineProtocol.KEY_IMAGE_BYTES, iconBytes)
+                            if (iconBytes != null) IpcPayload.put(this, TabEngineProtocol.KEY_IMAGE_BYTES, iconBytes, cacheDir)
                         }
                     }
                 }
@@ -282,12 +282,20 @@ abstract class TabEngineServiceBase : Service() {
 
     private fun sendDisplayList() {
         val currentTab = tab ?: return
-        val (wireCommands, newImages, newMeta) = converter.convert(currentTab.displayList)
-        for ((id, bitmap) in newImages) sendImage(id, bitmap)
-        if (newMeta.isNotEmpty()) sendMessage(TabEngineProtocol.MSG_ELEMENT_META) { putByteArray(TabEngineProtocol.KEY_PAYLOAD, ElementMetaCodec.encode(newMeta)) }
-        sendMessage(TabEngineProtocol.MSG_DISPLAY_LIST) {
-            putByteArray(TabEngineProtocol.KEY_PAYLOAD, DisplayListCodec.encode(wireCommands))
-            putFloat(TabEngineProtocol.KEY_CONTENT_HEIGHT, currentTab.contentHeight)
+        try {
+            val (wireCommands, newImages, newMeta) = converter.convert(currentTab.displayList)
+            for ((id, bitmap) in newImages) sendImage(id, bitmap)
+            if (newMeta.isNotEmpty()) sendMessage(TabEngineProtocol.MSG_ELEMENT_META) {
+                IpcPayload.put(this, TabEngineProtocol.KEY_PAYLOAD, ElementMetaCodec.encode(newMeta), cacheDir)
+            }
+            sendMessage(TabEngineProtocol.MSG_DISPLAY_LIST) {
+                IpcPayload.put(this, TabEngineProtocol.KEY_PAYLOAD, DisplayListCodec.encode(wireCommands), cacheDir)
+                putFloat(TabEngineProtocol.KEY_CONTENT_HEIGHT, currentTab.contentHeight)
+            }
+        } catch (e: Throwable) {
+            // Report it rather than leave a blank page that looks like it loaded fine.
+            val url = currentTab.currentUrl?.toString() ?: return
+            send(stateMessage(TabEngineProtocol.MSG_STATE_ERROR, url, "Couldn't display this page: ${e.message ?: e.javaClass.simpleName}"))
         }
     }
 
@@ -295,7 +303,7 @@ abstract class TabEngineServiceBase : Service() {
         val bytes = ByteArrayOutputStream().apply { bitmap.compress(Bitmap.CompressFormat.PNG, 100, this) }.toByteArray()
         sendMessage(TabEngineProtocol.MSG_IMAGE_DATA) {
             putInt(TabEngineProtocol.KEY_IMAGE_ID, imageId)
-            putByteArray(TabEngineProtocol.KEY_IMAGE_BYTES, bytes)
+            IpcPayload.put(this, TabEngineProtocol.KEY_IMAGE_BYTES, bytes, cacheDir)
         }
     }
 
@@ -305,7 +313,11 @@ abstract class TabEngineServiceBase : Service() {
 
     private fun send(message: Message) {
         val reply = uiMessenger ?: return
-        try { reply.send(message) } catch (_: Exception) {}
+        try {
+            reply.send(message)
+        } catch (e: Exception) {
+            android.util.Log.w("TabEngineService", "Dropped IPC message ${message.what}", e)
+        }
     }
 
     override fun onDestroy() {

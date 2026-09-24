@@ -38,6 +38,16 @@ class DisplayListCodecTest {
         assertEquals(null, text.style.fontFamilyName)
     }
 
+    @Test fun roundTripsStringsLongerThan64KB() {
+        // DataOutputStream.writeUTF throws past 64KB of encoded bytes; a long <pre> run or data: link can exceed that.
+        val longText = "é".repeat(50_000)
+        val longHref = "data:text/plain," + "x".repeat(100_000)
+        val commands = listOf(WireDrawText(0f, 0f, longText, style(link = longHref), 0f, 10f, 0f, 10f, false, 1))
+        val decoded = DisplayListCodec.decode(DisplayListCodec.encode(commands)).single() as WireDrawText
+        assertEquals(longText, decoded.text)
+        assertEquals(longHref, decoded.style.linkHref)
+    }
+
     @Test fun roundTripsUnicodeText() {
         val commands = listOf(WireDrawText(0f, 0f, "héllo 世界 😀", style(), 0f, 10f, 0f, 10f, false, 1))
         val decoded = DisplayListCodec.decode(DisplayListCodec.encode(commands))
