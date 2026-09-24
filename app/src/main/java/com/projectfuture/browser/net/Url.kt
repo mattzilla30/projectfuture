@@ -27,6 +27,18 @@ import javax.net.ssl.X509TrustManager
  * standard-library equivalent, and writing a Brotli decoder is its own
  * substantial project - same reasoning as the WOFF2 gap in FontDecoder.kt),
  * so a server that only offers `br` encoding won't get it requested.
+ *
+ * Every request made through [fetch]/[fetchBytes] is HTTP/1.1, as above.
+ * There is no HTTP/2 support to negotiate via ALPN, so the `net/quic/`
+ * package (a from-scratch QUIC transport, RFC 9001 Initial-packet crypto,
+ * and a minimal QPACK codec, built and unit-tested for HTTP/3) is not
+ * wired in here: it has no working TLS 1.3-over-QUIC handshake (see
+ * `Http3TlsHandshake`'s class doc for exactly why), so it can never
+ * complete a real request. Adding "try QUIC first" logic to this class
+ * would only mean every HTTPS request pays for a UDP attempt that is
+ * guaranteed to fail before falling back here - dead-weight negotiation
+ * theater, not real HTTP/3 support - so it's left as a standalone,
+ * honestly-labeled package instead. See README.md's HTTP/3 section.
  */
 data class Url(
     val scheme: String,
