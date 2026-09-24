@@ -42,11 +42,22 @@ class Settings(context: Context) {
         get() = prefs.getBoolean(KEY_SANDBOXED_TABS, true)
         set(value) = prefs.edit().putBoolean(KEY_SANDBOXED_TABS, value).apply()
 
+    /**
+     * Whether the browser renders pages with the dark-mode color inversion
+     * applied ([com.projectfuture.browser.view.BrowserView.setDarkMode]).
+     * Defaults to `false` (light), matching the app's existing default
+     * behavior before this setting was persisted.
+     */
+    var darkModeEnabled: Boolean
+        get() = prefs.getBoolean(KEY_DARK_MODE, false)
+        set(value) = prefs.edit().putBoolean(KEY_DARK_MODE, value).apply()
+
     companion object {
         private const val KEY_HOME_PAGE = "home_page"
         private const val KEY_SEARCH_TEMPLATE = "search_template"
         private const val KEY_TRACKING_PROTECTION = "tracking_protection"
         private const val KEY_SANDBOXED_TABS = "sandboxed_tabs_enabled"
+        private const val KEY_DARK_MODE = "dark_mode_enabled"
         const val DEFAULT_HOME_PAGE = "https://example.com/"
         const val DEFAULT_SEARCH_TEMPLATE = "https://duckduckgo.com/html/?q=%s"
     }

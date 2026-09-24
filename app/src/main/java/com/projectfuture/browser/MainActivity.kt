@@ -42,6 +42,7 @@ import com.projectfuture.browser.browser.BookmarkStore
 import com.projectfuture.browser.browser.sanitizeDownloadFilename
 import com.projectfuture.browser.browser.uniqueDownloadFilename
 import com.projectfuture.browser.browser.CredentialStore
+import com.projectfuture.browser.browser.DialogGuard
 import com.projectfuture.browser.browser.SavedCredential
 import com.projectfuture.browser.browser.HistoryStore
 import com.projectfuture.browser.browser.LocalStorageStore
@@ -79,7 +80,10 @@ class MainActivity : AppCompatActivity() {
     private val neverSaveOrigins = HashSet<String>()
     private var lastViewportWidth = 0f
     private var lastViewportHeight = 0f
+    /** Mirrors `settings.darkModeEnabled`; kept in memory too so the overflow menu's checkbox and click handler don't need to hit SharedPreferences on every open. */
     private var darkModeEnabled = false
+    /** Guards every MainActivity-owned dialog (tab switcher, bookmarks, history, settings, passwords, certificate-error interstitial, field/select-value prompts) against rapid double-taps stacking two instances - see DialogGuard's doc. */
+    private val dialogGuard = DialogGuard()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -93,6 +97,8 @@ class MainActivity : AppCompatActivity() {
         tabSessionStore = TabSessionStore(this)
         credentialStore = CredentialStore(this)
         TrackingProtection.enabled = settings.trackingProtectionEnabled
+        darkModeEnabled = settings.darkModeEnabled
+        binding.browserView.setDarkMode(darkModeEnabled)
         if (sharedCookieJar == null) sharedCookieJar = CookieJar(applicationContext)
         if (sharedLocalStorage == null) sharedLocalStorage = LocalStorageStore(applicationContext)
         if (sharedServiceWorkerRegistry == null) sharedServiceWorkerRegistry = ServiceWorkerRegistry(SharedPrefsStorageBacking(applicationContext, "service_workers"))
@@ -337,6 +343,7 @@ class MainActivity : AppCompatActivity() {
 
     /** The whole "settings screen": two fields, no PreferenceScreen framework - see Settings.kt's doc. */
     private fun showSettingsDialog() {
+        if (!dialogGuard.tryAcquire()) return
         val container = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(48, 24, 48, 0)
@@ -357,7 +364,7 @@ class MainActivity : AppCompatActivity() {
         container.addView(searchLabel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = 32 })
         container.addView(searchInput)
 
-        MaterialAlertDialogBuilder(this)
+        val dialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.menu_settings)
             .setView(container)
             .setPositiveButton(R.string.action_save) { d, _ ->
@@ -367,6 +374,7 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton(R.string.action_close, null)
             .show()
+        dialog.setOnDismissListener { dialogGuard.release() }
     }
 
     private fun applyWindowTitle(tab: TabHandle, text: String) {
@@ -425,6 +433,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showTabSwitcher() {
+        if (!dialogGuard.tryAcquire()) return
         lateinit var dialog: AlertDialog
         val tabs = tabManager.allTabs()
         val thumbWidthPx = (resources.displayMetrics.density * 150).toInt()
@@ -494,6 +503,7 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton(R.string.action_new_tab) { d, _ -> openNewTab(); d.dismiss() }
             .setNegativeButton(R.string.action_close, null)
             .create()
+        dialog.setOnDismissListener { dialogGuard.release() }
         dialog.show()
     }
 
@@ -566,6 +576,7 @@ class MainActivity : AppCompatActivity() {
                 6 -> { tabManager.activeTab?.toggleDesktopMode(); true }
                 7 -> {
                     darkModeEnabled = !darkModeEnabled
+                    settings.darkModeEnabled = darkModeEnabled
                     binding.browserView.setDarkMode(darkModeEnabled)
                     binding.browserView.clearOverlayViews()
                     refreshView()
@@ -599,6 +610,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showBookmarksDialog() {
+        if (!dialogGuard.tryAcquire()) return
         lateinit var dialog: AlertDialog
         val listView = ListView(this)
         fun bind() {
@@ -624,10 +636,12 @@ class MainActivity : AppCompatActivity() {
             .setView(listView)
             .setNegativeButton(R.string.action_close, null)
             .create()
+        dialog.setOnDismissListener { dialogGuard.release() }
         dialog.show()
     }
 
     private fun showHistoryDialog() {
+        if (!dialogGuard.tryAcquire()) return
         lateinit var dialog: AlertDialog
         val listView = ListView(this)
         fun bind() {
@@ -654,6 +668,7 @@ class MainActivity : AppCompatActivity() {
             .setPositiveButton(R.string.action_clear) { _, _ -> historyStore.clear(); dialog.dismiss() }
             .setNegativeButton(R.string.action_close, null)
             .create()
+        dialog.setOnDismissListener { dialogGuard.release() }
         dialog.show()
     }
 
@@ -706,6 +721,7 @@ class MainActivity : AppCompatActivity() {
 
     /** Lists every saved login (username + masked origin, never the plaintext password) with per-entry delete - the one settings surface onto CredentialStore. */
     private fun showPasswordsDialog() {
+        if (!dialogGuard.tryAcquire()) return
         lateinit var dialog: AlertDialog
         val listView = ListView(this)
         fun bind() {
@@ -739,6 +755,7 @@ class MainActivity : AppCompatActivity() {
             .setView(listView)
             .setNegativeButton(R.string.action_close, null)
             .create()
+        dialog.setOnDismissListener { dialogGuard.release() }
         dialog.show()
     }
 
@@ -821,7 +838,8 @@ class MainActivity : AppCompatActivity() {
      * weakening validation anywhere else.
      */
     private fun showCertificateErrorDialog(tab: TabHandle, url: Url, message: String) {
-        MaterialAlertDialogBuilder(this)
+        if (!dialogGuard.tryAcquire()) return
+        val dialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.certificate_error_title)
             .setMessage(getString(R.string.certificate_error_message, url.host, message))
             .setPositiveButton(R.string.certificate_error_proceed) { d, _ ->
@@ -830,6 +848,7 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton(R.string.action_close, null)
             .show()
+        dialog.setOnDismissListener { dialogGuard.release() }
     }
 
     /**
@@ -945,6 +964,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun promptForFieldValue(element: ElementNode, tab: TabHandle) {
+        if (!dialogGuard.tryAcquire()) return
         // Prefilling the dialog needs the field's current value, which for a sandboxed tab is a
         // round trip to the engine process rather than a synchronous read - see
         // TabHandle.currentFieldValue's doc.
@@ -956,23 +976,29 @@ class MainActivity : AppCompatActivity() {
                     inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                 }
             }
-            MaterialAlertDialogBuilder(this)
+            val dialog = MaterialAlertDialogBuilder(this)
                 .setView(input)
                 .setPositiveButton(android.R.string.ok) { _, _ -> tab.setFieldValue(element, input.text.toString()) }
                 .setNegativeButton(android.R.string.cancel, null)
                 .show()
+            dialog.setOnDismissListener { dialogGuard.release() }
         }
     }
 
     private fun promptForSelectValue(element: ElementNode, tab: TabHandle) {
+        if (!dialogGuard.tryAcquire()) return
         // The option list itself lives in the engine process's live DOM for a sandboxed tab, so
         // this is also async - see TabHandle.requestSelectOptions's doc.
         tab.requestSelectOptions(element) { options ->
-            if (options.isEmpty()) return@requestSelectOptions
+            if (options.isEmpty()) {
+                dialogGuard.release()
+                return@requestSelectOptions
+            }
             val labels = options.map { it.label }.toTypedArray()
-            MaterialAlertDialogBuilder(this)
+            val dialog = MaterialAlertDialogBuilder(this)
                 .setItems(labels) { _, which -> tab.setSelectValue(element, options[which].node) }
                 .show()
+            dialog.setOnDismissListener { dialogGuard.release() }
         }
     }
 
