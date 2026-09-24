@@ -156,7 +156,22 @@ data class Url(
         try {
             val socket = openSocket()
             socket.soTimeout = 20000
-            ConnectionPool.release("$scheme://$host:$port", socket)
+            val poolKey = "$scheme://$host:$port"
+            // A preconnected socket that negotiated h2 over ALPN must go into Http2ConnectionPool,
+            // not the plain HTTP/1.1 ConnectionPool below: the real request later checks
+            // Http2ConnectionPool first and, missing an entry there, would fall through to
+            // ConnectionPool.borrow(), get this same socket back, and speak HTTP/1.1 request lines
+            // over a connection the server already agreed (via ALPN) to speak HTTP/2 framing on -
+            // a protocol mismatch the server has no reason to make sense of.
+            if (socket is SSLSocket && Alpn.negotiated(socket) == "h2") {
+                val connection = Http2Connection(socket)
+                val winner = Http2ConnectionPool.putIfAbsent(poolKey, connection)
+                if (winner !== connection) {
+                    try { connection.close() } catch (_: Exception) {}
+                }
+                return
+            }
+            ConnectionPool.release(poolKey, socket)
         } catch (_: Exception) {
             // Best-effort - see doc above.
         }
@@ -267,8 +282,15 @@ data class Url(
             socket = openSocket()
             if (isHttps && socket is SSLSocket && Alpn.negotiated(socket) == "h2") {
                 val connection = Http2Connection(socket)
-                Http2ConnectionPool.put(poolKey, connection)
-                return fetchViaHttp2(connection, method, body, extraHeaders, redirectsLeft, allowCookies)
+                // putIfAbsent, not put: another thread (a concurrent request from a different Tab
+                // to the same host, or a racing preconnect()) may have already finished its own
+                // handshake and registered a connection for this key first. If so, use that one and
+                // close this redundant one instead of clobbering - see putIfAbsent's doc.
+                val winner = Http2ConnectionPool.putIfAbsent(poolKey, connection)
+                if (winner !== connection) {
+                    try { connection.close() } catch (_: Exception) {}
+                }
+                return fetchViaHttp2(winner, method, body, extraHeaders, redirectsLeft, allowCookies)
             }
         }
         socket.soTimeout = 20000
@@ -474,15 +496,27 @@ data class Url(
 
     private fun readLine(input: BufferedInputStream): String? = readCrlfLine(input)
 
+    /**
+     * Reads exactly [count] bytes, or throws if the connection is closed first. A short read here
+     * used to be swallowed (returning whatever bytes had arrived, as if that were the whole body):
+     * that silently handed callers a truncated response with no error, since the truncation only
+     * ever happens when `Content-Length` promised more than the server actually sent (a dropped
+     * connection, a proxy that cuts a response short, etc). Worse, the caller in [fetchRaw] treats
+     * a `Content-Length` body as always "determinate" and pools the socket for reuse once it thinks
+     * it's read the full body - so a truncated read used to hand a dead, already-EOF'd socket back
+     * to [ConnectionPool] as if it were still good, poisoning the next request that borrowed it.
+     * Throwing instead makes `fetchRaw`'s own `catch` close the socket rather than pool it, and
+     * surfaces the real problem to the caller instead of silently corrupting the response body.
+     */
     private fun readExactly(input: BufferedInputStream, count: Int): ByteArray {
         val out = ByteArray(count)
         var read = 0
         while (read < count) {
             val n = input.read(out, read, count - read)
-            if (n == -1) break
+            if (n == -1) throw IOException("Unexpected end of stream after $read/$count bytes of response body from $host")
             read += n
         }
-        return if (read == count) out else out.copyOf(read)
+        return out
     }
 
     private fun readToEnd(input: BufferedInputStream): ByteArray {
