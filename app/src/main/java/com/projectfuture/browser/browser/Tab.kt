@@ -685,7 +685,8 @@ class Tab(
         return true
     }
 
-    private fun load(url: Url, action: HistoryAction, method: String = "GET", body: ByteArray? = null) {
+    private fun load(requestedUrl: Url, action: HistoryAction, method: String = "GET", body: ByteArray? = null) {
+        val url = unwrapSearchRedirect(requestedUrl)
         val navigation = ++navigationSeq
         onStateChanged(TabState.Loading(url))
         // Read on the main thread (load() is always called from one) before
