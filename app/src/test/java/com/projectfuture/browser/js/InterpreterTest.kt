@@ -270,6 +270,57 @@ class InterpreterTest {
         assertTrue(bool("var re = new RegExp('^abc${'$'}', 'i'); var result = re.test('ABC');"))
     }
 
+    @Test fun regexNamedGroupsSurfaceOnExecAndMatch() {
+        // `(?<name>...)` capture groups must show up under `.groups`, not just as positional
+        // captures - both from a stateless exec() and a non-global String.match().
+        assertEquals(
+            "2023",
+            str("var m = /(?<year>\\d+)-(?<month>\\d+)/.exec('2023-01'); var result = m.groups.year;")
+        )
+        assertEquals(
+            "01",
+            str("var m = '2023-01'.match(/(?<year>\\d+)-(?<month>\\d+)/); var result = m.groups.month;")
+        )
+        // A regex with no named groups at all must report `groups` as undefined, not an empty object.
+        assertEquals(
+            "undefined",
+            str("var m = /(\\d)-(\\d)/.exec('5-9'); var result = typeof m.groups;")
+        )
+        // A named group on a branch that didn't participate in the match is undefined, not missing.
+        assertEquals(
+            "undefined",
+            str("var m = /(?<a>x)|(?<b>y)/.exec('y'); var result = typeof m.groups.a;")
+        )
+    }
+
+    @Test fun regexNonGlobalMatchHasIndexAndInputLikeExec() {
+        // A non-global String.match() result must carry the same `.index`/`.input` extras as exec(),
+        // not just be a bare array of matched strings.
+        assertNum(3.0, "var result = 'xx foo yy'.match(/foo/).index;")
+        assertEquals("xx foo yy", str("var result = 'xx foo yy'.match(/foo/).input;"))
+    }
+
+    @Test fun regexNamedBackreference() {
+        assertTrue(bool("var result = /(?<x>a)\\k<x>/.test('aa');"))
+        assertTrue(!bool("var result = /(?<x>a)\\k<x>/.test('ab');"))
+    }
+
+    @Test fun regexReplaceDollarDollarIsLiteralDollarSign() {
+        // `$$` in a replacement string must become a single literal `$`, not throw and not stay `$$`.
+        // This used to throw java.lang.IllegalArgumentException("Illegal group reference") for a
+        // global replace, because the plain-string replacement was previously handed to Java's own
+        // replacement-string parser, which uses `\$` (not `$$`) to escape a literal dollar sign.
+        assertEquals("a\$c", str("var result = 'abc'.replace(/b/, '\$\$');"))
+        assertEquals("a\$c", str("var result = 'abc'.replace(/b/g, '\$\$');"))
+    }
+
+    @Test fun regexReplaceOutOfRangeAndUnknownGroupRefsAreLiteral() {
+        // `$9` when the pattern has no 9th capture group, and `$<name>` when the pattern declares no
+        // named groups at all, must be left as literal text per spec - not silently dropped/emptied.
+        assertEquals("x\$9yb", str("var result = 'ab'.replace(/a/, 'x\$9y');"))
+        assertEquals("x\$<nope>yb", str("var result = 'ab'.replace(/a/, 'x\$<nope>y');"))
+    }
+
     @Test fun divisionStillWorksAfterRegexSupportAdded() {
         // Guards against the regex-vs-division lexer heuristic breaking ordinary division.
         assertNum(2.0, "var a = 10; var b = 5; var result = a / b;")

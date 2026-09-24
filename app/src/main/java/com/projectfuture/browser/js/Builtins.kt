@@ -448,7 +448,7 @@ private fun stringMethod(interpreter: Interpreter, s: JsString, key: String, arg
                 if (matches.isEmpty()) JsNull else JsArray(matches)
             } else {
                 val m = re.kotlinRegex.find(v) ?: return JsNull
-                JsArray(m.groupValues.map { JsString(it) as JsValue }.toMutableList())
+                buildMatchArray(re, v, m)
             }
         }
         "repeat" -> JsString(v.repeat(toNumber(arg(args, 0)).toInt().coerceAtLeast(0)))
