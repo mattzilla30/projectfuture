@@ -8,6 +8,7 @@ import com.projectfuture.browser.net.http2.HpackHeader
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
+import java.io.InputStream
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.charset.Charset
@@ -436,23 +437,7 @@ data class Url(
         return try { Charset.forName(name) } catch (_: Exception) { Charsets.UTF_8 }
     }
 
-    private fun readLine(input: BufferedInputStream): String? {
-        val buffer = ByteArrayOutputStream()
-        var prevWasCr = false
-        var readAny = false
-        while (true) {
-            val b = input.read()
-            if (b == -1) return if (readAny) buffer.toString("ISO-8859-1") else null
-            readAny = true
-            if (b == '\n'.code) {
-                val bytes = buffer.toByteArray()
-                val len = if (prevWasCr && bytes.isNotEmpty()) bytes.size - 1 else bytes.size
-                return String(bytes, 0, len, Charsets.ISO_8859_1)
-            }
-            prevWasCr = b == '\r'.code
-            buffer.write(b)
-        }
-    }
+    private fun readLine(input: BufferedInputStream): String? = readCrlfLine(input)
 
     private fun readExactly(input: BufferedInputStream, count: Int): ByteArray {
         val out = ByteArray(count)
@@ -590,3 +575,29 @@ private data class RawHttpResponse(
     val body: ByteArray,
     val url: Url
 )
+
+/**
+ * Reads one CRLF- (or bare LF-) terminated line as ISO-8859-1 text, per
+ * RFC 7230's header-line grammar - shared by the HTTP client above and
+ * [WebSocketClient]'s Upgrade handshake, which parses the same kind of
+ * line-oriented response. Returns null only at end-of-stream with nothing
+ * read yet (a closed/empty connection), not at end-of-stream after a
+ * partial, unterminated line.
+ */
+internal fun readCrlfLine(input: InputStream): String? {
+    val buffer = ByteArrayOutputStream()
+    var prevWasCr = false
+    var readAny = false
+    while (true) {
+        val b = input.read()
+        if (b == -1) return if (readAny) buffer.toString("ISO-8859-1") else null
+        readAny = true
+        if (b == '\n'.code) {
+            val bytes = buffer.toByteArray()
+            val len = if (prevWasCr && bytes.isNotEmpty()) bytes.size - 1 else bytes.size
+            return String(bytes, 0, len, Charsets.ISO_8859_1)
+        }
+        prevWasCr = b == '\r'.code
+        buffer.write(b)
+    }
+}

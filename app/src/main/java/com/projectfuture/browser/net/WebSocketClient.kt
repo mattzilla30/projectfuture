@@ -186,21 +186,5 @@ class WebSocketClient(private val url: Url) {
         }
     }
 
-    private fun readLine(input: InputStream): String? {
-        val buffer = ByteArrayOutputStream()
-        var prevWasCr = false
-        var readAny = false
-        while (true) {
-            val b = input.read()
-            if (b == -1) return if (readAny) buffer.toString("ISO-8859-1") else null
-            readAny = true
-            if (b == '\n'.code) {
-                val bytes = buffer.toByteArray()
-                val len = if (prevWasCr && bytes.isNotEmpty()) bytes.size - 1 else bytes.size
-                return String(bytes, 0, len, Charsets.ISO_8859_1)
-            }
-            prevWasCr = b == '\r'.code
-            buffer.write(b)
-        }
-    }
+    private fun readLine(input: InputStream): String? = readCrlfLine(input)
 }
