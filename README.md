@@ -49,11 +49,19 @@ correctness) - see commit history for the detailed limitations of each:
 - `<img>` rendering (via `BitmapFactory`), baseline-aligned inline sizing
 - Clickable links, vertical scrolling, back/forward history, reload
 - Address bar with a plain-text/search fallback
+- JavaScript execution (a from-scratch interpreter), the DOM/window bridge,
+  `fetch`/`setTimeout`/`setInterval`
+- Web fonts (`@font-face`), SVG, `<canvas>` 2D, CSS `calc()`/custom
+  properties/media queries
+- Forms: `<input>`/`<textarea>`/`<select>`/`<button>` render as real
+  controls (tap to edit/toggle/pick), and submit via GET or POST
+- Cookies, gzip response decoding, multiple tabs, bookmarks/history
 
-Not yet implemented: JavaScript execution, web fonts, CSS transitions/
-animations/transforms, `calc()`/custom properties/media queries, SVG,
-`<canvas>`, forms/POST, cookies, and multiple tabs. These are natural
-next milestones - see the project roadmap for the fuller list.
+Not yet implemented: CSS transitions/animations, `transform: scale()`/
+`rotate()`/`skew()`, `multipart/form-data` file uploads, and a real text
+cursor/in-place typing (form field edits go through a dialog rather than
+on-canvas text editing). These are natural next milestones - see the
+project roadmap for the fuller list.
 
 ## Building
 

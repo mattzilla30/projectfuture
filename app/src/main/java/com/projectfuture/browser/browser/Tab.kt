@@ -35,6 +35,7 @@ import com.projectfuture.browser.layout.customFonts
 import com.projectfuture.browser.net.HttpResponse
 import com.projectfuture.browser.net.Url
 import java.io.File
+import java.net.URLEncoder
 import java.util.concurrent.Executors
 
 sealed class TabState {
@@ -130,6 +131,114 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         }
     }
 
+    /** Current text shown in a text-like `<input>`/`<textarea>`, used to pre-fill MainActivity's edit dialog. */
+    fun currentFieldValue(element: ElementNode): String =
+        if (element.tag == "textarea") element.children.filterIsInstance<TextNode>().joinToString("") { it.text }
+        else element.attr("value") ?: ""
+
+    fun toggleCheckbox(element: ElementNode) {
+        if (element.attr("checked") != null) element.attributes.remove("checked") else element.attributes["checked"] = "checked"
+        mutateAndRefresh()
+    }
+
+    /** Checks [element] and unchecks every other radio sharing its `name` within the same `<form>` (or the whole document if it's outside one). */
+    fun selectRadio(element: ElementNode) {
+        val name = element.attr("name")
+        val scope = findAncestorForm(element) ?: currentDoc
+        if (name != null) {
+            scope?.walkElements { el ->
+                if (el !== element && el.tag == "input" && (el.attr("type") ?: "").lowercase() == "radio" && el.attr("name") == name) {
+                    el.attributes.remove("checked")
+                }
+            }
+        }
+        element.attributes["checked"] = "checked"
+        mutateAndRefresh()
+    }
+
+    fun setFieldValue(element: ElementNode, value: String) {
+        if (element.tag == "textarea") {
+            element.children.clear()
+            element.children.add(TextNode(value, element))
+        } else {
+            element.attributes["value"] = value
+        }
+        mutateAndRefresh()
+    }
+
+    fun setSelectValue(select: ElementNode, chosenOption: ElementNode) {
+        select.children.filterIsInstance<ElementNode>().forEach { if (it.tag == "option") it.attributes.remove("selected") }
+        chosenOption.attributes["selected"] = "selected"
+        mutateAndRefresh()
+    }
+
+    /**
+     * Submits [trigger]'s nearest ancestor `<form>`: gathers every named
+     * control's current value (checkboxes/radios only when checked; a
+     * `<select>` contributes its selected `<option>`'s value), URL-encodes
+     * them, and navigates - as a `?query` string on the form's `action` for
+     * `method="get"` (the default), or as a request body for
+     * `method="post"`. `enctype="multipart/form-data"` (file uploads) isn't
+     * supported - `<input type=file>` never has a value to contribute here.
+     */
+    fun submitForm(trigger: ElementNode) {
+        val form = findAncestorForm(trigger) ?: return
+        val baseUrl = currentUrl ?: return
+        val action = form.attr("action")?.takeIf { it.isNotBlank() }?.let { baseUrl.resolve(it) } ?: baseUrl
+        val method = (form.attr("method") ?: "get").trim().lowercase()
+
+        val params = ArrayList<Pair<String, String>>()
+        form.walkElements { el ->
+            if (el === form) return@walkElements
+            val name = el.attr("name") ?: return@walkElements
+            when (el.tag) {
+                "input" -> when ((el.attr("type") ?: "text").lowercase()) {
+                    "submit", "button", "reset", "image", "file" -> {}
+                    "checkbox", "radio" -> if (el.attr("checked") != null) params.add(name to (el.attr("value") ?: "on"))
+                    else -> params.add(name to (el.attr("value") ?: ""))
+                }
+                "textarea" -> params.add(name to currentFieldValue(el))
+                "select" -> {
+                    val options = el.children.filterIsInstance<ElementNode>().filter { it.tag == "option" }
+                    val chosen = options.firstOrNull { it.attr("selected") != null } ?: options.firstOrNull()
+                    if (chosen != null) {
+                        val value = chosen.attr("value") ?: chosen.children.filterIsInstance<TextNode>().joinToString("") { it.text }
+                        params.add(name to value)
+                    }
+                }
+            }
+        }
+        val encoded = params.joinToString("&") { (k, v) -> "${urlEncode(k)}=${urlEncode(v)}" }
+
+        if (method == "post") {
+            load(action, HistoryAction.PUSH, "POST", encoded.toByteArray(Charsets.UTF_8), "application/x-www-form-urlencoded")
+        } else {
+            val basePath = action.path.substringBefore('?')
+            val query = if (encoded.isEmpty()) "" else "?$encoded"
+            load(action.copy(path = basePath + query), HistoryAction.PUSH)
+        }
+    }
+
+    private fun urlEncode(s: String) = URLEncoder.encode(s, "UTF-8")
+
+    private fun findAncestorForm(element: ElementNode): ElementNode? {
+        var current: ElementNode? = element
+        while (current != null) {
+            if (current.tag == "form") return current
+            current = current.parent
+        }
+        return null
+    }
+
+    /** Shared by every form-control mutation above: re-cascade/re-layout and report Updated, same as dispatchClick's DOM-mutation path. */
+    private fun mutateAndRefresh() {
+        val doc = currentDoc ?: return
+        val url = currentUrl ?: return
+        computeStyles(doc, currentAuthorRules)
+        relayout()
+        onStateChanged(TabState.Updated(url, extractTitle(doc)))
+    }
+
     /** Called by the view when its size changes; re-runs layout without re-fetching. */
     fun onViewportSizeChanged(widthPx: Float, heightPx: Float): Boolean {
         if (widthPx <= 0f || heightPx <= 0f || (widthPx == viewportWidth && heightPx == viewportHeight)) return false
@@ -139,7 +248,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         return true
     }
 
-    private fun load(url: Url, action: HistoryAction) {
+    private fun load(url: Url, action: HistoryAction, method: String = "GET", body: ByteArray? = null, contentType: String? = null) {
         onStateChanged(TabState.Loading(url))
         // Read on the main thread (load() is always called from one) before
         // handing off to the background executor, rather than reading the
@@ -147,7 +256,7 @@ class Tab(private val context: Context, private val onStateChanged: (TabState) -
         val mediaViewportWidth = if (viewportWidth > 0f) viewportWidth else 360f
         executor.execute {
             try {
-                val response = url.fetch()
+                val response = url.fetch(method, body, contentType)
                 val root = HtmlParser(response.body).parse()
                 // Scripts may mutate the DOM, so this runs before CSS/images/fonts are collected below.
                 val (interpreter, bridge) = runScripts(root, response.url)
