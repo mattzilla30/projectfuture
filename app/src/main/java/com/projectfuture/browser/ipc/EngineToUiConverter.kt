@@ -23,6 +23,24 @@ class EngineToUiConverter(private val elementIds: ElementIdRegistry) {
     /** Which elementIds have already had a [WireElementMeta] sent for them - each is only ever sent once, the first time it's seen (see [TabEngineProtocol.MSG_ELEMENT_META]'s doc). */
     private val metaSent = HashSet<Int>()
 
+    /**
+     * Clears every per-document cache - must be called (alongside
+     * [ElementIdRegistry.reset]) exactly when a fresh document has loaded,
+     * before converting its first display list. Without this, an id
+     * recycled by [ElementIdRegistry.reset] (ids restart at 1 for every
+     * new document) would already be in [metaSent] from the *previous*
+     * document, so [WireElementMeta] for the new element at that id would
+     * never be (re-)sent - the UI process would keep treating it as
+     * whatever tag/type the old element at that id had, a real
+     * misattribution (e.g. a stale "input type=password" shadow surviving
+     * onto a plain link), not just a leak.
+     */
+    fun reset() {
+        imageIds.clear()
+        nextImageId = 1
+        metaSent.clear()
+    }
+
     /** The wire commands, plus any bitmaps and element metadata seen here for the first time (send these once - as MSG_IMAGE_DATA/MSG_ELEMENT_META - before or alongside the display list). */
     fun convert(commands: List<DisplayCommand>): Triple<List<WireDisplayCommand>, List<Pair<Int, Bitmap>>, List<WireElementMeta>> {
         val newImages = ArrayList<Pair<Int, Bitmap>>()

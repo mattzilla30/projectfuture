@@ -203,22 +203,35 @@ class ServiceWorkerHost(
         }
     }
 
-    private fun dispatchLifecycle(type: String) {
-        val (interpreter, listeners) = prepare() ?: return
+    /** Returns false (without dispatching anything) if [scriptCode] failed to even parse/run to the point of registering its listeners - the caller must not treat that as a completed lifecycle step. */
+    private fun dispatchLifecycle(type: String): Boolean {
+        val (interpreter, listeners) = prepare() ?: return false
         val event = JsObject()
         event.set("waitUntil", NativeFunction("waitUntil", 1) { _, _, _ -> JsUndefined })
         for (fn in listeners[type].orEmpty()) {
             try { fn.call(interpreter, JsUndefined, listOf(event)) } catch (_: Exception) { }
         }
+        return true
     }
 
-    /** Runs `install` then `activate` exactly once ever for this scope (persisted via [registry]); a no-op on every later call. */
+    /**
+     * Runs `install` then `activate` exactly once ever for this scope
+     * (persisted via [registry]); a no-op on every later call. Only
+     * persists [ServiceWorkerRegistry.markInstalled] once those events
+     * genuinely ran - a script that fails to even parse (so [prepare]
+     * returns null and there is nothing to dispatch to) must not be
+     * silently marked installed, or it would be permanently stuck
+     * "installed" without its install/activate listeners - if it's ever
+     * fixed and re-registered with the *same* scriptUrl (a no-op
+     * re-register, see [ServiceWorkerRegistry.register]) - having ever
+     * actually run once.
+     */
     fun ensureInstalledAndActivated() {
         val reg = registry.all(origin).firstOrNull { it.scope == scope } ?: return
         if (reg.installed) return
-        dispatchLifecycle("install")
-        dispatchLifecycle("activate")
-        registry.markInstalled(origin, scope)
+        val installRan = dispatchLifecycle("install")
+        val activateRan = dispatchLifecycle("activate")
+        if (installRan && activateRan) registry.markInstalled(origin, scope)
     }
 
     /**

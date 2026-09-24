@@ -49,15 +49,34 @@ class StunTest {
         assertFalse(StunMessage.verifyIntegrity(decoded, encoded, encoded.size, "wrong-password".toByteArray()))
     }
 
-    @Test fun fingerprintProtectsAgainstBitFlips() {
+    @Test fun validFingerprintIsAccepted() {
+        val encoded = StunMessage.bindingRequest().addUseCandidate().encode()
+        val decoded = StunMessage.decode(encoded)
+        assertNotNull("an untampered message with a correct FINGERPRINT must decode", decoded)
+    }
+
+    @Test fun fingerprintRejectsATamperedMessage() {
         val encoded = StunMessage.bindingRequest().addUseCandidate().encode()
         val tampered = encoded.copyOf()
-        tampered[tampered.size - 1] = (tampered[tampered.size - 1] + 1).toByte() // corrupt part of the fingerprint's covered data
-        // The message still decodes structurally (FINGERPRINT itself is just another attribute we don't
-        // independently re-check on decode), but recomputing it over the tampered bytes must now disagree
-        // with the attribute the tampering left behind - proving the checksum actually covers the payload.
-        val decoded = StunMessage.decode(tampered)
-        assertNotNull(decoded)
+        // Corrupt a byte inside USE-CANDIDATE's TLV, which FINGERPRINT covers but is itself
+        // untouched - the sort of single-bit wire corruption/tampering FINGERPRINT exists to catch
+        // (RFC 5389 section 15.5). decode() must refuse to hand back a message whose payload no
+        // longer matches its own checksum, not silently accept corrupted/tampered STUN traffic.
+        tampered[21] = (tampered[21] + 1).toByte()
+        assertNull("decode() must reject a message whose FINGERPRINT no longer matches its covered bytes", StunMessage.decode(tampered))
+    }
+
+    @Test fun fingerprintVerificationDirectlyRejectsTamperedBytes() {
+        val encoded = StunMessage.bindingRequest().addUseCandidate().addPriority(12345L).encode()
+        val message = StunMessage.decode(encoded)!!
+        assertTrue(StunMessage.verifyFingerprint(message, encoded, encoded.size))
+        val tampered = encoded.copyOf()
+        tampered[24] = (tampered[24] + 1).toByte()
+        // verifyFingerprint is handed the decoded message (still carrying the original, un-tampered
+        // FINGERPRINT attribute value) alongside the tampered raw bytes - it must recompute against
+        // the raw bytes and disagree, not trust the attribute it already parsed out.
+        val decodedFromTampered = StunMessage(message.type, message.transactionId, message.attributes)
+        assertFalse(StunMessage.verifyFingerprint(decodedFromTampered, tampered, tampered.size))
     }
 
     @Test fun garbageIsNotMisparsedAsStun() {

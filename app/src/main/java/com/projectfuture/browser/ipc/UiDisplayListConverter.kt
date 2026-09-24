@@ -35,6 +35,28 @@ class UiDisplayListConverter {
     /** tag/inputType for each elementId, learned from MSG_ELEMENT_META - see that message's doc. Looked up lazily when a shadow is first built for an id, so ordering only matters relative to that (guaranteed: the engine always sends an id's meta before/alongside the first display list or reply referencing it). */
     private val metaByElementId = HashMap<Int, Pair<String, String?>>()
 
+    /**
+     * Clears every per-document cache - the UI-process twin of
+     * [EngineToUiConverter.reset], called by [TabEngineClient] when it
+     * learns a fresh document has loaded ([TabEngineProtocol.MSG_STATE_LOADED]),
+     * before that document's [TabEngineProtocol.MSG_ELEMENT_META]/
+     * [TabEngineProtocol.MSG_DISPLAY_LIST] are processed (the engine side
+     * sends the state message first for exactly this reason - see
+     * [TabEngineServiceBase.onTabStateChanged]'s `TabState.Loaded` branch).
+     * Without this, ids recycled for the new document (elementId
+     * numbering restarts at 1 per document - see [ElementIdRegistry])
+     * would resolve through [shadowFor] to whatever shadow element/tag/
+     * inputType a *previous* document's same id had, silently
+     * misattributing tap-routing metadata across navigations rather than
+     * just leaking memory.
+     */
+    fun reset() {
+        shadowElements.clear()
+        idsByShadowElement.clear()
+        images.clear()
+        metaByElementId.clear()
+    }
+
     fun onImageReceived(imageId: Int, pngBytes: ByteArray) {
         images[imageId] = BitmapFactory.decodeByteArray(pngBytes, 0, pngBytes.size)
     }

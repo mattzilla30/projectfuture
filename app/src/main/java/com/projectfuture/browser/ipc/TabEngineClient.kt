@@ -146,7 +146,15 @@ class TabEngineClient(private val context: Context, tabIndex: Int, val isPrivate
                     currentUrl = info.url?.let { runCatching { Url.parse(it) }.getOrNull() }
                 }
                 TabEngineProtocol.MSG_STATE_LOADING -> forwardState(msg) { url -> TabState.Loading(url) }
-                TabEngineProtocol.MSG_STATE_LOADED -> forwardState(msg) { url -> TabState.Loaded(url, msg.data.getString(TabEngineProtocol.KEY_TITLE)) }
+                TabEngineProtocol.MSG_STATE_LOADED -> {
+                    // The engine process sends this before that fresh document's MSG_ELEMENT_META/
+                    // MSG_DISPLAY_LIST (see TabEngineServiceBase.onTabStateChanged's TabState.Loaded
+                    // branch) specifically so this reset lands before any of that document's ids are
+                    // resolved through the converter - see UiDisplayListConverter.reset's doc for
+                    // what goes wrong (silently stale shadow elements/tag-type metadata) without it.
+                    converter.reset()
+                    forwardState(msg) { url -> TabState.Loaded(url, msg.data.getString(TabEngineProtocol.KEY_TITLE)) }
+                }
                 TabEngineProtocol.MSG_STATE_UPDATED -> forwardState(msg) { url -> TabState.Updated(url, msg.data.getString(TabEngineProtocol.KEY_TITLE)) }
                 TabEngineProtocol.MSG_STATE_ERROR -> forwardState(msg) { url -> TabState.Error(url, msg.data.getString(TabEngineProtocol.KEY_MESSAGE) ?: "") }
                 TabEngineProtocol.MSG_STATE_CERTIFICATE_ERROR -> forwardState(msg) { url -> TabState.CertificateError(url, msg.data.getString(TabEngineProtocol.KEY_MESSAGE) ?: "") }
