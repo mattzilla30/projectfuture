@@ -27,7 +27,12 @@ class CssParser(private val source: String, private val viewportWidth: Float = 3
 
     fun parseRules(): List<CssRule> {
         val rules = ArrayList<CssRule>()
-        var i = 0
+        // Defense in depth: Url.kt's fetch() already strips a leading UTF-8 BOM (U+FEFF) from
+        // any decoded response body, but CssParser is also fed text from other places (inline
+        // `<style>` bodies, tests, ...) that don't go through that path - and a stray BOM here
+        // would otherwise corrupt just the first selector of the stylesheet (see NeverMatchSelector's
+        // sibling fix and Url.kt's decodeBody doc for the full story).
+        var i = if (source.isNotEmpty() && source[0] == '﻿') 1 else 0
         val n = source.length
         while (i < n) {
             i = skipWhitespace(i)
@@ -150,7 +155,11 @@ class CssParser(private val source: String, private val viewportWidth: Float = 3
     }
 
     private fun parseToken(raw: String): Selector? {
-        val token = raw.substringBefore(':') // drop pseudo-classes/elements, unsupported
+        // A pseudo-class/pseudo-element this engine doesn't implement (`:hover`, `:visited`,
+        // `::before`, ...) makes the whole selector never match - see NeverMatchSelector's doc
+        // for why that's the safe choice, unlike silently treating the pseudo as always satisfied.
+        if (':' in raw) return NeverMatchSelector
+        val token = raw
         if (token.isEmpty()) return null
         val parts = ArrayList<Selector>()
         var idx = 0

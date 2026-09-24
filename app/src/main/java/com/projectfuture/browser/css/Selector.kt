@@ -11,6 +11,22 @@ object UniversalSelector : Selector(0) {
     override fun matches(node: ElementNode) = true
 }
 
+/**
+ * Stands in for a pseudo-class/pseudo-element this engine doesn't implement
+ * (`:hover`, `:visited`, `:nth-child()`, `::before`, ...). Per the CSS spec,
+ * a selector containing an unsupported pseudo is invalid and matches
+ * nothing - the safe default, matching this file's existing fail-safe
+ * philosophy for unrecognized `@media` features. The alternative (silently
+ * dropping just the pseudo and keeping the rest of the selector, as if the
+ * pseudo were always satisfied) is actively wrong: `a:visited{color:...}`
+ * would then apply to every plain, unvisited link too, and since it's
+ * textually last in a typical stylesheet it would silently win the cascade
+ * over the real `a{color:...}` rule.
+ */
+object NeverMatchSelector : Selector(0) {
+    override fun matches(node: ElementNode) = false
+}
+
 class TagSelector(val tag: String) : Selector(1) {
     override fun matches(node: ElementNode) = node.tag == tag
 }

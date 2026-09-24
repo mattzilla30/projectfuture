@@ -123,7 +123,7 @@ data class Url(
         if (cacheable) HttpCache.get(this)?.let { return it }
         val raw = fetchRaw(method, body, extraHeaders, redirectsLeft, allowCookies)
         val charset = charsetFromContentType(raw.headers["content-type"])
-        val response = HttpResponse(raw.statusCode, raw.headers, String(raw.body, charset), raw.url)
+        val response = HttpResponse(raw.statusCode, raw.headers, decodeBody(raw.body, charset), raw.url)
         if (cacheable) HttpCache.store(this, response)
         return response
     }
@@ -442,6 +442,21 @@ data class Url(
         } catch (_: Exception) {
             rawBody
         }
+    }
+
+    /**
+     * `String(bytes, charset)` (used below) does NOT strip a leading byte-order-mark the way
+     * a spec-compliant HTML/CSS/JS decoder should - a real, common quirk of hand-rolled parsers.
+     * Many real-world stylesheets/scripts are emitted with one (a stray UTF-8 BOM, `EF BB BF`,
+     * decodes as the single Unicode char U+FEFF) even though nothing in the Content-Type header
+     * says so. Left in, that stray U+FEFF sits in front of the first token of the decoded text -
+     * for CSS, in front of the first selector - silently corrupting just that one rule (e.g.
+     * turning `body{...}` into an unmatchable `<BOM>body{...}` selector) while the rest of the
+     * file parses fine, since nothing else depends on this exact byte sequence.
+     */
+    private fun decodeBody(bytes: ByteArray, charset: Charset): String {
+        val text = String(bytes, charset)
+        return if (text.isNotEmpty() && text[0] == '﻿') text.substring(1) else text
     }
 
     private fun charsetFromContentType(contentType: String?): Charset {
