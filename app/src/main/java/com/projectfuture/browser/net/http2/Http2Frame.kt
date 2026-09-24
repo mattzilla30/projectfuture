@@ -162,6 +162,16 @@ object Http2FrameIO {
         return out
     }
 
+    /** Strips DATA-frame padding (RFC 7540 6.1): a leading pad-length byte plus that many trailing pad bytes. */
+    fun extractDataPayload(payload: ByteArray, flags: Int): ByteArray {
+        if (flags and FrameFlag.PADDED == 0) return payload
+        if (payload.isEmpty()) throw java.io.IOException("PADDED DATA frame with no pad length")
+        val padLength = payload[0].toInt() and 0xff
+        val end = payload.size - padLength
+        if (end < 1) throw java.io.IOException("DATA frame padding exceeds frame length")
+        return payload.copyOfRange(1, end)
+    }
+
     /** Strips HEADERS-frame padding/priority prefix fields, returning just the HPACK block bytes. */
     fun extractHeaderBlockFragment(payload: ByteArray, flags: Int): ByteArray {
         var offset = 0

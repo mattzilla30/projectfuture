@@ -355,4 +355,118 @@ class Http2ConnectionTest {
         }
         assertEquals("client sent more DATA bytes than the connection-level window ever granted", 0, maxObservedOverGrant.get())
     }
+
+    private fun request(connection: Http2Connection, path: String) = connection.request(
+        listOf(HpackHeader(":method", "GET"), HpackHeader(":scheme", "http"), HpackHeader(":authority", "example.test"), HpackHeader(":path", path)),
+        null
+    )
+
+    /** Accepts one client, skips its preface, then hands every client frame to [onFrame] until the socket closes. */
+    private fun scriptedServer(onFrame: (Http2Frame, BufferedOutputStream) -> Unit): ServerSocket {
+        val server = ServerSocket(0)
+        Thread {
+            try {
+                val socket = server.accept()
+                val input = BufferedInputStream(socket.getInputStream())
+                val output = BufferedOutputStream(socket.getOutputStream())
+                val preface = ByteArray(HTTP2_CONNECTION_PREFACE.size)
+                var read = 0
+                while (read < preface.size) read += input.read(preface, read, preface.size - read)
+                while (!socket.isClosed) {
+                    val frame = try { Http2FrameIO.readFrame(input) } catch (_: Exception) { break }
+                    onFrame(frame, output)
+                }
+            } catch (_: Exception) {
+            }
+        }.apply { isDaemon = true }.start()
+        return server
+    }
+
+    private fun okHeaders(encoder: HpackEncoder) = encoder.encode(listOf(HpackHeader(":status", "200")))
+
+    @Test fun paddedDataFrameContributesOnlyItsDataToTheBody() {
+        val encoder = HpackEncoder()
+        val server = scriptedServer { frame, out ->
+            if (frame.type == FrameType.HEADERS) {
+                val data = "hello".toByteArray()
+                val padded = byteArrayOf(4) + data + ByteArray(4)
+                Http2FrameIO.writeFrame(out, Http2Frame(FrameType.HEADERS, FrameFlag.END_HEADERS, frame.streamId, okHeaders(encoder)))
+                Http2FrameIO.writeFrame(out, Http2Frame(FrameType.DATA, FrameFlag.PADDED or FrameFlag.END_STREAM, frame.streamId, padded))
+                out.flush()
+            }
+        }
+        try {
+            val response = request(Http2Connection(Socket("127.0.0.1", server.localPort)), "/padded")
+            assertEquals("hello", String(response.body, Charsets.UTF_8))
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test fun resetWithNoErrorAfterACompleteResponseDoesNotFailTheRequest() {
+        val encoder = HpackEncoder()
+        val server = scriptedServer { frame, out ->
+            if (frame.type == FrameType.HEADERS) {
+                // RFC 7540 8.1 lets a server follow a complete response with RST_STREAM(NO_ERROR).
+                Http2FrameIO.writeFrame(out, Http2Frame(FrameType.HEADERS, FrameFlag.END_HEADERS, frame.streamId, okHeaders(encoder)))
+                Http2FrameIO.writeFrame(out, Http2Frame(FrameType.DATA, FrameFlag.END_STREAM, frame.streamId, "done".toByteArray()))
+                Http2FrameIO.writeFrame(out, Http2Frame(FrameType.RST_STREAM, 0, frame.streamId, Http2FrameIO.encodeRstStream(ErrorCode.NO_ERROR)))
+                out.flush()
+            }
+        }
+        try {
+            val connection = Http2Connection(Socket("127.0.0.1", server.localPort))
+            repeat(20) { assertEquals("done", String(request(connection, "/r$it").body, Charsets.UTF_8)) }
+        } finally {
+            server.close()
+        }
+    }
+
+    @Test fun concurrentRequestsOpenStreamIdsInIncreasingOrder() {
+        val seen = java.util.Collections.synchronizedList(ArrayList<Int>())
+        val encoder = HpackEncoder()
+        val decoder = HpackDecoder()
+        val server = scriptedServer { frame, out ->
+            if (frame.type == FrameType.HEADERS) {
+                seen.add(frame.streamId)
+                decoder.decode(Http2FrameIO.extractHeaderBlockFragment(frame.payload, frame.flags))
+                Http2FrameIO.writeFrame(out, Http2Frame(FrameType.HEADERS, FrameFlag.END_HEADERS or FrameFlag.END_STREAM, frame.streamId, okHeaders(encoder)))
+                out.flush()
+            }
+        }
+        val threads = 32
+        val pool = Executors.newFixedThreadPool(threads)
+        try {
+            val connection = Http2Connection(Socket("127.0.0.1", server.localPort))
+            val start = CountDownLatch(1)
+            val futures = (0 until threads).map { i -> pool.submit<Int> { start.await(); request(connection, "/c$i").statusCode } }
+            start.countDown()
+            for (f in futures) assertEquals(200, f.get(10, TimeUnit.SECONDS))
+            // RFC 7540 5.1.1: a server that sees a lower id after a higher one treats it as closed and never answers it.
+            assertEquals(seen.sorted(), seen.toList())
+        } finally {
+            pool.shutdownNow()
+            server.close()
+        }
+    }
+
+    @Test fun gracefulGoAwayLetsStreamsAtOrBelowTheLastStreamIdFinish() {
+        val encoder = HpackEncoder()
+        val server = scriptedServer { frame, out ->
+            if (frame.type == FrameType.HEADERS) {
+                val goAway = Http2FrameIO.encodeRstStream(frame.streamId) + Http2FrameIO.encodeRstStream(ErrorCode.NO_ERROR)
+                Http2FrameIO.writeFrame(out, Http2Frame(FrameType.GOAWAY, 0, 0, goAway))
+                Http2FrameIO.writeFrame(out, Http2Frame(FrameType.HEADERS, FrameFlag.END_HEADERS, frame.streamId, okHeaders(encoder)))
+                Http2FrameIO.writeFrame(out, Http2Frame(FrameType.DATA, FrameFlag.END_STREAM, frame.streamId, "finished".toByteArray()))
+                out.flush()
+            }
+        }
+        try {
+            val connection = Http2Connection(Socket("127.0.0.1", server.localPort))
+            assertEquals("finished", String(request(connection, "/last").body, Charsets.UTF_8))
+            assertTrue("a connection that received GOAWAY must not be reused for new requests", !connection.isOpen)
+        } finally {
+            server.close()
+        }
+    }
 }
