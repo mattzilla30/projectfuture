@@ -196,21 +196,41 @@ class CssParser(private val source: String, private val viewportWidth: Float = 3
     }
 
     companion object {
-        private val MEDIA_FEATURE = Regex("\\(\\s*(min-width|max-width)\\s*:\\s*([0-9.]+)(px)?\\s*\\)")
+        private val MEDIA_FEATURE = Regex("^\\(\\s*(min-width|max-width)\\s*:\\s*([0-9.]+)(px)?\\s*\\)$")
+        private val NOT_PREFIX = Regex("^not\\s+", RegexOption.IGNORE_CASE)
+        private val ONLY_PREFIX = Regex("^only\\s+", RegexOption.IGNORE_CASE)
 
         /** OR across comma-separated queries. */
         private fun mediaQueryMatches(condition: String, viewportWidth: Float): Boolean =
             condition.split(',').map { it.trim() }.any { matchesSingleQuery(it, viewportWidth) }
 
-        /** AND across `and`-separated conditions within one query. */
-        private fun matchesSingleQuery(query: String, viewportWidth: Float): Boolean =
-            query.split(Regex("\\band\\b", RegexOption.IGNORE_CASE)).map { it.trim() }
+        /**
+         * AND across `and`-separated conditions within one query, after stripping the leading
+         * `only` (a legacy no-op for a parser that already understands the query it prefixes -
+         * dropping it here, rather than comparing it as a literal media type and rejecting it,
+         * matches real browsers) and `not` (which inverts the *whole* query - type and every
+         * `and`-joined feature together - not just whichever single feature happens to come
+         * right after it).
+         */
+        private fun matchesSingleQuery(query: String, viewportWidth: Float): Boolean {
+            var q = query.trim()
+            var negate = false
+            NOT_PREFIX.find(q)?.let { negate = true; q = q.substring(it.value.length).trim() }
+            ONLY_PREFIX.find(q)?.let { q = q.substring(it.value.length).trim() }
+            val result = q.split(Regex("\\band\\b", RegexOption.IGNORE_CASE)).map { it.trim() }
                 .all { matchesFeature(it, viewportWidth) }
+            return if (negate) !result else result
+        }
 
         private fun matchesFeature(part: String, viewportWidth: Float): Boolean {
             val trimmed = part.trim()
             if (trimmed.isEmpty() || trimmed.equals("screen", true) || trimmed.equals("all", true)) return true
             if (trimmed.equals("print", true) || trimmed.equals("speech", true)) return false
+            // Anchored (^...$) full-string match, not `find`: a `find` here would happily locate
+            // a `(min-width: ...)` feature buried inside a string like "not (min-width: 600px)"
+            // and evaluate just that fragment, silently ignoring the leading "not " that's
+            // supposed to invert it (that inversion is handled by the caller, one level up, once
+            // the whole condition text - not just a feature substring - has been matched).
             val match = MEDIA_FEATURE.find(trimmed) ?: return false // unrecognized feature: fail-safe exclude
             val value = match.groupValues[2].toFloatOrNull() ?: return false
             return when (match.groupValues[1]) {
