@@ -1409,14 +1409,17 @@ class Tab(
      * works - if these fired synchronously during the call itself, the
      * handler wouldn't be attached yet. See IndexedDbStore's doc for the
      * bounded storage model underneath (session-only, per-tab, no
-     * indexes/cursors/key ranges).
+     * indexes/cursors/key ranges). Transaction `oncomplete`/`onabort` firing
+     * and the `db.close()` guard are driven by the pure, separately-tested
+     * [IndexedDbTransactionTracker]/[IndexedDbConnectionGuard].
      */
     private fun installIndexedDb(interpreter: Interpreter, pageRoot: ElementNode) {
-        fun <T : JsValue> deferRequest(interp: Interpreter, request: JsObject, resultProvider: () -> T) {
+        fun <T : JsValue> deferRequest(interp: Interpreter, request: JsObject, onSettled: ((Boolean) -> Unit)? = null, resultProvider: () -> T) {
             postMain {
                 if (currentDoc !== pageRoot) return@postMain
                 val result = try { resultProvider() } catch (e: Exception) {
                     (request.get("onerror") as? JsFunction)?.call(interp, request, listOf(makeError(e.message ?: "IndexedDB error")))
+                    onSettled?.invoke(false)
                     return@postMain
                 }
                 val event = JsObject()
@@ -1424,55 +1427,86 @@ class Tab(
                 target.set("result", result)
                 event.set("target", target)
                 (request.get("onsuccess") as? JsFunction)?.call(interp, request, listOf(event))
+                onSettled?.invoke(true)
             }
         }
 
-        fun makeObjectStoreObject(dbName: String, storeName: String, interp: Interpreter): JsObject {
+        // Fires a transaction's `oncomplete`/`onabort` handler - see IndexedDbTransactionTracker's
+        // doc for why this needs to exist at all (previously nothing ever called it).
+        fun fireTransactionOutcome(interp: Interpreter, tx: JsObject, outcome: TransactionOutcome) {
+            val handlerName = if (outcome == TransactionOutcome.COMPLETE) "oncomplete" else "onabort"
+            (tx.get(handlerName) as? JsFunction)?.call(interp, tx, listOf(JsObject()))
+        }
+
+        fun makeObjectStoreObject(
+            dbName: String,
+            storeName: String,
+            interp: Interpreter,
+            tracker: IndexedDbTransactionTracker,
+            onOutcome: (TransactionOutcome) -> Unit
+        ): JsObject {
+            fun <T : JsValue> trackedRequest(resultProvider: () -> T): JsObject {
+                val request = JsObject()
+                tracker.requestStarted()
+                deferRequest(interp, request, onSettled = { success ->
+                    tracker.requestFinished(success)?.let(onOutcome)
+                }, resultProvider = resultProvider)
+                return request
+            }
             val store = JsObject()
             val putFn = NativeFunction("put", 2) { _, _, args ->
                 val value = args.getOrElse(0) { JsUndefined }
                 val key = toJsString(args.getOrElse(1) { JsUndefined })
-                val request = JsObject()
-                deferRequest(interp, request) { indexedDbStore.put(dbName, storeName, key, value); value }
-                request
+                // Spec: `put`/`add`'s request.result is the record's *key*, not the stored value.
+                trackedRequest { indexedDbStore.put(dbName, storeName, key, value); JsString(key) }
             }
             store.set("put", putFn)
             store.set("add", putFn) // bounded: behaves like put, no "key already exists" error
             store.set("get", NativeFunction("get", 1) { _, _, args ->
                 val key = toJsString(args.getOrElse(0) { JsUndefined })
-                val request = JsObject()
-                deferRequest(interp, request) { indexedDbStore.get(dbName, storeName, key) ?: JsUndefined }
-                request
+                trackedRequest { indexedDbStore.get(dbName, storeName, key) ?: JsUndefined }
             })
             store.set("delete", NativeFunction("delete", 1) { _, _, args ->
                 val key = toJsString(args.getOrElse(0) { JsUndefined })
-                val request = JsObject()
-                deferRequest(interp, request) { indexedDbStore.delete(dbName, storeName, key); JsUndefined }
-                request
+                trackedRequest { indexedDbStore.delete(dbName, storeName, key); JsUndefined }
             })
             store.set("getAll", NativeFunction("getAll", 0) { _, _, _ ->
-                val request = JsObject()
-                deferRequest(interp, request) { JsArray(indexedDbStore.getAll(dbName, storeName).toMutableList()) }
-                request
+                trackedRequest { JsArray(indexedDbStore.getAll(dbName, storeName).toMutableList()) }
             })
             store.set("clear", NativeFunction("clear", 0) { _, _, _ ->
-                val request = JsObject()
-                deferRequest(interp, request) { indexedDbStore.clear(dbName, storeName); JsUndefined }
-                request
+                trackedRequest { indexedDbStore.clear(dbName, storeName); JsUndefined }
             })
             return store
         }
 
         fun makeDbObject(dbName: String, interp: Interpreter): JsObject {
             val db = JsObject()
+            val connection = IndexedDbConnectionGuard()
             db.set("createObjectStore", NativeFunction("createObjectStore", 1) { _, _, args ->
                 indexedDbStore.createObjectStore(dbName, toJsString(args.getOrElse(0) { JsUndefined }))
                 JsUndefined
             })
-            db.set("transaction", NativeFunction("transaction", 2) { _, _, args ->
+            db.set("close", NativeFunction("close", 0) { _, _, _ ->
+                connection.close()
+                JsUndefined
+            })
+            db.set("transaction", NativeFunction("transaction", 2) { txInterp, _, args ->
+                if (!connection.isOpen) {
+                    throw jsError("Failed to execute 'transaction' on 'IDBDatabase': The database connection is closed.")
+                }
                 val storeName = toJsString(args.getOrElse(0) { JsUndefined })
                 val tx = JsObject()
-                tx.set("objectStore", NativeFunction("objectStore", 1) { _, _, _ -> makeObjectStoreObject(dbName, storeName, interp) })
+                val tracker = IndexedDbTransactionTracker()
+                tx.set("objectStore", NativeFunction("objectStore", 1) { _, _, _ ->
+                    makeObjectStoreObject(dbName, storeName, txInterp, tracker) { outcome -> fireTransactionOutcome(txInterp, tx, outcome) }
+                })
+                // Fires oncomplete for a transaction whose requests (if any) have all already
+                // settled by the time the current synchronous script finishes - including the
+                // case where the script never issued a request through this tx at all.
+                postMain {
+                    if (currentDoc !== pageRoot) return@postMain
+                    tracker.finalizeIfIdle()?.let { outcome -> fireTransactionOutcome(txInterp, tx, outcome) }
+                }
                 tx
             })
             return db
