@@ -14,6 +14,9 @@ import javax.net.ssl.SSLSocketFactory
  * No java.net.URLConnection / OkHttp / WebView networking is used here -
  * everything from the TCP handshake up is written for this project.
  *
+ * GET is the default, but [fetch] also sends POST (with a body and
+ * `Content-Type`) for form submission - see Tab.submitForm.
+ *
  * Cookies are sent/stored via [sharedCookieJar] (see CookieJar.kt for what
  * it does and doesn't cover). `Accept-Encoding: gzip` is sent, and a gzip
  * `Content-Encoding` response is decompressed via the standard
@@ -65,24 +68,26 @@ data class Url(
     }
 
     /**
-     * Performs a blocking GET over a raw TCP (or TLS) socket, hand-rolling the
-     * HTTP/1.1 request/response format. Must be called off the main thread.
-     * Follows redirects itself, since there is no library to do it for us.
+     * Performs a blocking HTTP request over a raw TCP (or TLS) socket,
+     * hand-rolling the HTTP/1.1 request/response format. Must be called off
+     * the main thread. Follows redirects itself, since there is no library
+     * to do it for us. [method]/[body]/[contentType] exist for form
+     * submission (`method="post"`) - see Tab.submitForm.
      */
-    fun fetch(redirectsLeft: Int = 10): HttpResponse {
-        val raw = fetchRaw(redirectsLeft)
+    fun fetch(method: String = "GET", body: ByteArray? = null, contentType: String? = null, redirectsLeft: Int = 10): HttpResponse {
+        val raw = fetchRaw(method, body, contentType, redirectsLeft)
         val charset = charsetFromContentType(raw.headers["content-type"])
         return HttpResponse(raw.statusCode, raw.headers, String(raw.body, charset), raw.url)
     }
 
     /** Same request as [fetch], but returns the raw body bytes undecoded - for binary resources like images. */
     fun fetchBytes(redirectsLeft: Int = 10): HttpBytesResponse {
-        val raw = fetchRaw(redirectsLeft)
+        val raw = fetchRaw("GET", null, null, redirectsLeft)
         return HttpBytesResponse(raw.statusCode, raw.headers, raw.body, raw.url)
     }
 
     /** Shared socket/request/response-header/body-bytes plumbing for [fetch] and [fetchBytes]. Follows redirects itself. */
-    private fun fetchRaw(redirectsLeft: Int): RawHttpResponse {
+    private fun fetchRaw(method: String, body: ByteArray?, contentType: String?, redirectsLeft: Int): RawHttpResponse {
         if (scheme != "http" && scheme != "https") {
             throw IOException("Unsupported scheme: $scheme")
         }
@@ -102,16 +107,21 @@ data class Url(
         try {
             val cookieHeader = sharedCookieJar?.cookieHeaderFor(this)
             val request = buildString {
-                append("GET $path HTTP/1.1\r\n")
+                append("$method $path HTTP/1.1\r\n")
                 append("Host: $host\r\n")
                 append("Connection: close\r\n")
                 append("User-Agent: ProjectFutureBrowser/0.1 (Android; from-scratch)\r\n")
                 append("Accept: text/html,text/css,*/*\r\n")
                 append("Accept-Encoding: gzip\r\n")
                 if (cookieHeader != null) append("Cookie: $cookieHeader\r\n")
+                if (body != null) {
+                    append("Content-Type: ${contentType ?: "application/x-www-form-urlencoded"}\r\n")
+                    append("Content-Length: ${body.size}\r\n")
+                }
                 append("\r\n")
             }
             socket.getOutputStream().write(request.toByteArray(Charsets.US_ASCII))
+            if (body != null) socket.getOutputStream().write(body)
             socket.getOutputStream().flush()
 
             val input = BufferedInputStream(socket.getInputStream())
@@ -136,12 +146,21 @@ data class Url(
             }
             if (setCookieHeaders.isNotEmpty()) sharedCookieJar?.store(this, setCookieHeaders)
 
-            // Redirects: follow them ourselves rather than the body.
+            // Redirects: follow them ourselves rather than the body. A 303, or a
+            // legacy 301/302 for a non-GET/HEAD request, is switched to a bodyless
+            // GET on the new location (matching real browser behavior); 307/308
+            // resend the same method and body.
             if (statusCode in intArrayOf(301, 302, 303, 307, 308) && redirectsLeft > 0) {
                 val location = headers["location"]
                 if (location != null) {
                     val next = resolve(location)
-                    return next.fetchRaw(redirectsLeft - 1)
+                    val downgradeToGet = statusCode == 303 ||
+                        (statusCode in intArrayOf(301, 302) && method != "GET" && method != "HEAD")
+                    return if (downgradeToGet) {
+                        next.fetchRaw("GET", null, null, redirectsLeft - 1)
+                    } else {
+                        next.fetchRaw(method, body, contentType, redirectsLeft - 1)
+                    }
                 }
             }
 

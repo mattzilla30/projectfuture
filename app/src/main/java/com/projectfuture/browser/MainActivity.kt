@@ -9,6 +9,7 @@ import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.BaseAdapter
+import android.widget.EditText
 import android.widget.ImageButton
 import android.widget.ListView
 import android.widget.PopupMenu
@@ -23,6 +24,8 @@ import com.projectfuture.browser.browser.HistoryStore
 import com.projectfuture.browser.browser.Tab
 import com.projectfuture.browser.browser.TabManager
 import com.projectfuture.browser.browser.TabState
+import com.projectfuture.browser.html.ElementNode
+import com.projectfuture.browser.html.TextNode
 import com.projectfuture.browser.net.CookieJar
 import com.projectfuture.browser.net.sharedCookieJar
 import com.projectfuture.browser.databinding.ActivityMainBinding
@@ -55,7 +58,7 @@ class MainActivity : AppCompatActivity() {
             if (tabManager.activeTab?.onViewportSizeChanged(width, height) == true) refreshView()
         }
         binding.browserView.onLinkTapped = { href -> tabManager.activeTab?.followLink(href) }
-        binding.browserView.onElementTapped = { element -> tabManager.activeTab?.dispatchClick(element) }
+        binding.browserView.onElementTapped = { element -> handleElementTap(element) }
 
         binding.buttonBack.setOnClickListener { tabManager.activeTab?.goBack() }
         binding.buttonForward.setOnClickListener { tabManager.activeTab?.goForward() }
@@ -300,6 +303,60 @@ class MainActivity : AppCompatActivity() {
     private fun refreshView() {
         val tab = tabManager.activeTab ?: return
         binding.browserView.setContent(tab.displayList, tab.contentHeight)
+    }
+
+    /**
+     * Routes a tap that BrowserView hit-tested to a source element (see
+     * LayoutBox's form-control doc comment). A generic element still just
+     * bubbles through DOM click dispatch as before; a form control also
+     * gets its type-specific behavior - toggling a checkbox/radio in place,
+     * prompting for a new value via a dialog, or submitting the form.
+     */
+    private fun handleElementTap(element: ElementNode) {
+        val tab = tabManager.activeTab ?: return
+        when (element.tag) {
+            "input" -> when ((element.attr("type") ?: "text").lowercase()) {
+                "checkbox" -> tab.toggleCheckbox(element)
+                "radio" -> tab.selectRadio(element)
+                "submit" -> { tab.dispatchClick(element); tab.submitForm(element) }
+                "button", "reset" -> tab.dispatchClick(element)
+                "hidden" -> {}
+                else -> promptForFieldValue(element, tab)
+            }
+            "textarea" -> promptForFieldValue(element, tab)
+            "select" -> promptForSelectValue(element, tab)
+            "button" -> {
+                tab.dispatchClick(element)
+                if ((element.attr("type") ?: "submit").lowercase() == "submit") tab.submitForm(element)
+            }
+            else -> tab.dispatchClick(element)
+        }
+    }
+
+    private fun promptForFieldValue(element: ElementNode, tab: Tab) {
+        val input = EditText(this).apply {
+            setText(tab.currentFieldValue(element))
+            setSelection(text.length)
+            if (element.tag == "input" && (element.attr("type") ?: "").lowercase() == "password") {
+                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            }
+        }
+        AlertDialog.Builder(this)
+            .setView(input)
+            .setPositiveButton(android.R.string.ok) { _, _ -> tab.setFieldValue(element, input.text.toString()) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun promptForSelectValue(element: ElementNode, tab: Tab) {
+        val options = element.children.filterIsInstance<ElementNode>().filter { it.tag == "option" }
+        if (options.isEmpty()) return
+        val labels = options.map { opt ->
+            opt.children.filterIsInstance<TextNode>().joinToString("") { it.text }.trim().ifEmpty { opt.attr("value") ?: "" }
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setItems(labels) { _, which -> tab.setSelectValue(element, options[which]) }
+            .show()
     }
 
     private fun updateNavButtons() {
