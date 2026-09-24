@@ -141,23 +141,77 @@ cursor/in-place typing (form field edits go through a dialog rather than
 on-canvas text editing). These are natural next milestones - see the
 project roadmap for the fuller list.
 
-**HTTP/3 (QUIC) is deliberately not implemented.** Unlike HTTP/2 (a framing
-layer over the TLS/TCP stack this project already has), HTTP/3 replaces the
-transport itself: it needs a from-scratch QUIC implementation over raw UDP
-`DatagramSocket`s, including its own packet-number-based loss detection and
-retransmission, a TLS 1.3 handshake carried inside QUIC frames rather than a
-normal `SSLSocket` handshake (the JDK/Android TLS stack has no supported way
-to drive a handshake over an arbitrary transport instead of a `Socket`, so
-this alone means vendoring or writing a TLS 1.3 state machine), stream
-multiplexing with its own flow control independent of TCP's, and a real
-congestion controller (at minimum a NewReno/CUBIC-style implementation) to
-be a good network citizen. That's multiple independent, substantial
-subsystems - realistically a multi-week project on its own even before
-QPACK (HTTP/3's HPACK equivalent, itself different from HPACK because it
-has to tolerate out-of-order delivery) or connection migration. Rather than
-ship a partial QUIC stack that silently falls over on real servers, or a
-"HTTP/3 support" that's actually just HTTP/2 or HTTP/1.1 underneath, this
-project sticks to HTTP/2 with an HTTP/1.1 fallback for now.
+## HTTP/3 (QUIC): attempted further, here's exactly how far it got
+
+HTTP and HTTPS traffic in this project uses HTTP/2 (see above) where a
+server negotiates it via ALPN, HTTP/1.1 otherwise. HTTP/3 was investigated
+properly rather than dismissed outright, and a real chunk of it now lives
+under `net/quic/`:
+
+- **QUIC transport (real)**: raw UDP via `DatagramSocket`, QUIC long-header
+  packet framing for Initial/Handshake packets (`QuicPacket.kt`), the
+  variable-length integer encoding QUIC uses throughout (`QuicVarInt.kt`),
+  and the frame types a basic request/response needs - PADDING, PING, ACK,
+  CRYPTO, STREAM (`QuicFrame.kt`). Loss detection is a simple fixed-timeout
+  retransmit (`Http3Client.RETRANSMIT_TIMEOUT_MS`/`MAX_RETRANSMITS`), not
+  RFC 9002's real congestion controller - documented as a deliberate
+  simplification in `Http3Client`'s class doc, acceptable because (see
+  below) this client never gets far enough into a connection to need real
+  congestion control anyway.
+- **RFC 9001 Initial-packet crypto (real)**: QUIC's one packet-number space
+  whose keys don't depend on a completed TLS handshake - derived via HKDF
+  (RFC 5869/RFC 8446 `HKDF-Expand-Label`) from the client's destination
+  connection ID and a version-fixed salt. AES-128-GCM packet payload
+  protection and AES-128-ECB-based header protection are both implemented
+  against `javax.crypto` (`QuicInitialSecrets.kt`) and unit-tested via
+  encrypt/protect-then-decrypt/unprotect round trips.
+- **QPACK (real, deliberately scoped down)**: the full 99-entry RFC 9204
+  Appendix A static table, plus literal field-line encoding with no
+  dynamic table at all (`Required Insert Count`/`Delta Base` always zero -
+  RFC 9204 explicitly allows an encoder to never use the dynamic table).
+  This is spec-legal QPACK; it just forgoes QPACK's main compression win
+  for headers that repeat across requests, which this client's one-shot
+  use never benefits from anyway. Huffman string coding is optional per
+  the spec and isn't implemented (`Qpack.kt`).
+- **TLS 1.3 over QUIC: not real, and deliberately not faked.** This is the
+  genuinely hard part, and it does not have a working implementation:
+  - `javax.net.ssl.SSLEngine`/`SSLSocket` always own the TLS *record*
+    layer - `wrap()`/`unwrap()` produce and consume TLS records, not the
+    bare handshake-message bytes QUIC's CRYPTO frames need, and there is
+    no supported Android/OpenJDK API to extract the derived handshake
+    traffic secrets QUIC needs at each encryption level (RFC 9001 section
+    5). Real QUIC stacks solve this with a specially-built TLS library
+    (BoringSSL's `SSL_set_quic_method` and friends) - there's no
+    equivalent hook in `javax.net.ssl`.
+  - No pure-Kotlin/Java TLS 1.3 handshake was vendored either. Unlike the
+    Brotli decoder (small, self-contained, no security surface), a TLS 1.3
+    client handshake is security-critical - transcript hashing, the key
+    schedule, and certificate validation all need to be exactly right, and
+    getting them subtly wrong produces a connection that *looks*
+    encrypted but isn't. That's a level of scrutiny (real test-vector
+    coverage, security review) this change did not have, so nothing was
+    shipped there rather than shipping something unreviewed and calling it
+    secure.
+  - See `Http3TlsHandshake`'s class doc for the full reasoning.
+  `Http3Client.request()` builds a real, padded, header-protected client
+  Initial packet up to the point it would need an actual TLS 1.3
+  ClientHello, then throws `UnsupportedOperationException` rather than
+  sending meaningless CRYPTO-frame bytes to a real server and calling that
+  "HTTP/3".
+- **Not wired into `Url.kt`**: since the handshake can never complete,
+  adding "try QUIC on port 443, fall back" logic to the real request path
+  would just mean every HTTPS request pays for a UDP attempt guaranteed to
+  fail before falling back to HTTP/2 or HTTP/1.1 - not real negotiation,
+  just overhead. `net/quic/` is therefore a standalone, tested package,
+  reachable from `Http3Client` directly, not from `Url.fetch()`. Real
+  `Alt-Svc`/HTTPS-record discovery was not attempted for the same reason:
+  there is nothing on the other side of a successful discovery yet.
+
+Unit tests in `app/src/test/java/com/projectfuture/browser/net/quic/`
+cover QUIC varint/frame/packet encode-decode round trips, the RFC 9001
+Initial-secret derivation and AEAD/header-protection round trip, and QPACK
+static-table encode/decode - i.e. everything up to the TLS boundary
+described above.
 
 ### WebRTC data channels (`rtc/`)
 

@@ -28,7 +28,6 @@ import javax.net.ssl.X509TrustManager
  * it does and doesn't cover). `Accept-Encoding: gzip, br` is sent; a gzip
  * `Content-Encoding` response is decompressed via the standard
  * `java.util.zip.GZIPInputStream` - a platform compression utility, the
- * same tier as `Inflater` (used for WOFF font decompression) elsewhere in
  * this project, not "browser engine" logic - and a `br` (Brotli) response
  * is decompressed via the vendored decoder in `org.brotli.dec` (see
  * `BrotliDecoder.kt` for why that's vendored rather than hand-written here).
@@ -41,6 +40,17 @@ import javax.net.ssl.X509TrustManager
  * A server that doesn't offer `h2` (including every plain `http` URL, and
  * every device below API 29 where this project doesn't attempt ALPN at
  * all - see `Alpn`'s doc for why) falls back to HTTP/1.1 exactly as before.
+ *
+ * HTTP/3 is not wired in here. The `net/quic/` package (a from-scratch
+ * QUIC transport, RFC 9001 Initial-packet crypto, and a minimal QPACK
+ * codec) exists and is unit-tested, but has no working TLS 1.3-over-QUIC
+ * handshake (see `Http3TlsHandshake`'s class doc for exactly why), so it
+ * can never complete a real request. Adding "try QUIC first" logic to this
+ * class would only mean every HTTPS request pays for a UDP attempt that is
+ * guaranteed to fail before falling back to HTTP/2 or HTTP/1.1 here - dead-
+ * weight negotiation theater, not real HTTP/3 support - so it's left as a
+ * standalone, honestly-labeled package instead. See README.md's HTTP/3
+ * section.
  */
 data class Url(
     val scheme: String,
