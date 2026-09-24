@@ -10,9 +10,15 @@ import org.junit.Test
  * A genuine end-to-end test of two [PeerConnectionCore] instances talking
  * over real loopback UDP sockets - offer/answer SDP exchange (as strings,
  * exactly as two pages would hand them to each other over a signaling
- * channel), then real bidirectional data channel messaging. See
- * PeerConnectionCore's class doc for exactly what this proves versus what
- * it deliberately doesn't (no ICE/STUN/TURN, no DTLS, not real SCTP).
+ * channel), then real bidirectional data channel messaging. This now
+ * exercises the full real stack underneath: RFC 8445 ICE connectivity
+ * checks nominate the candidate pair, a genuine DTLS 1.2 handshake
+ * authenticated by the SDP-exchanged fingerprint secures it, and an RFC
+ * 4960 SCTP association (real INIT/COOKIE handshake, real DATA/SACK
+ * chunks, one real stream per data channel) carries the messages - see
+ * PeerConnectionCore's class doc for exactly what's real versus still
+ * simplified at each of those layers (no trickle ICE/TURN, no SCTP
+ * congestion control/partial reliability).
  */
 class PeerConnectionCoreTest {
 

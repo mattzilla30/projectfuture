@@ -63,6 +63,47 @@ cursor/in-place typing (form field edits go through a dialog rather than
 on-canvas text editing). These are natural next milestones - see the
 project roadmap for the fuller list.
 
+### WebRTC data channels (`rtc/`)
+
+`RTCPeerConnection`/`RTCDataChannel` are implemented from scratch too -
+real protocol stacks, not stubs, for everything except media:
+
+- **SDP** (`Sdp.kt`) - real RFC 4566/8866-shaped offer/answer generation
+  and parsing for the one `m=application ... webrtc-datachannel` section
+  this engine supports.
+- **ICE** (`IceAgent.kt`, `Stun.kt`) - a real RFC 5389 STUN client/message
+  codec (binding requests/responses, `XOR-MAPPED-ADDRESS`, HMAC-SHA1
+  `MESSAGE-INTEGRITY`, CRC-32 `FINGERPRINT`) doing genuine server-reflexive
+  candidate gathering and real RFC 8445 peer-to-peer connectivity checks
+  with RFC 8445 priority/pairing math, nominating a working candidate
+  pair. Trickle ICE isn't supported (full candidate sets must be known up
+  front) and nomination uses the spec-legal "aggressive" algorithm rather
+  than "regular". **No TURN/relay candidates**: this environment has no
+  TURN server reachable to verify a client against, so none was written -
+  see `IceAgent`'s class doc.
+- **DTLS** (`DtlsTransport.kt`, `SelfSignedCert.kt`) - a real DTLS 1.2
+  handshake via the platform's `SSLContext.getInstance("DTLS")`/
+  `SSLEngine`, authenticated the way WebRTC actually does it: each peer's
+  self-signed certificate (a real hand-built X.509 DER cert, no external
+  crypto library) is hashed and compared against the SDP `a=fingerprint`
+  line, not validated against a CA. Data channel bytes flow encrypted
+  over this. Android only supports `SSLEngine` DTLS from API 29 (this
+  project's `minSdk` is 24); below that (and wherever else the platform
+  lacks a `"DTLS"` provider) it falls back to a small plaintext ARQ
+  channel instead - real and reliable, but unencrypted. See
+  `PeerConnectionCore`'s class doc for exactly when that fallback runs.
+- **SCTP** (`SctpChunk.kt`, `SctpAssociation.kt`) - a real (if
+  congestion-control-free) RFC 4960 association: INIT/INIT-ACK-with-
+  state-cookie/COOKIE-ECHO/COOKIE-ACK setup, CRC-32C-checksummed packets,
+  TSN-numbered DATA chunks acknowledged by cumulative-TSN SACKs, and a
+  genuine SCTP stream ID per `RTCDataChannel` rather than a hand-rolled
+  label-multiplexing hack. Simplified deliberately: one DATA chunk in
+  flight at a time (no congestion window/pipelining), no partial
+  reliability or unordered delivery modes.
+- **Media is not implemented**: no `getUserMedia`, no audio/video `m=`
+  sections, no codecs, no RTP/SRTP. A from-scratch codec/RTP stack is its
+  own multi-month project and was not attempted.
+
 ## Building
 
 Requires JDK 17 and the Android SDK (compileSdk/targetSdk 36, minSdk 24).
