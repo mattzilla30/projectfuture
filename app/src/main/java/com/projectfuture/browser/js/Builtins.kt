@@ -87,15 +87,35 @@ private fun makeMath(): JsObject {
 }
 
 /** Public so Tab.kt's Web Worker bridge can reuse it for a structured-clone approximation - see installWorker's doc. */
-fun jsonStringify(v: JsValue): String = when (v) {
+fun jsonStringify(v: JsValue): String = jsonStringify(v, java.util.Collections.newSetFromMap(java.util.IdentityHashMap()))
+
+/** [seen] tracks objects/arrays currently being stringified on the path from the root, by identity (not
+ * structural equality - two distinct objects that happen to look alike are not circular), so a self-
+ * referencing structure throws the same `TypeError`-shaped error real JS's `JSON.stringify` does instead
+ * of recursing until the JVM stack overflows. */
+private fun jsonStringify(v: JsValue, seen: MutableSet<JsObject>): String = when (v) {
     JsUndefined -> "null" // JSON has no undefined; simplified to null everywhere rather than omitting keys
     JsNull -> "null"
     is JsBoolean -> v.value.toString()
     is JsNumber -> formatNumber(v.value)
     is JsString -> "\"" + v.value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""
-    is JsArray -> "[" + v.elements.joinToString(",") { jsonStringify(it) } + "]"
     is JsFunction -> "null"
-    is JsObject -> "{" + v.ownKeys().joinToString(",") { k -> "\"$k\":" + jsonStringify(v.get(k)) } + "}"
+    is JsArray -> {
+        if (!seen.add(v)) throw jsError("Converting circular structure to JSON")
+        try {
+            "[" + v.elements.joinToString(",") { jsonStringify(it, seen) } + "]"
+        } finally {
+            seen.remove(v)
+        }
+    }
+    is JsObject -> {
+        if (!seen.add(v)) throw jsError("Converting circular structure to JSON")
+        try {
+            "{" + v.ownKeys().joinToString(",") { k -> "\"$k\":" + jsonStringify(v.get(k), seen) } + "}"
+        } finally {
+            seen.remove(v)
+        }
+    }
 }
 
 private fun makeJson(): JsObject {

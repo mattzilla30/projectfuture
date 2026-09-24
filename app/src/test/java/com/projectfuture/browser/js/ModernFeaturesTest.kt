@@ -402,4 +402,19 @@ class ModernFeaturesTest {
             """.trimIndent()
         )
     }
+
+    @Test fun superMethodCallWorksForStaticMethods() {
+        assertNum(
+            15.0,
+            """
+            class Base {
+                static describe() { return 10; }
+            }
+            class Derived extends Base {
+                static describe() { return super.describe() + 5; }
+            }
+            var result = Derived.describe();
+            """.trimIndent()
+        )
+    }
 }

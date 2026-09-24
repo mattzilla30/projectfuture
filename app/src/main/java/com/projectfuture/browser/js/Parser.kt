@@ -359,7 +359,9 @@ class Parser(private val tokens: List<Token>) {
 
     private fun parseExpression(): Expr = parseAssignment()
 
-    private val assignOps = setOf("=", "+=", "-=", "*=", "/=", "%=")
+    // Matches Lexer.kt's `multiCharPuncts`: every compound-assignment punctuator the lexer tokenizes
+    // as a single token must be recognized here too, or valid JS using it fails to parse.
+    private val assignOps = setOf("=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "**=", ">>>=")
 
     private fun parseAssignment(): Expr {
         if (checkIdentText("yield")) return parseYield()
