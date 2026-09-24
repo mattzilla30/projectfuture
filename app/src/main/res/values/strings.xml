@@ -60,6 +60,5 @@
     <string name="passwords_dialog_title">Saved passwords</string>
     <string name="passwords_empty">No saved passwords yet</string>
     <string name="password_deleted">Password removed</string>
-    <string name="menu_sandboxed_tab">Sandboxed tab (experimental)</string>
-    <string name="sandboxed_tab_hint">This page\'s JS/DOM/layout run in a separate process</string>
+    <string name="menu_sandboxed_tabs">Sandboxed tabs</string>
 </resources>

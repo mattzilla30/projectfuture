@@ -32,13 +32,22 @@ class UiDisplayListConverter {
     private val shadowElements = HashMap<Int, ElementNode>()
     private val idsByShadowElement = IdentityHashMap<ElementNode, Int>()
     private val images = HashMap<Int, Bitmap>()
+    /** tag/inputType for each elementId, learned from MSG_ELEMENT_META - see that message's doc. Looked up lazily when a shadow is first built for an id, so ordering only matters relative to that (guaranteed: the engine always sends an id's meta before/alongside the first display list or reply referencing it). */
+    private val metaByElementId = HashMap<Int, Pair<String, String?>>()
 
     fun onImageReceived(imageId: Int, pngBytes: ByteArray) {
         images[imageId] = BitmapFactory.decodeByteArray(pngBytes, 0, pngBytes.size)
     }
 
+    fun onElementMetaReceived(entries: List<WireElementMeta>) {
+        for (entry in entries) metaByElementId[entry.elementId] = entry.tag to entry.inputType
+    }
+
     /** The elementId a shadow ElementNode (from a BrowserView callback) stands in for, or null if it's not one of ours. */
     fun elementIdFor(shadow: ElementNode): Int? = idsByShadowElement[shadow]
+
+    /** Builds (or returns the existing) shadow ElementNode for an id learned outside a display-list conversion - e.g. a `<select>`'s options ([TabEngineProtocol.MSG_SELECT_OPTIONS]) or a detected login form's fields ([TabEngineProtocol.MSG_LOGIN_FORM_RESULT]). Public (unlike the private [shadowFor] below) since those callers aren't converting a WireDisplayCommand. */
+    fun shadowElementFor(elementId: Int): ElementNode = shadowFor(elementId)!!
 
     fun convert(wireCommands: List<WireDisplayCommand>): List<DisplayCommand> =
         wireCommands.mapNotNull { cmd ->
@@ -61,7 +70,11 @@ class UiDisplayListConverter {
     private fun shadowFor(elementId: Int): ElementNode? {
         if (elementId == 0) return null
         return shadowElements.getOrPut(elementId) {
-            ElementNode(tag = "").also { idsByShadowElement[it] = elementId }
+            val (tag, inputType) = metaByElementId[elementId] ?: ("" to null)
+            ElementNode(tag = tag).also {
+                if (inputType != null) it.attributes["type"] = inputType
+                idsByShadowElement[it] = elementId
+            }
         }
     }
 
