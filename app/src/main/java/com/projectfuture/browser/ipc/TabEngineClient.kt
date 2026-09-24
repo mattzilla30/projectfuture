@@ -13,6 +13,7 @@ import android.os.Messenger
 import android.os.RemoteException
 import com.projectfuture.browser.browser.Settings
 import com.projectfuture.browser.browser.TabState
+import com.projectfuture.browser.debug.BrowserLog
 import com.projectfuture.browser.html.ElementNode
 import com.projectfuture.browser.layout.DisplayCommand
 import com.projectfuture.browser.net.Url
@@ -202,6 +203,7 @@ class TabEngineClient(private val context: Context, tabIndex: Int, val isPrivate
 
     private val connection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, service: IBinder) {
+            BrowserLog.i("ipc", "connected to ${name.shortClassName}")
             outgoingMessenger = Messenger(service)
             send(TabEngineProtocol.MSG_REGISTER_CLIENT, fillReplyTo = { replyTo = incomingMessenger })
             send(TabEngineProtocol.MSG_INIT) { putBoolean(TabEngineProtocol.KEY_IS_PRIVATE, isPrivate) }
@@ -209,6 +211,11 @@ class TabEngineClient(private val context: Context, tabIndex: Int, val isPrivate
 
         override fun onServiceDisconnected(name: ComponentName?) {
             outgoingMessenger = null
+            // The engine process crashed or the system killed it. Its page is gone with it, so say
+            // so instead of leaving whatever was last drawn looking alive.
+            BrowserLog.e("ipc", "tab engine ${name?.shortClassName} disconnected: its process crashed or was killed")
+            val url = currentUrl ?: return
+            onStateChanged?.invoke(TabState.Error(url, "This tab's engine process stopped. Reload to try again."))
         }
     }
 

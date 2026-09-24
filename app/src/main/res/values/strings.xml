@@ -61,4 +61,6 @@
     <string name="passwords_empty">No saved passwords yet</string>
     <string name="password_deleted">Password removed</string>
     <string name="menu_sandboxed_tabs">Sandboxed tabs</string>
+    <string name="menu_copy_logs">Copy logs</string>
+    <string name="logs_copied">Logs copied (%1$d lines)</string>
 </resources>

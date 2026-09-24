@@ -57,6 +57,9 @@ import com.projectfuture.browser.browser.TabHandle
 import com.projectfuture.browser.browser.TabManager
 import com.projectfuture.browser.browser.TabSessionStore
 import com.projectfuture.browser.browser.TabState
+import com.projectfuture.browser.debug.BrowserLog
+import com.projectfuture.browser.debug.LogReport
+import com.projectfuture.browser.debug.SystemLogReader
 import com.projectfuture.browser.layout.DrawText
 import com.projectfuture.browser.html.ElementNode
 import com.projectfuture.browser.net.CookieJar
@@ -258,6 +261,8 @@ class MainActivity : AppCompatActivity() {
                 tabTitles[tab] = label
                 if (!tab.isPrivate) historyStore.record(state.url.toString(), label)
             }
+            is TabState.Error -> BrowserLog.w("ui", "load error shown for ${if (tab.isPrivate) "[private]" else state.url.toString()}: ${state.message}")
+            is TabState.CertificateError -> BrowserLog.w("ui", "certificate error shown for ${if (tab.isPrivate) "[private]" else state.url.host}: ${state.message}")
             else -> {}
         }
         if (state is TabState.Loaded || state is TabState.Updated) saveSession()
@@ -551,6 +556,7 @@ class MainActivity : AppCompatActivity() {
             isCheckable = true
             isChecked = settings.sandboxedTabsEnabled
         }
+        popup.menu.add(0, 16, 15, R.string.menu_copy_logs)
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> {
@@ -594,10 +600,55 @@ class MainActivity : AppCompatActivity() {
                 13 -> { addToHomeScreen(); true }
                 14 -> { showPasswordsDialog(); true }
                 15 -> { settings.sandboxedTabsEnabled = !settings.sandboxedTabsEnabled; true }
+                16 -> { copyLogs(); true }
                 else -> false
             }
         }
         popup.show()
+    }
+
+    /**
+     * Copies a debugging report to the clipboard: app, device and tab details, then the recent log
+     * from every process of this app. Reading the system log takes a moment, so it runs off the
+     * main thread. A private tab's URL never appears (see BrowserLog).
+     */
+    private fun copyLogs() {
+        val activeTab = tabManager.activeTab
+        val header = listOf(
+            "ProjectFuture Browser logs, copied ${java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss Z", java.util.Locale.US).format(java.util.Date())}",
+            "App: ${appVersion()}",
+            "Android: ${Build.VERSION.RELEASE} (API ${Build.VERSION.SDK_INT}), device: ${Build.MANUFACTURER} ${Build.MODEL}",
+            "Tabs open: ${tabManager.count()}, sandboxed tabs: ${settings.sandboxedTabsEnabled}, " +
+                "tracking protection: ${TrackingProtection.enabled}, dark mode: $darkModeEnabled",
+            "Current tab: " + when {
+                activeTab == null -> "none"
+                activeTab.isPrivate -> "[private]"
+                else -> activeTab.currentUrl?.toString() ?: "blank"
+            }
+        )
+        Thread {
+            var lines = SystemLogReader.recentLines()
+            if (lines.isEmpty()) {
+                lines = listOf("(The system log couldn't be read; showing this process's own entries only.)") + BrowserLog.recentEntries()
+            }
+            val report = LogReport.build(header, lines)
+            runOnUiThread {
+                val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                clipboard.setPrimaryClip(android.content.ClipData.newPlainText(getString(R.string.menu_copy_logs), report))
+                // Android 13+ shows its own confirmation whenever an app copies to the clipboard.
+                if (Build.VERSION.SDK_INT < 33) {
+                    Toast.makeText(this, getString(R.string.logs_copied, report.count { it == '\n' } + 1), Toast.LENGTH_SHORT).show()
+                }
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+    private fun appVersion(): String = try {
+        val info = packageManager.getPackageInfo(packageName, 0)
+        val code = if (Build.VERSION.SDK_INT >= 28) info.longVersionCode else @Suppress("DEPRECATION") info.versionCode.toLong()
+        "${info.versionName} ($code)"
+    } catch (_: Exception) {
+        "unknown"
     }
 
     /** Shared row builder for the tabs/bookmarks/history dialogs: a label, tap to act, X to remove. */

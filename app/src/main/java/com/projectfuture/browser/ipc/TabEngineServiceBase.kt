@@ -10,6 +10,7 @@ import android.os.Looper
 import android.os.Message
 import android.os.Messenger
 import com.projectfuture.browser.browser.LoginFormDetector
+import com.projectfuture.browser.debug.BrowserLog
 import com.projectfuture.browser.browser.LocalStorageStore
 import com.projectfuture.browser.browser.Settings
 import com.projectfuture.browser.browser.Tab
@@ -79,6 +80,7 @@ abstract class TabEngineServiceBase : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        BrowserLog.i("ipc", "tab engine service ${javaClass.simpleName} started in pid ${android.os.Process.myPid()}")
         // See this class's doc for what this does and doesn't fix.
         if (sharedCookieJar == null) sharedCookieJar = CookieJar(applicationContext)
         if (sharedLocalStorage == null) sharedLocalStorage = LocalStorageStore(applicationContext)
@@ -288,11 +290,19 @@ abstract class TabEngineServiceBase : Service() {
             if (newMeta.isNotEmpty()) sendMessage(TabEngineProtocol.MSG_ELEMENT_META) {
                 IpcPayload.put(this, TabEngineProtocol.KEY_PAYLOAD, ElementMetaCodec.encode(newMeta), cacheDir)
             }
+            val encoded = DisplayListCodec.encode(wireCommands)
             sendMessage(TabEngineProtocol.MSG_DISPLAY_LIST) {
-                IpcPayload.put(this, TabEngineProtocol.KEY_PAYLOAD, DisplayListCodec.encode(wireCommands), cacheDir)
+                IpcPayload.put(this, TabEngineProtocol.KEY_PAYLOAD, encoded, cacheDir)
                 putFloat(TabEngineProtocol.KEY_CONTENT_HEIGHT, currentTab.contentHeight)
             }
+            BrowserLog.i(
+                "ipc",
+                "sent display list: ${wireCommands.size} commands, ${encoded.size}B" +
+                    (if (encoded.size > IpcPayload.INLINE_LIMIT) " via file" else "") +
+                    ", ${newImages.size} new images, ${newMeta.size} new elements"
+            )
         } catch (e: Throwable) {
+            BrowserLog.e("ipc", "couldn't build or send the display list", e)
             // Report it rather than leave a blank page that looks like it loaded fine.
             val url = currentTab.currentUrl?.toString() ?: return
             send(stateMessage(TabEngineProtocol.MSG_STATE_ERROR, url, "Couldn't display this page: ${e.message ?: e.javaClass.simpleName}"))
@@ -316,7 +326,7 @@ abstract class TabEngineServiceBase : Service() {
         try {
             reply.send(message)
         } catch (e: Exception) {
-            android.util.Log.w("TabEngineService", "Dropped IPC message ${message.what}", e)
+            BrowserLog.w("ipc", "dropped message ${message.what} to the UI process", e)
         }
     }
 

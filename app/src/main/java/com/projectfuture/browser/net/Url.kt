@@ -1,5 +1,6 @@
 package com.projectfuture.browser.net
 
+import com.projectfuture.browser.debug.BrowserLog
 import com.projectfuture.browser.net.http2.Alpn
 import com.projectfuture.browser.net.http2.Http2Connection
 import com.projectfuture.browser.net.http2.Http2ConnectionClosedException
@@ -143,8 +144,11 @@ data class Url(
         // Only cacheable requests (see HttpCache's class doc) even attempt a cache lookup - a
         // GET with no body, matching this project's bounded RFC 7234 subset.
         val cacheable = allowCookies && method.equals("GET", ignoreCase = true) && body == null
-        if (cacheable) HttpCache.get(this)?.let { return it }
-        val raw = fetchRaw(method, body, extraHeaders, redirectsLeft, allowCookies)
+        if (cacheable) HttpCache.get(this)?.let {
+            BrowserLog.i("net", "$method ${logName(allowCookies)} -> ${it.statusCode} from cache")
+            return it
+        }
+        val raw = logged(method, allowCookies) { fetchRaw(method, body, extraHeaders, redirectsLeft, allowCookies) }
         val charset = charsetFromContentType(raw.headers["content-type"])
         val response = HttpResponse(raw.statusCode, raw.headers, decodeBody(raw.body, charset), raw.url)
         if (cacheable) HttpCache.store(this, response)
@@ -154,8 +158,26 @@ data class Url(
     /** Same request as [fetch], but returns the raw body bytes undecoded - for binary resources like images. */
     fun fetchBytes(redirectsLeft: Int = 10, allowCookies: Boolean = true): HttpBytesResponse {
         hstsUpgrade()?.let { return it.fetchBytes(redirectsLeft, allowCookies) }
-        val raw = fetchRaw("GET", null, emptyMap(), redirectsLeft, allowCookies)
+        val raw = logged("GET", allowCookies) { fetchRaw("GET", null, emptyMap(), redirectsLeft, allowCookies) }
         return HttpBytesResponse(raw.statusCode, raw.headers, raw.body, raw.url)
+    }
+
+    /** This URL for [BrowserLog]. A request with cookies off comes from a private tab, so its URL is never logged. */
+    private fun logName(allowCookies: Boolean): String = if (allowCookies) toString().take(300) else "[private]"
+
+    private fun logged(method: String, allowCookies: Boolean, request: () -> RawHttpResponse): RawHttpResponse {
+        val start = System.nanoTime()
+        try {
+            val raw = request()
+            val ms = (System.nanoTime() - start) / 1_000_000
+            val redirected = if (raw.url != this && allowCookies) " via redirect to ${raw.url.toString().take(300)}" else ""
+            BrowserLog.i("net", "$method ${logName(allowCookies)} -> ${raw.statusCode} ${raw.protocol} ${raw.body.size}B in ${ms}ms$redirected")
+            return raw
+        } catch (e: Exception) {
+            val ms = (System.nanoTime() - start) / 1_000_000
+            BrowserLog.w("net", "$method ${logName(allowCookies)} failed after ${ms}ms: ${e.javaClass.simpleName}: ${e.message}")
+            throw e
+        }
     }
 
     /** Non-null (the HTTPS-upgraded URL to use instead) when this is a plain-HTTP request to an HSTS-enforced host. */
@@ -401,7 +423,7 @@ data class Url(
                 try { socket.close() } catch (_: Exception) {}
             }
 
-            return RawHttpResponse(statusCode, headers, decodeContentEncoding(headers, rawBody), this)
+            return RawHttpResponse(statusCode, headers, decodeContentEncoding(headers, rawBody), this, "http/1.1")
         } catch (e: Exception) {
             try { socket.close() } catch (_: Exception) {}
             throw e
@@ -472,7 +494,7 @@ data class Url(
             }
         }
 
-        return RawHttpResponse(response.statusCode, headers, decodeContentEncoding(headers, response.body), this)
+        return RawHttpResponse(response.statusCode, headers, decodeContentEncoding(headers, response.body), this, "h2")
     }
 
     /** Shared `Content-Encoding` handling for both the HTTP/1.1 and HTTP/2 request paths. Unrecognized or absent encodings pass the body through unchanged. */
@@ -484,7 +506,8 @@ data class Url(
                 encoding.contains("gzip") -> GZIPInputStream(rawBody.inputStream()).use { it.readBytes() }
                 else -> rawBody
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            BrowserLog.w("net", "couldn't decode $encoding body (${rawBody.size}B) from $host: ${e.message}")
             rawBody
         }
     }
@@ -676,7 +699,8 @@ private data class RawHttpResponse(
     val statusCode: Int,
     val headers: Map<String, String>,
     val body: ByteArray,
-    val url: Url
+    val url: Url,
+    val protocol: String
 )
 
 /**

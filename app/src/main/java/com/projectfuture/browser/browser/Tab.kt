@@ -7,6 +7,7 @@ import android.graphics.Typeface
 import android.os.Handler
 import android.os.Looper
 import com.projectfuture.browser.css.CssParser
+import com.projectfuture.browser.debug.BrowserLog
 import com.projectfuture.browser.css.CssRule
 import com.projectfuture.browser.css.FontFaceRule
 import com.projectfuture.browser.css.computeStyles
@@ -36,6 +37,7 @@ import com.projectfuture.browser.js.Parser
 import com.projectfuture.browser.js.jsError
 import com.projectfuture.browser.js.jsonStringify
 import com.projectfuture.browser.js.parseJsonToJsValue
+import com.projectfuture.browser.js.JsException
 import com.projectfuture.browser.js.toJsString
 import com.projectfuture.browser.js.toNumber
 import com.projectfuture.browser.layout.DisplayCommand
@@ -688,6 +690,9 @@ class Tab(
     private fun load(requestedUrl: Url, action: HistoryAction, method: String = "GET", body: ByteArray? = null) {
         val url = unwrapSearchRedirect(requestedUrl)
         val navigation = ++navigationSeq
+        val startedAt = System.nanoTime()
+        fun ms() = (System.nanoTime() - startedAt) / 1_000_000
+        BrowserLog.i("load", "#$navigation $method ${logUrl(url)} ($action)" + if (url != requestedUrl) " unwrapped from ${logUrl(requestedUrl)}" else "")
         onStateChanged(TabState.Loading(url))
         // Read on the main thread (load() is always called from one) before
         // handing off to the background executor, rather than reading the
@@ -703,6 +708,11 @@ class Tab(
         executor.execute {
             try {
                 val response = url.fetch(method, body, requestHeaders, allowCookies = !isPrivate)
+                BrowserLog.i(
+                    "load",
+                    "#$navigation fetched ${logUrl(response.url)} status=${response.statusCode} " +
+                        "type=${response.headers["content-type"]} chars=${response.body.length} at ${ms()}ms"
+                )
                 if (isDownloadResponse(response.headers["content-type"], response.headers["content-disposition"])) {
                     // Not an `<a download>` tap - a navigation (JS-driven, or a redirect chain)
                     // that landed on a non-HTML/attachment response. Route it to the download
@@ -724,6 +734,9 @@ class Tab(
                 }
                 val csp = ContentSecurityPolicy.parse(response.headers["content-security-policy"])
                 val root = HtmlParser(response.body).parse()
+                var elementCount = 0
+                root.walkElements { elementCount++ }
+                BrowserLog.i("load", "#$navigation parsed $elementCount elements at ${ms()}ms")
                 warmPreconnectHints(root, response.url)
                 // Scripts may mutate the DOM, so this runs before CSS/images/fonts are collected below.
                 val (interpreter, bridge) = runScripts(root, response.url, csp, navigation)
@@ -733,6 +746,10 @@ class Tab(
                 val title = extractTitle(root)
                 val images = collectAndDecodeImages(root, response.url, csp) + collectAndRenderSvgs(root) + bridge.canvasBitmaps()
                 val fonts = loadFontFaces(authorCss.fontFaces, response.url, csp)
+                BrowserLog.i(
+                    "load",
+                    "#$navigation styled: ${authorCss.rules.size} css rules, ${images.size} images, ${fonts.size} fonts at ${ms()}ms"
+                )
                 postMain {
                     currentUrl = response.url
                     currentDoc = root
@@ -773,10 +790,16 @@ class Tab(
                         }
                     }
                     relayout()
+                    BrowserLog.i(
+                        "load",
+                        "#$navigation laid out ${displayList.size} draw commands, content height ${contentHeight.toInt()}px, " +
+                            "viewport ${viewportWidth.toInt()}x${viewportHeight.toInt()}, done at ${ms()}ms"
+                    )
                     onStateChanged(TabState.Loaded(response.url, title))
                     scheduleMetaRefresh(metaRefresh, response.url)
                 }
             } catch (e: Throwable) {
+                BrowserLog.w("load", "#$navigation failed for ${logUrl(url)} at ${ms()}ms", e)
                 // Throwable, not Exception: a StackOverflowError from deeply recursive real-world
                 // JS/DOM (see the executor's doc above) or any other Error must still resolve this
                 // tab out of TabState.Loading instead of silently killing this thread and leaving
@@ -907,6 +930,17 @@ class Tab(
      * class doc for what the script<->DOM/window bridge does and doesn't
      * cover yet (no real event dispatch from taps, no setTimeout/fetch).
      */
+    /** A URL for [BrowserLog]: never a private tab's. */
+    private fun logUrl(url: Url): String = if (isPrivate) "[private]" else url.toString().take(300)
+
+    /** A thrown JS value (`throw new TypeError(...)`) arrives as a JsException wrapping it; show its message, not "[object Object]". */
+    private fun describeJsError(e: Throwable): String {
+        val thrown = (e as? JsException)?.value as? JsObject ?: return e.message ?: ""
+        val name = toJsString(thrown.get("name"))
+        val message = toJsString(thrown.get("message"))
+        return if (name == "undefined" && message == "undefined") e.message ?: "" else "$name: $message"
+    }
+
     /**
      * `<meta http-equiv="refresh" content="N; url=...">`: after N seconds, replace this page with the
      * target, as long as nothing else has navigated first. A refresh with no URL (a periodic
@@ -930,6 +964,8 @@ class Tab(
 
         val scripts = ArrayList<ElementNode>()
         root.walkElements { if (it.tag == "script") scripts.add(it) }
+        var scriptsRun = 0
+        var scriptsFailed = 0
 
         for (scriptEl in scripts) {
             // Only JavaScript types run. `application/ld+json` metadata, `text/template` markup and
@@ -947,16 +983,28 @@ class Tab(
                 null
             }
             if (code.isNullOrBlank()) continue
+            val label = if (src.isNullOrBlank()) "inline script (${code.length} chars)" else "script ${if (isPrivate) "[private]" else src.take(120)}"
+            val scriptStart = System.nanoTime()
             try {
                 interpreter.run(Parser(Lexer(code).tokenize()).parseProgram())
-            } catch (_: Throwable) {
+                scriptsRun++
+            } catch (e: Throwable) {
                 // A script that fails to parse or throws - including a StackOverflowError from
                 // deeply recursive real-world JS, an Error rather than an Exception - shouldn't
                 // take down the whole page; move on to the next script instead.
+                scriptsFailed++
+                BrowserLog.i("js", "$label failed: ${e.javaClass.simpleName}: ${describeJsError(e).take(200)}")
             }
+            val scriptMs = (System.nanoTime() - scriptStart) / 1_000_000
+            if (scriptMs > 500) BrowserLog.w("js", "$label took ${scriptMs}ms")
         }
 
-        bridge.fireDomContentLoaded(interpreter)
+        try {
+            bridge.fireDomContentLoaded(interpreter)
+        } catch (e: Throwable) {
+            BrowserLog.i("js", "DOMContentLoaded handler failed: ${e.javaClass.simpleName}: ${describeJsError(e).take(200)}")
+        }
+        BrowserLog.i("js", "${scripts.size} script elements: $scriptsRun ran, $scriptsFailed failed")
         return interpreter to bridge
     }
 

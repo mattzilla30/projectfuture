@@ -1,5 +1,6 @@
 package com.projectfuture.browser.net.http2
 
+import com.projectfuture.browser.debug.BrowserLog
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.IOException
@@ -16,6 +17,7 @@ class Http2ConnectionClosedException(message: String) : IOException(message)
 data class Http2Response(val statusCode: Int, val headers: List<Pair<String, String>>, val body: ByteArray)
 
 private const val DEFAULT_INITIAL_WINDOW = 65535
+private val nextLogId = AtomicInteger(0)
 private const val CONNECTION_STREAM_ID = 0
 /** How long a stream may go without receiving any frame before it's considered dead. Measured from the last frame, not from the start, so a large response on a slow network isn't cut off. */
 private const val STREAM_INACTIVITY_TIMEOUT_MS = 20000L
@@ -36,6 +38,7 @@ private const val MAX_IDLE_BEFORE_REUSE_MS = 60000L
  * than silently mishandled.
  */
 class Http2Connection(private val socket: Socket) {
+    private val logId = nextLogId.incrementAndGet()
     private val input = BufferedInputStream(socket.getInputStream(), 16384)
     private val output = BufferedOutputStream(socket.getOutputStream(), 16384)
     private val writeLock = Any()
@@ -75,13 +78,14 @@ class Http2Connection(private val socket: Socket) {
         )))
         synchronized(writeLock) { output.flush() }
         readerThread.start()
+        BrowserLog.i("h2", "connection #$logId opened")
     }
 
     /** Whether a new request may be started on this connection. See [MAX_IDLE_BEFORE_REUSE_MS] for the idle check. */
     val isOpen: Boolean get() {
         if (closed || goingAway) return false
         if (streams.isEmpty() && System.currentTimeMillis() - lastTrafficMs > MAX_IDLE_BEFORE_REUSE_MS) {
-            close()
+            failAll(IOException("idle too long to reuse"))
             return false
         }
         return true
@@ -140,6 +144,7 @@ class Http2Connection(private val socket: Socket) {
                     // Nothing at all has arrived for this stream in that long: the connection is almost
                     // certainly dead. Tear it down so the pool stops handing it out and the next
                     // request opens a fresh one, instead of every later request timing out on it too.
+                    BrowserLog.w("h2", "connection #$logId stream $streamId got nothing for ${STREAM_INACTIVITY_TIMEOUT_MS}ms, closing connection")
                     failAll(IOException("HTTP/2 connection stopped responding"))
                     throw IOException("HTTP/2 stream $streamId timed out")
                 }
@@ -243,6 +248,7 @@ class Http2Connection(private val socket: Socket) {
                 // already saw END_STREAM here is complete and the reset must not turn it into a failure.
                 if (it.finished) return@let
                 val code = if (frame.payload.size >= 4) readInt32(frame.payload, 0) else -1
+                BrowserLog.w("h2", "connection #$logId stream ${frame.streamId} reset by server, error code $code")
                 it.error = IOException("Stream ${frame.streamId} reset by server (error code $code)")
                 it.headersLatch.countDown()
                 it.doneLatch.countDown()
@@ -275,6 +281,8 @@ class Http2Connection(private val socket: Socket) {
     private fun handleGoAway(frame: Http2Frame) {
         goingAway = true
         val lastStreamId = if (frame.payload.size >= 4) readInt32(frame.payload, 0) and 0x7fffffff else 0
+        val code = if (frame.payload.size >= 8) readInt32(frame.payload, 4) else -1
+        BrowserLog.i("h2", "connection #$logId GOAWAY last stream $lastStreamId, error code $code, ${streams.size} streams open")
         for ((id, state) in streams) {
             if (id > lastStreamId && !state.finished) {
                 state.error = Http2ConnectionClosedException("Stream $id refused by GOAWAY")
@@ -413,6 +421,7 @@ class Http2Connection(private val socket: Socket) {
         if (closed) return
         closed = true
         closeCause = cause
+        BrowserLog.i("h2", "connection #$logId closed: ${cause.message}${cause.cause?.let { " (${it.javaClass.simpleName}: ${it.message})" } ?: ""}, ${streams.size} streams open")
         for (state in streams.values) {
             // A stream that already received END_STREAM has its complete response; its caller may just
             // not have picked it up yet.
