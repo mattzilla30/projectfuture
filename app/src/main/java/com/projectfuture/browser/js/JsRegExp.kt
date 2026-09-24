@@ -32,13 +32,21 @@ class JsRegExp(val source: String, val flags: String) : JsObject() {
 
     private fun execFirst(input: String): JsValue {
         val m = kotlinRegex.find(input) ?: return JsNull
-        val result = JsArray(m.groupValues.map { JsString(it) as JsValue }.toMutableList())
-        result.set("index", JsNumber(m.range.first.toDouble()))
-        result.set("input", JsString(input))
-        return result
+        return buildMatchArray(this, input, m)
+    }
+
+    /** Names declared by `(?<name>...)` in [source], in the order they appear. Extracted from the
+     * source text itself, since Kotlin's `Regex`/`MatchNamedGroupCollection` can look a name up but
+     * doesn't expose the full set of names a pattern declares. The identifier-start restriction
+     * (`[A-Za-z_$]` first char) means this never mistakes a `(?<=` lookbehind or `(?<!` negative
+     * lookbehind - whose second char is `=`/`!`, not a legal identifier char - for a named group. */
+    val groupNames: List<String> by lazy {
+        NAMED_GROUP.findAll(source).map { it.groupValues[1] }.toList()
     }
 
     companion object {
+        private val NAMED_GROUP = Regex("\\(\\?<([A-Za-z_$][A-Za-z0-9_$]*)>")
+
         private fun regexOptions(flags: String): Set<RegexOption> {
             val options = HashSet<RegexOption>()
             if (flags.contains('i')) options.add(RegexOption.IGNORE_CASE)
@@ -47,6 +55,32 @@ class JsRegExp(val source: String, val flags: String) : JsObject() {
             return options
         }
     }
+}
+
+/** Builds the array `exec()`/non-global `match()` return: the matched substrings (whole match plus
+ * capture groups, like [MatchResult.groupValues]) with `index`/`input`/`groups` attached, per spec.
+ * `groups` is `undefined` when the pattern declares no named capture groups, and otherwise an object
+ * mapping each declared name to its captured text (or `undefined` if that group didn't participate). */
+fun buildMatchArray(re: JsRegExp, input: String, m: MatchResult): JsArray {
+    val result = JsArray(m.groupValues.map { JsString(it) as JsValue }.toMutableList())
+    result.set("index", JsNumber(m.range.first.toDouble()))
+    result.set("input", JsString(input))
+    val names = re.groupNames
+    result.set(
+        "groups",
+        if (names.isEmpty()) {
+            JsUndefined
+        } else {
+            val groups = JsObject()
+            val named = m.groups as? MatchNamedGroupCollection
+            for (n in names) {
+                val g = named?.get(n)
+                groups.set(n, if (g != null) JsString(g.value) else JsUndefined)
+            }
+            groups
+        }
+    )
+    return result
 }
 
 fun makeRegExpCtor(): JsFunction = object : JsFunction("RegExp") {
@@ -89,19 +123,84 @@ fun regexReplace(interpreter: Interpreter, input: String, re: JsRegExp, replacem
         }
     }
 
-    // Plain string: translate JS's $& (whole match) to Kotlin's $0, then let Kotlin's
-    // native backreference handling do the rest for the global (whole-string) case.
-    val replStr = toJsString(replacement).replace("$&", "\$0")
-    return if (re.global) {
-        re.kotlinRegex.replace(input, replStr)
-    } else {
-        val m = re.kotlinRegex.find(input) ?: return input
-        input.substring(0, m.range.first) + expandBackreferences(replStr, m) + input.substring(m.range.last + 1)
+    // Plain string: expand $-patterns by hand against each match, rather than handing the string to
+    // Kotlin/Java's own replacement-string parser - that parser uses *Java's* replacement syntax
+    // (`\$` for a literal `$`, no `$$`/$<name>/$`/$' support), which isn't JS's and previously caused
+    // a literal "$$" in the replacement to throw ("Illegal group reference") instead of becoming "$",
+    // and "$1" to silently vanish (empty) instead of resolving against the right match once global.
+    val template = toJsString(replacement)
+    val matches: Iterable<MatchResult> = if (re.global) re.kotlinRegex.findAll(input).asIterable() else listOfNotNull(re.kotlinRegex.find(input))
+    val sb = StringBuilder()
+    var lastEnd = 0
+    for (m in matches) {
+        sb.append(input, lastEnd, m.range.first)
+        sb.append(expandReplacementTemplate(template, m, input, re.groupNames.isNotEmpty()))
+        lastEnd = m.range.last + 1
     }
+    sb.append(input, lastEnd, input.length)
+    return sb.toString()
 }
 
-private val BACKREF = Regex("\\$(\\d+)")
-
-/** Kotlin's `Regex.replace` only expands `$1`-style backreferences when replacing across a whole string, not one match - so a non-global JS replace resolves them by hand against that single match. */
-private fun expandBackreferences(template: String, match: MatchResult): String =
-    BACKREF.replace(template) { mr -> match.groupValues.getOrElse(mr.groupValues[1].toInt()) { "" } }
+/** Expands a JS `String.replace` replacement template (`$$`, `$&`, `` $` ``, `$'`, `$<name>`, `$n`/`$nn`)
+ * against one match, per the spec's `GetSubstitution`. An unrecognized `$`-sequence - e.g. `$9` when the
+ * pattern has fewer than 9 groups, or `$<name>` when it declares no such named group - is left as the
+ * literal text it is in JS, not treated as a (possibly out-of-range) backreference. */
+private fun expandReplacementTemplate(template: String, match: MatchResult, input: String, hasNamedGroups: Boolean): String {
+    val sb = StringBuilder()
+    var i = 0
+    while (i < template.length) {
+        val c = template[i]
+        if (c != '$' || i == template.length - 1) {
+            sb.append(c)
+            i++
+            continue
+        }
+        when (val next = template[i + 1]) {
+            '$' -> { sb.append('$'); i += 2 }
+            '&' -> { sb.append(match.value); i += 2 }
+            '`' -> { sb.append(input, 0, match.range.first); i += 2 }
+            '\'' -> { sb.append(input, match.range.last + 1, input.length); i += 2 }
+            '<' -> {
+                val end = template.indexOf('>', i + 2)
+                if (end < 0 || !hasNamedGroups) {
+                    // No named-capturing groups at all: per spec `$<...>` is left as literal text
+                    // rather than parsed as a substitution (there's no named-captures object to
+                    // resolve it against).
+                    sb.append(c); i++
+                } else {
+                    val name = template.substring(i + 2, end)
+                    val named = match.groups as? MatchNamedGroupCollection
+                    // A named group that exists on the pattern but didn't match this name resolves
+                    // to the empty string (like reading a missing property), not literal text.
+                    val g = try { named?.get(name) } catch (e: IllegalArgumentException) { null }
+                    if (g != null) sb.append(g.value)
+                    i = end + 1
+                }
+            }
+            else -> {
+                if (next.isDigit()) {
+                    // Greedily prefer two digits (e.g. $12) if that group exists, else fall back to one.
+                    val twoDigits = if (i + 2 < template.length && template[i + 2].isDigit()) template.substring(i + 1, i + 3) else null
+                    val twoNum = twoDigits?.toIntOrNull()
+                    if (twoNum != null && twoNum in 1 until match.groups.size) {
+                        sb.append(match.groups[twoNum]?.value ?: "")
+                        i += 3
+                    } else {
+                        val oneNum = next.toString().toInt()
+                        if (oneNum in 1 until match.groups.size) {
+                            sb.append(match.groups[oneNum]?.value ?: "")
+                            i += 2
+                        } else {
+                            sb.append(c)
+                            i++
+                        }
+                    }
+                } else {
+                    sb.append(c)
+                    i++
+                }
+            }
+        }
+    }
+    return sb.toString()
+}
