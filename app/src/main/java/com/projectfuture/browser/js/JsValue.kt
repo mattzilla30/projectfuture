@@ -102,16 +102,52 @@ class Closure(
         interpreter.callClosure(this, thisArg, args)
 }
 
-fun toNumber(v: JsValue): Double = when (v) {
-    is JsNumber -> v.value
-    is JsString -> {
-        val t = v.value.trim()
-        if (t.isEmpty()) 0.0 else t.toDoubleOrNull() ?: Double.NaN
-    }
-    is JsBoolean -> if (v.value) 1.0 else 0.0
+/**
+ * ES ToPrimitive, restricted to what this flat-property-bag object model can actually express:
+ * there is no general `valueOf`/`Symbol.toPrimitive` override mechanism (see JsObject's class doc), so the
+ * only case that matters is the plain default-hint algorithm's fallback - `Object.prototype.valueOf`
+ * returns `this` (non-primitive) for a plain object and is therefore skipped, and the result is always
+ * the object's string form. That also happens to be correct for [JsArray], whose own `toString`-equivalent
+ * ([toJsString]'s array branch) is exactly what real JS's `Array.prototype.valueOf` (inherited, so also
+ * skipped) plus `Array.prototype.toString`/`join` would produce.
+ */
+fun toPrimitive(v: JsValue): JsValue = if (v is JsObject) JsString(toJsString(v)) else v
+
+fun toNumber(v: JsValue): Double = when (val p = toPrimitive(v)) {
+    is JsNumber -> p.value
+    is JsString -> stringToNumber(p.value)
+    is JsBoolean -> if (p.value) 1.0 else 0.0
     JsNull -> 0.0
     JsUndefined -> Double.NaN
     else -> Double.NaN
+}
+
+/** ES StringToNumber: trims whitespace, treats an empty/whitespace-only string as `0`, and - unlike
+ * `String.toDoubleOrNull()` - also recognizes the `0x`/`0o`/`0b` integer literal prefixes ES2015 added
+ * to this algorithm (`Number("0x1F")` is `31`, not `NaN`). */
+private fun stringToNumber(s: String): Double {
+    val t = s.trim()
+    if (t.isEmpty()) return 0.0
+    val negative = t.startsWith("-")
+    val unsigned = if (negative || t.startsWith("+")) t.substring(1) else t
+    if (unsigned.length > 2 && unsigned[0] == '0') {
+        val radix = when (unsigned[1]) {
+            'x', 'X' -> 16
+            'o', 'O' -> 8
+            'b', 'B' -> 2
+            else -> 0
+        }
+        if (radix != 0) {
+            // A sign is not permitted before 0x/0o/0b per spec, only before decimal literals.
+            if (negative || t.startsWith("+")) return Double.NaN
+            val digits = unsigned.substring(2)
+            return digits.toLongOrNull(radix)?.toDouble()
+                ?: (if (digits.isNotEmpty() && digits.all { Character.digit(it, radix) >= 0 }) {
+                    java.math.BigInteger(digits, radix).toDouble()
+                } else Double.NaN)
+        }
+    }
+    return t.toDoubleOrNull() ?: Double.NaN
 }
 
 fun formatNumber(d: Double): String = when {
@@ -120,7 +156,48 @@ fun formatNumber(d: Double): String = when {
     d == Double.NEGATIVE_INFINITY -> "-Infinity"
     d == 0.0 -> "0"
     d == Math.floor(d) && Math.abs(d) < 1e21 -> d.toLong().toString()
-    else -> d.toString()
+    else -> formatNonIntegerNumber(d)
+}
+
+/**
+ * ES Number::toString for the cases [formatNumber] doesn't shortcut (non-integers, and integers with
+ * magnitude >= 1e21). `Double.toString()` already produces the same shortest round-trip *digits* JS's
+ * algorithm would (both guarantee a unique shortest decimal that reads back to the same double), but
+ * Java's notation rules differ from JS's (scientific-notation threshold, `E`/no sign vs `e`/`+`, no
+ * `.0` mantissa suffix), so this reformats those digits per the actual ECMA-262 7.1.12.1 rules instead
+ * of using Java's rendering directly.
+ */
+private fun formatNonIntegerNumber(d: Double): String {
+    val negative = d < 0
+    val javaStr = Math.abs(d).toString()
+    val eIdx = javaStr.indexOf('E')
+    val mantissa = if (eIdx >= 0) javaStr.substring(0, eIdx) else javaStr
+    val exp = if (eIdx >= 0) javaStr.substring(eIdx + 1).toInt() else 0
+    val dotIdx = mantissa.indexOf('.')
+    val intPart = mantissa.substring(0, dotIdx)
+    val fracPart = mantissa.substring(dotIdx + 1)
+    var allDigits = intPart + fracPart
+    var pointPos = intPart.length + exp
+    val firstNonZero = allDigits.indexOfFirst { it != '0' }
+    if (firstNonZero == -1) return "0"
+    pointPos -= firstNonZero
+    allDigits = allDigits.substring(firstNonZero).trimEnd('0')
+    if (allDigits.isEmpty()) allDigits = "0"
+    val k = allDigits.length
+    val n = pointPos
+    val sign = if (negative) "-" else ""
+    val body = if (n in k..21) {
+        allDigits + "0".repeat(n - k)
+    } else if (n in 1 until k) {
+        allDigits.substring(0, n) + "." + allDigits.substring(n)
+    } else if (n in -5..0) {
+        "0." + "0".repeat(-n) + allDigits
+    } else {
+        val e = n - 1
+        val mant = if (k == 1) allDigits else allDigits[0] + "." + allDigits.substring(1)
+        mant + "e" + (if (e >= 0) "+" else "") + e
+    }
+    return sign + body
 }
 
 fun toJsString(v: JsValue): String = when (v) {

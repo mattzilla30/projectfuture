@@ -509,7 +509,12 @@ class Interpreter {
      */
     fun iterableToSequence(obj: JsValue): Iterator<JsValue> = when (obj) {
         is JsArray -> obj.elements.toList().iterator()
-        is JsString -> obj.value.map { JsString(it.toString()) }.iterator()
+        // Per spec, String's iterator (unlike `.length`/bracket-indexing, which stay UTF-16-code-unit-based
+        // - see JsValue's `length` handling) walks whole Unicode codepoints: an astral character stored as a
+        // surrogate pair yields one iteration, not two. `codePoints()` groups each surrogate pair back
+        // together before re-splitting into (one- or two-char) JS string values.
+        is JsString -> obj.value.codePoints().toArray()
+            .map { cp -> JsString(String(Character.toChars(cp))) }.iterator()
         is JsMap -> obj.entryPairs().iterator()
         is JsSet -> obj.valuesList().iterator()
         is JsTypedArray -> obj.toList().iterator()
@@ -631,7 +636,15 @@ class Interpreter {
     }
 
     fun evalBinary(op: String, l: JsValue, r: JsValue): JsValue = when (op) {
-        "+" -> if (l is JsString || r is JsString) JsString(toJsString(l) + toJsString(r)) else JsNumber(toNumber(l) + toNumber(r))
+        "+" -> {
+            // ES `+`: ToPrimitive both operands *first*, then decide string-concat vs numeric-add from the
+            // primitive results - not the original operand types. Without this, `[] + []` (each array's
+            // ToPrimitive is the string "") would wrongly take the numeric path (`toNumber(JsArray)` on the
+            // original array) instead of concatenating to "", and `[] + {}` would miss "[object Object]".
+            val lp = toPrimitive(l)
+            val rp = toPrimitive(r)
+            if (lp is JsString || rp is JsString) JsString(toJsString(lp) + toJsString(rp)) else JsNumber(toNumber(lp) + toNumber(rp))
+        }
         "-" -> JsNumber(toNumber(l) - toNumber(r))
         "*" -> JsNumber(toNumber(l) * toNumber(r))
         "/" -> JsNumber(toNumber(l) / toNumber(r))

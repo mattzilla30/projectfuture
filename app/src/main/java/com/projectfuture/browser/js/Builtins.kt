@@ -31,15 +31,44 @@ fun installGlobals(env: Environment, interpreter: Interpreter) {
     for (kind in TypedArrayKind.values()) env.declare(kind.label, makeTypedArrayCtor(kind))
 
     env.declare("parseInt", NativeFunction("parseInt", 2) { _, _, args ->
-        val s = toJsString(arg(args, 0)).trim()
-        val radix = (arg(args, 1) as? JsNumber)?.value?.toInt()?.takeIf { it in 2..36 } ?: 10
-        val match = Regex("^[+-]?[0-9a-zA-Z]+").find(s)
-        JsNumber(match?.value?.toLongOrNull(radix)?.toDouble() ?: Double.NaN)
+        var s = toJsString(arg(args, 0)).trim()
+        var sign = 1.0
+        if (s.startsWith("-")) { sign = -1.0; s = s.substring(1) } else if (s.startsWith("+")) s = s.substring(1)
+        // radix 0/omitted means "auto-detect": a "0x"/"0X" prefix selects hex (and is consumed); anything
+        // else defaults to 10 (unlike the old ES3 behavior of auto-detecting octal from a leading "0").
+        var radix = (arg(args, 1) as? JsNumber)?.value?.toInt() ?: 0
+        if ((radix == 16 || radix == 0) && (s.startsWith("0x") || s.startsWith("0X"))) {
+            s = s.substring(2)
+            radix = 16
+        }
+        if (radix == 0) radix = 10
+        if (radix < 2 || radix > 36) {
+            JsNumber(Double.NaN)
+        } else {
+            // Take the longest prefix valid in this radix and stop there, rather than requiring the whole
+            // trimmed string to parse - real `parseInt` reads as many digits as it can and ignores the rest
+            // (`parseInt("42abc")` is `42`, not `NaN`).
+            val digitsAlphabet = "0123456789abcdefghijklmnopqrstuvwxyz".take(radix)
+            val prefix = s.takeWhile { it.lowercaseChar() in digitsAlphabet }
+            if (prefix.isEmpty()) {
+                JsNumber(Double.NaN)
+            } else {
+                val value = prefix.toLongOrNull(radix)?.toDouble() ?: java.math.BigInteger(prefix, radix).toDouble()
+                JsNumber(sign * value)
+            }
+        }
     })
     env.declare("parseFloat", NativeFunction("parseFloat", 1) { _, _, args ->
         val s = toJsString(arg(args, 0)).trim()
-        val match = Regex("^[+-]?([0-9]*\\.[0-9]+|[0-9]+\\.?)([eE][+-]?[0-9]+)?").find(s)
-        JsNumber(match?.value?.toDoubleOrNull() ?: Double.NaN)
+        // Per spec, parseFloat also recognizes a signed "Infinity" literal prefix (distinct from the
+        // decimal-digit grammar the regex below covers) - parseFloat("Infinity") is Infinity, not NaN.
+        val infinityMatch = Regex("^[+-]?Infinity").find(s)
+        if (infinityMatch != null) {
+            JsNumber(if (infinityMatch.value.startsWith("-")) Double.NEGATIVE_INFINITY else Double.POSITIVE_INFINITY)
+        } else {
+            val match = Regex("^[+-]?([0-9]*\\.[0-9]+|[0-9]+\\.?)([eE][+-]?[0-9]+)?").find(s)
+            JsNumber(match?.value?.toDoubleOrNull() ?: Double.NaN)
+        }
     })
     env.declare("isNaN", NativeFunction("isNaN", 1) { _, _, args -> JsBoolean(toNumber(arg(args, 0)).isNaN()) })
     env.declare("String", NativeFunction("String", 1) { _, _, args -> JsString(if (args.isEmpty()) "" else toJsString(args[0])) })
@@ -179,7 +208,9 @@ private fun makeArrayCtor(): JsFunction = object : JsFunction("Array") {
             val mapFn = a.getOrNull(1) as? JsFunction
             val items: List<JsValue> = when (source) {
                 is JsArray -> source.elements.toList()
-                is JsString -> source.value.map { JsString(it.toString()) }
+                // Codepoint-aware, like `for...of` over a string (Interpreter.iterableToSequence) - an astral
+                // character (surrogate pair) becomes one element, not two.
+                is JsString -> source.value.codePoints().toArray().map { cp -> JsString(String(Character.toChars(cp))) }
                 is JsMap -> source.entryPairs()
                 is JsSet -> source.valuesList()
                 is JsObject -> {
@@ -205,22 +236,105 @@ fun builtinMethodCall(interpreter: Interpreter, obj: JsValue, key: String, args:
 
 private fun numberMethod(n: JsNumber, key: String, args: List<JsValue>): JsValue? = when (key) {
     "toFixed" -> {
-        val digits = (args.getOrNull(0) as? JsNumber)?.value?.toInt() ?: 0
-        JsString(String.format(java.util.Locale.US, "%.${digits.coerceIn(0, 100)}f", n.value))
+        val digits = ((args.getOrNull(0) as? JsNumber)?.value?.toInt() ?: 0).coerceIn(0, 100)
+        val d = n.value
+        when {
+            d.isNaN() -> JsString("NaN")
+            // Per spec, toFixed falls back to plain toString notation once |x| >= 1e21.
+            !d.isFinite() || Math.abs(d) >= 1e21 -> JsString(formatNumber(d))
+            // `BigDecimal(Double)` captures the double's *exact* binary value (unlike
+            // `String.format("%.Nf", ...)`, which effectively rounds the shortest-round-trip decimal
+            // string instead) - which is what makes real JS's famous `(1.005).toFixed(2) === "1.00"`
+            // quirk happen: 1.005 is actually stored as ~1.00499999999999989..., just under the
+            // rounding boundary. Using the exact value here reproduces that instead of "fixing" it.
+            else -> JsString(java.math.BigDecimal(d).setScale(digits, java.math.RoundingMode.HALF_UP).toPlainString())
+        }
     }
     "toString" -> {
         val radix = (args.getOrNull(0) as? JsNumber)?.value?.toInt() ?: 10
-        if (radix == 10) JsString(formatNumber(n.value)) else JsString(n.value.toLong().toString(radix))
+        if (radix == 10) JsString(formatNumber(n.value)) else JsString(formatRadix(n.value, radix))
     }
     "toPrecision" -> {
-        val precision = (args.getOrNull(0) as? JsNumber)?.value?.toInt()
-        if (precision == null) {
+        val precisionArg = args.getOrNull(0)
+        if (precisionArg == null || precisionArg == JsUndefined) {
             JsString(formatNumber(n.value))
         } else {
-            JsString(java.math.BigDecimal(n.value).round(java.math.MathContext(precision.coerceIn(1, 100))).toPlainString())
+            JsString(formatPrecision(n.value, toNumber(precisionArg).toInt()))
         }
     }
     else -> null
+}
+
+/**
+ * `Number.prototype.toString(radix)` for `radix != 10`. `Long.toString(radix)` alone (the old
+ * implementation) truncates any fractional part via `.toLong()` - `(255.5).toString(16)` came out as
+ * "ff" instead of "ff.8" - so this formats the integer and fractional parts separately, the latter by
+ * repeatedly multiplying the remainder by the radix and taking each resulting digit (capped so an
+ * irrational-in-this-radix fraction like 0.1 in base 2 terminates instead of looping toward zero forever).
+ */
+private fun formatRadix(d: Double, radix: Int): String {
+    if (d.isNaN()) return "NaN"
+    if (d.isInfinite()) return if (d > 0) "Infinity" else "-Infinity"
+    val negative = d < 0
+    val abs = Math.abs(d)
+    val intPart = Math.floor(abs)
+    var frac = abs - intPart
+    val intStr = if (intPart < Long.MAX_VALUE.toDouble()) intPart.toLong().toString(radix) else formatNumber(intPart)
+    val fracStr = if (frac == 0.0) {
+        ""
+    } else {
+        val sb = StringBuilder(".")
+        var count = 0
+        while (frac > 0.0 && count < 1100) {
+            frac *= radix
+            val digit = Math.floor(frac).toInt()
+            sb.append(Character.forDigit(digit, radix))
+            frac -= digit
+            count++
+        }
+        sb.toString()
+    }
+    return (if (negative) "-" else "") + intStr + fracStr
+}
+
+/**
+ * `Number.prototype.toPrecision(p)` (ECMA-262 Number::toPrecision). The previous implementation
+ * (`BigDecimal(x).round(MathContext(p)).toPlainString()`) never produces exponential notation, so e.g.
+ * `(123456).toPrecision(2)` came out as the plain "120000" instead of the spec's "1.2e+5" - toPrecision
+ * switches to exponential form whenever the value's decimal exponent falls outside `[-6, p)`, the same
+ * way `toString()`'s general form does for very large/small magnitudes (see [formatNonIntegerNumber]).
+ */
+private fun formatPrecision(d: Double, p: Int): String {
+    if (d.isNaN()) return "NaN"
+    val negative = d < 0
+    val abs = Math.abs(d)
+    val sign = if (negative) "-" else ""
+    if (abs.isInfinite()) return sign + "Infinity"
+    val prec = p.coerceIn(1, 100)
+    if (abs == 0.0) return sign + if (prec == 1) "0" else "0." + "0".repeat(prec - 1)
+    val rounded = java.math.BigDecimal(abs).round(java.math.MathContext(prec, java.math.RoundingMode.HALF_UP))
+    var unscaled = rounded.unscaledValue().abs().toString()
+    var scale = rounded.scale()
+    if (unscaled.length > prec) {
+        val diff = unscaled.length - prec
+        unscaled = unscaled.substring(0, prec)
+        scale -= diff
+    } else if (unscaled.length < prec) {
+        val diff = prec - unscaled.length
+        unscaled += "0".repeat(diff)
+        scale += diff
+    }
+    // value == 0.<unscaled digits> * 10^e, e = exponent of the leading significant digit.
+    val e = prec - 1 - scale
+    return sign + when {
+        e < -6 || e >= prec -> {
+            val mant = if (prec == 1) unscaled else unscaled[0] + "." + unscaled.substring(1)
+            mant + "e" + (if (e >= 0) "+" else "") + e
+        }
+        e == prec - 1 -> unscaled
+        e >= 0 -> unscaled.substring(0, e + 1) + "." + unscaled.substring(e + 1)
+        else -> "0." + "0".repeat(-(e + 1)) + unscaled
+    }
 }
 
 private fun flattenToDepth(elements: List<JsValue>, depth: Int): List<JsValue> {
