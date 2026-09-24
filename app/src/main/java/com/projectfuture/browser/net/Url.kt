@@ -29,6 +29,7 @@ import javax.net.ssl.X509TrustManager
  * it does and doesn't cover). `Accept-Encoding: gzip, br` is sent; a gzip
  * `Content-Encoding` response is decompressed via the standard
  * `java.util.zip.GZIPInputStream` - a platform compression utility, the
+ * same tier as `Inflater` (used for WOFF font decompression) elsewhere in
  * this project, not "browser engine" logic - and a `br` (Brotli) response
  * is decompressed via the vendored decoder in `org.brotli.dec` (see
  * `BrotliDecoder.kt` for why that's vendored rather than hand-written here).
@@ -53,6 +54,13 @@ import javax.net.ssl.X509TrustManager
  * standalone, honestly-labeled package instead. See README.md's HTTP/3
  * section.
  */
+// A real, mainstream-looking User-Agent for any request that doesn't specify its own -
+// subresource fetches (stylesheets, fonts, images, `<script src>`) chief among them, since
+// Tab's own explicit MOBILE_USER_AGENT/DESKTOP_USER_AGENT only covers the main page load. Real
+// production sites commonly block or serve reduced content to a request whose User-Agent
+// doesn't look like a recognized browser - see Tab.kt's matching constants for the full story.
+private const val DEFAULT_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+
 data class Url(
     val scheme: String,
     val host: String,
@@ -195,8 +203,15 @@ data class Url(
         val cookieHeader = if (allowCookies) sharedCookieJar?.cookieHeaderFor(this) else null
         // A caller (Tab's "desktop site" toggle) can override the User-Agent via extraHeaders;
         // it's handled specially here rather than just appended, so there's never a duplicate header.
+        // The fallback below is used for every request that doesn't pass one explicitly -
+        // subresource fetches (stylesheets, fonts, images, `<script src>`) chief among them -
+        // so it needs to be a real, mainstream-looking UA too, not this project's own name:
+        // real production sites commonly block or serve reduced content to a request whose
+        // User-Agent doesn't look like a recognized browser (see the doc on Tab's
+        // MOBILE_USER_AGENT/DESKTOP_USER_AGENT for the full story - this is the same fix,
+        // just for the requests that don't go through Tab's own explicit header).
         val userAgent = extraHeaders.entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }?.value
-            ?: "ProjectFutureBrowser/0.1 (Android; from-scratch)"
+            ?: DEFAULT_USER_AGENT
         return buildString {
             append("${method.uppercase()} $path HTTP/1.1\r\n")
             append("Host: $host\r\n")
@@ -359,7 +374,7 @@ data class Url(
     private fun fetchViaHttp2(connection: Http2Connection, method: String, body: ByteArray?, extraHeaders: Map<String, String>, redirectsLeft: Int, allowCookies: Boolean): RawHttpResponse {
         val cookieHeader = if (allowCookies) sharedCookieJar?.cookieHeaderFor(this) else null
         val userAgent = extraHeaders.entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }?.value
-            ?: "ProjectFutureBrowser/0.1 (Android; from-scratch)"
+            ?: DEFAULT_USER_AGENT
         val authority = if (port == 443) host else "$host:$port"
         // HTTP/2 has no start line: the same request-line information instead travels as
         // ":"-prefixed pseudo-headers, which by RFC 7540 8.1.2.1 must come first in the block.

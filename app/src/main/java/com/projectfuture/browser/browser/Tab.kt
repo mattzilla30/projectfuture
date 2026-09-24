@@ -71,8 +71,16 @@ sealed class TabState {
 
 private enum class HistoryAction { PUSH, NONE }
 
-private const val MOBILE_USER_AGENT = "ProjectFutureBrowser/0.1 (Android; from-scratch)"
-private const val DESKTOP_USER_AGENT = "ProjectFutureBrowser/0.1 (X11; Linux x86_64; from-scratch) Desktop"
+// A real, mainstream-looking User-Agent, not this project's own name. Many real-world sites
+// (news publishers, retailers, anything behind Akamai/Cloudflare/PerimeterX-style bot
+// mitigation) return a small blocked/challenge page - or just omit their normal
+// stylesheets/scripts - for a request whose User-Agent doesn't look like a recognized
+// browser, which reproduces as "the page renders bare/unstyled" even though every part of
+// this project's own fetch/HTML/CSS pipeline worked correctly on the (non-)response it got.
+// Identifying as Chrome (both variants below) is what lets those sites serve their real,
+// normal markup, exactly like any other browser has to do to be treated as one.
+private const val MOBILE_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
+private const val DESKTOP_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 private const val DESKTOP_MEDIA_VIEWPORT_WIDTH = 1024f
 
 /**
