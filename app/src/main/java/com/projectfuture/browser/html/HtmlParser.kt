@@ -117,12 +117,33 @@ class HtmlParser(private val source: String) {
      * full of. Not the full per-spec scope-chain check.
      */
     private fun autoCloseForNewTag(tag: String) {
-        val innermost = unfinished.lastOrNull() ?: return
+        if (unfinished.isEmpty()) return
         val closesTags = AUTO_CLOSE_RULES[tag]
         if (closesTags != null) {
-            if (innermost.tag in closesTags) closeTag(innermost.tag)
-        } else if (tag in BLOCK_ELEMENTS && innermost.tag == "p") {
-            closeTag("p")
+            // Scan outward from the innermost open element - not just the
+            // innermost element itself - so an intervening, still-open tag
+            // (e.g. an unclosed inline `<b>` inside a `<li>`, or an unclosed
+            // `<td>` inside a `<tr>`) doesn't block the implicit close. Stop
+            // at a scope boundary (e.g. `<table>` for row/cell tags) so this
+            // never reaches past the container the rule is scoped to.
+            val boundary = AUTO_CLOSE_BOUNDARY[tag] ?: emptySet()
+            for (idx in unfinished.indices.reversed()) {
+                val openTag = unfinished[idx].tag
+                if (openTag in closesTags) {
+                    closeTag(openTag)
+                    return
+                }
+                if (openTag in boundary) return
+            }
+        } else if (tag in BLOCK_ELEMENTS) {
+            for (idx in unfinished.indices.reversed()) {
+                val openTag = unfinished[idx].tag
+                if (openTag == "p") {
+                    closeTag("p")
+                    return
+                }
+                if (openTag in BLOCK_ELEMENTS) return
+            }
         }
     }
 
@@ -264,6 +285,19 @@ class HtmlParser(private val source: String) {
             "tbody" to setOf("thead", "tbody", "tfoot", "tr", "td", "th"),
             "tfoot" to setOf("thead", "tbody", "tfoot", "tr", "td", "th")
         )
+        /** Tag -> the set of open tags [autoCloseForNewTag] must not scan past while looking for a match. */
+        val AUTO_CLOSE_BOUNDARY: Map<String, Set<String>> = mapOf(
+            "li" to setOf("ul", "ol", "menu"),
+            "dt" to setOf("dl"),
+            "dd" to setOf("dl"),
+            "tr" to setOf("table"),
+            "td" to setOf("table"),
+            "th" to setOf("table"),
+            "option" to setOf("select", "optgroup"),
+            "thead" to setOf("table"),
+            "tbody" to setOf("table"),
+            "tfoot" to setOf("table")
+        )
         val BLOCK_ELEMENTS = setOf(
             "html", "body", "article", "section", "nav", "aside", "h1", "h2", "h3", "h4", "h5", "h6",
             "hgroup", "header", "footer", "address", "p", "hr", "pre", "blockquote", "ol", "ul", "menu",
@@ -298,11 +332,11 @@ class HtmlParser(private val source: String) {
         private fun namedEntity(entity: String): String? {
             if (entity.startsWith("#x") || entity.startsWith("#X")) {
                 val code = entity.substring(2).toIntOrNull(16) ?: return null
-                return String(Character.toChars(code))
+                return codePointToString(code)
             }
             if (entity.startsWith("#")) {
                 val code = entity.substring(1).toIntOrNull() ?: return null
-                return String(Character.toChars(code))
+                return codePointToString(code)
             }
             return when (entity) {
                 "lt" -> "<"
@@ -322,5 +356,16 @@ class HtmlParser(private val source: String) {
                 else -> null
             }
         }
+
+        /**
+         * `&#...;` numeric references can carry a codepoint outside the
+         * valid Unicode range (e.g. `&#x110000;`), which crashes
+         * [Character.toChars] with an [IllegalArgumentException] - one
+         * malformed reference anywhere on a page must not abort parsing
+         * the whole document. Per spec, an invalid numeric reference
+         * becomes U+FFFD instead.
+         */
+        private fun codePointToString(code: Int): String =
+            if (Character.isValidCodePoint(code)) String(Character.toChars(code)) else "�"
     }
 }

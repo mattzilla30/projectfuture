@@ -194,6 +194,40 @@ class DomBridgeTest {
         assertEquals(0.0, (f.eval("count") as JsNumber).value, 0.0)
     }
 
+    @Test fun appendChildMovesANodeAlreadyAttachedElsewhereInsteadOfDuplicatingIt() {
+        val f = Fixture("<html><body><div id='a'><span id='s'>x</span></div><div id='b'></div></body></html>")
+        f.run("document.getElementById('b').appendChild(document.getElementById('s'));")
+        assertEquals(0.0, (f.eval("document.getElementById('a').children.length") as JsNumber).value, 0.0)
+        assertEquals(1.0, (f.eval("document.getElementById('b').children.length") as JsNumber).value, 0.0)
+        assertEquals("b", f.str("document.getElementById('s').parentElement.id"))
+    }
+
+    @Test fun appendChildOfSelfOrOwnDescendantIsRejectedRatherThanCreatingACycle() {
+        val f = Fixture("<html><body><div id='outer'><div id='inner'></div></div></body></html>")
+        // Appending an element to itself must not corrupt the tree.
+        f.run("document.getElementById('outer').appendChild(document.getElementById('outer'));")
+        assertEquals(1.0, (f.eval("document.getElementById('outer').children.length") as JsNumber).value, 0.0)
+        // Appending an ancestor into its own descendant would create a cycle.
+        f.run("document.getElementById('inner').appendChild(document.getElementById('outer'));")
+        assertEquals(0.0, (f.eval("document.getElementById('inner').children.length") as JsNumber).value, 0.0)
+    }
+
+    @Test fun removeClearsParentNodeSoTheElementReportsDetached() {
+        val f = Fixture("<html><body><div id='parent'><span id='child'>x</span></div></body></html>")
+        f.run("document.getElementById('child').remove();")
+        assertTrue("a removed element's parentNode must become null", f.eval("document.getElementById('child')") == JsNull)
+        // Re-fetch the node via a variable captured before removal.
+        val f2 = Fixture("<html><body><div id='parent'><span id='child'>x</span></div></body></html>")
+        f2.run("var c = document.getElementById('child'); c.remove();")
+        assertTrue(f2.eval("c.parentNode") == JsNull)
+    }
+
+    @Test fun innerHtmlResetDetachesTheOldChildrenParentPointers() {
+        val f = Fixture("<html><body><div id='d'><span id='old'>x</span></div></body></html>")
+        f.run("var old = document.getElementById('old'); document.getElementById('d').innerHTML = '<b>new</b>';")
+        assertTrue("a child removed by an innerHTML reset must report a null parentNode", f.eval("old.parentNode") == JsNull)
+    }
+
     @Test fun inlineOnclickSeesImplicitEventVariable() {
         val f = Fixture("<html><body><button id='btn' onclick='event.preventDefault();'>go</button></body></html>")
         var button: ElementNode? = null

@@ -294,7 +294,20 @@ class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObjec
         }
         "appendChild" -> NativeFunction("appendChild", 1) { interp, _, args ->
             val child = args.getOrNull(0) as? DomElement
-            if (child != null) {
+            // Guard the two cases real DOM rejects outright: appending a
+            // node to itself, or to one of its own descendants (which would
+            // make the appended node both an ancestor and a child of `node`
+            // - a cycle that would hang any tree walk).
+            if (child != null && child.node !== node && !isAncestor(child.node, node)) {
+                val oldParent = child.node.parent
+                if (oldParent != null && oldParent !== node) {
+                    // appendChild MOVES a node that's already attached elsewhere -
+                    // it must not be left listed as a child of its old parent too.
+                    oldParent.children.remove(child.node)
+                    bridge.notifyMutation(interp, oldParent, "childList")
+                } else if (oldParent === node) {
+                    node.children.remove(child.node)
+                }
                 child.node.parent = node
                 node.children.add(child.node)
                 bridge.notifyMutation(interp, node, "childList")
@@ -304,6 +317,7 @@ class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObjec
         "remove" -> NativeFunction("remove", 0) { interp, _, _ ->
             val parent = node.parent
             parent?.children?.remove(node)
+            node.parent = null
             if (parent != null) bridge.notifyMutation(interp, parent, "childList")
             JsUndefined
         }
@@ -345,6 +359,11 @@ class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObjec
     }
 
     private fun setInnerHtml(html: String) {
+        // Detach the old children properly - they may still be reachable
+        // from JS (a variable holding a node fetched before this reset), and
+        // must report a null parentNode/parentElement once they're gone
+        // rather than keep pointing at an element they're no longer inside.
+        for (old in node.children) old.parent = null
         node.children.clear()
         // Parse as a full document and pull the fragment back out of the implicit html>body>div wrapper.
         val doc = HtmlParser("<div>$html</div>").parse()
@@ -454,6 +473,16 @@ class DomDocument(private val root: ElementNode) : JsObject() {
         is TextNode -> n.text
         is ElementNode -> n.children.joinToString("") { collectTextStatic(it) }
     }
+}
+
+/** True if [maybeAncestor] is an ancestor of [node] (walking up `node.parent`). Used to reject cycle-forming appendChild calls. */
+private fun isAncestor(maybeAncestor: ElementNode, node: ElementNode): Boolean {
+    var current: ElementNode? = node.parent
+    while (current != null) {
+        if (current === maybeAncestor) return true
+        current = current.parent
+    }
+    return false
 }
 
 private val VOID_HTML_TAGS = setOf(
