@@ -124,7 +124,18 @@ class Tab(
     private val historyGenerations = ArrayList<Int>()
     private var documentGeneration = 0
     private var historyIndex = -1
-    private val executor = Executors.newSingleThreadExecutor()
+    // A custom, large-stack thread factory rather than the default ~1MB thread stack: page load
+    // runs HTML parsing, this hand-written tree-walking JS interpreter, style computation, and
+    // layout all recursively over the DOM, and real-world pages routinely produce either deep DOM
+    // nesting (framework-generated markup) or deeply recursive JS evaluation (minified bundles'
+    // long chained expressions) that a 1MB stack exhausts well before a real browser's JS engine
+    // would even notice - which used to surface as a StackOverflowError that escaped every `catch
+    // (e: Exception)` in this file (Error, not Exception) and silently killed this thread mid-load,
+    // leaving the tab stuck in TabState.Loading forever. DuckDuckGo's JS-free `/html/` results page
+    // never triggers either case, which is why it kept working while ordinary sites didn't.
+    private val executor = Executors.newSingleThreadExecutor { r ->
+        Thread(null, r, "tab-load", 32L * 1024 * 1024).apply { isDaemon = true }
+    }
     private val mainHandler = Handler(Looper.getMainLooper())
     /**
      * Set by [destroy]. Background work (network fetches, timers, the Service
@@ -743,7 +754,11 @@ class Tab(
                     relayout()
                     onStateChanged(TabState.Loaded(response.url, title))
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
+                // Throwable, not Exception: a StackOverflowError from deeply recursive real-world
+                // JS/DOM (see the executor's doc above) or any other Error must still resolve this
+                // tab out of TabState.Loading instead of silently killing this thread and leaving
+                // the page spinning forever.
                 postMain {
                     if (e is SSLException) {
                         onStateChanged(TabState.CertificateError(url, e.message ?: e.toString()))
@@ -894,8 +909,10 @@ class Tab(
             if (code.isNullOrBlank()) continue
             try {
                 interpreter.run(Parser(Lexer(code).tokenize()).parseProgram())
-            } catch (_: Exception) {
-                // A script that fails to parse or throws shouldn't take down the whole page.
+            } catch (_: Throwable) {
+                // A script that fails to parse or throws - including a StackOverflowError from
+                // deeply recursive real-world JS, an Error rather than an Exception - shouldn't
+                // take down the whole page; move on to the next script instead.
             }
         }
 
