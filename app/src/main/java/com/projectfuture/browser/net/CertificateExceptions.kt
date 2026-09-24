@@ -12,9 +12,14 @@ package com.projectfuture.browser.net
 object CertificateExceptions {
     private val allowedHosts = HashSet<String>()
 
-    fun isAllowed(host: String): Boolean = host in allowedHosts
+    // Hostnames are case-insensitive (DNS/RFC 4343); compare/store normalized so an exception
+    // recorded for one casing of a host (e.g. from a redirect or an address-bar typo) is still
+    // honored - and, just as importantly, so it stays scoped to that one host either way rather
+    // than silently failing to apply and re-prompting, or (if some other lookup ever normalized
+    // differently) drifting into matching a host it was never granted for.
+    fun isAllowed(host: String): Boolean = host.lowercase() in allowedHosts
 
     fun allow(host: String) {
-        allowedHosts.add(host)
+        allowedHosts.add(host.lowercase())
     }
 }

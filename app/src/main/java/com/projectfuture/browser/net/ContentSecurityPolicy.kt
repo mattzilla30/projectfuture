@@ -70,8 +70,10 @@ private fun matchesHostSource(source: String, target: Url): Boolean {
     val host = s.substringBefore("/")
     if (scheme != null && !scheme.equals(target.scheme, ignoreCase = true)) return false
     return if (host.startsWith("*.")) {
+        // CSP Level 3: a leading "*." wildcard source matches proper subdomains only -
+        // never the bare apex itself (`*.trusted.com` must not match `trusted.com`).
         val suffix = host.removePrefix("*.")
-        target.host.equals(suffix, ignoreCase = true) || target.host.endsWith(".$suffix", ignoreCase = true)
+        target.host.endsWith(".$suffix", ignoreCase = true)
     } else {
         target.host.equals(host, ignoreCase = true)
     }
