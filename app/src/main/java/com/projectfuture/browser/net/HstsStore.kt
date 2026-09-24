@@ -20,9 +20,10 @@ object HstsStore {
 
     @Synchronized
     fun isEnforced(host: String, nowMillis: Long = System.currentTimeMillis()): Boolean {
-        val entry = hosts[host] ?: return false
+        val key = host.lowercase()
+        val entry = hosts[key] ?: return false
         if (nowMillis >= entry.expiresAtMillis) {
-            hosts.remove(host)
+            hosts.remove(key)
             return false
         }
         return true
@@ -31,10 +32,11 @@ object HstsStore {
     @Synchronized
     fun record(host: String, headerValue: String, nowMillis: Long = System.currentTimeMillis()) {
         val maxAge = parseMaxAge(headerValue) ?: return
+        val key = host.lowercase()
         if (maxAge <= 0) {
-            hosts.remove(host) // max-age=0 means "forget this host was ever HSTS-enforced"
+            hosts.remove(key) // max-age=0 means "forget this host was ever HSTS-enforced"
         } else {
-            hosts[host] = Entry(nowMillis + maxAge * 1000)
+            hosts[key] = Entry(nowMillis + maxAge * 1000)
         }
     }
 

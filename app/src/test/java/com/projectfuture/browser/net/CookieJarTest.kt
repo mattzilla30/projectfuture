@@ -122,6 +122,29 @@ class CookieJarTest {
         assertTrue(!HstsStore.isEnforced("example.com", now))
     }
 
+    @Test fun hstsHostComparisonIsCaseInsensitive() {
+        // Hostnames are case-insensitive (RFC 4343). If the header arrived while the host was
+        // spelled one way (e.g. Url doesn't normalize case) a later plain-HTTP request spelled
+        // differently must still be upgraded - a mismatch here would silently let an insecure
+        // request go out to a host that HSTS was supposed to protect.
+        HstsStore.clear()
+        val now = 1_000_000L
+        HstsStore.record("Example.COM", "max-age=100", now)
+        assertTrue(HstsStore.isEnforced("example.com", now))
+        assertTrue(HstsStore.isEnforced("EXAMPLE.COM", now))
+    }
+
+    @Test fun hstsRejectsMalformedMaxAgeWithoutCrashingOrMisenforcing() {
+        HstsStore.clear()
+        val now = 1_000_000L
+        HstsStore.record("bad1.example.com", "includeSubDomains", now) // missing max-age
+        HstsStore.record("bad2.example.com", "max-age=notanumber", now) // non-numeric
+        HstsStore.record("bad3.example.com", "max-age=-5", now) // negative - not \d+, must not parse
+        assertTrue(!HstsStore.isEnforced("bad1.example.com", now))
+        assertTrue(!HstsStore.isEnforced("bad2.example.com", now))
+        assertTrue(!HstsStore.isEnforced("bad3.example.com", now))
+    }
+
     @Test fun cspAllowsEverythingWhenNoPolicyPresent() {
         val csp = ContentSecurityPolicy.parse(null)
         assertTrue(csp.allowsInlineScript())
@@ -141,7 +164,21 @@ class CookieJarTest {
         val page = Url.parse("https://example.com/")
         assertTrue(csp.allowsScriptSrc(page, Url.parse("https://cdn.example.com/lib.js")))
         assertTrue(csp.allowsScriptSrc(page, Url.parse("https://sub.trusted.com/lib.js")))
+        assertTrue(csp.allowsScriptSrc(page, Url.parse("https://a.b.trusted.com/lib.js"))) // multi-level subdomain
         assertTrue(!csp.allowsScriptSrc(page, Url.parse("https://untrusted.com/lib.js")))
+    }
+
+    @Test fun cspWildcardSourceDoesNotMatchBareApexPerSpec() {
+        // CSP Level 3's host-source matching algorithm: a leading "*." wildcard matches only
+        // proper subdomains of the given host, never the bare apex itself. `*.trusted.com` must
+        // NOT authorize a resource served directly from `trusted.com`.
+        val csp = ContentSecurityPolicy.parse("script-src *.trusted.com")
+        val page = Url.parse("https://example.com/")
+        assertTrue(!csp.allowsScriptSrc(page, Url.parse("https://trusted.com/lib.js")))
+        assertTrue(csp.allowsScriptSrc(page, Url.parse("https://sub.trusted.com/lib.js")))
+        // Also must not match an unrelated host that merely ends with the same suffix string.
+        assertTrue(!csp.allowsScriptSrc(page, Url.parse("https://nottrusted.com/lib.js")))
+        assertTrue(!csp.allowsScriptSrc(page, Url.parse("https://evil-trusted.com/lib.js")))
     }
 
     @Test fun cspUnsafeInlineAllowsInlineScriptsAndStyles() {
@@ -177,6 +214,16 @@ class CookieJarTest {
         CertificateExceptions.allow("bad-cert.example.com")
         assertTrue(CertificateExceptions.isAllowed("bad-cert.example.com"))
         assertTrue(!CertificateExceptions.isAllowed("other.example.com"))
+    }
+
+    @Test fun certificateExceptionsAreCaseInsensitive() {
+        // Url.host isn't case-normalized on parse, so the same host can reach allow()/isAllowed()
+        // spelled differently (typed in the address bar, or after a redirect). The exception must
+        // still be recognized for that host - and must still NOT bleed onto an unrelated host.
+        CertificateExceptions.allow("Bad-Cert-Case.example.com")
+        assertTrue(CertificateExceptions.isAllowed("bad-cert-case.example.com"))
+        assertTrue(CertificateExceptions.isAllowed("BAD-CERT-CASE.EXAMPLE.COM"))
+        assertTrue(!CertificateExceptions.isAllowed("other-case.example.com"))
     }
 
     @Test fun httpCacheServesFreshEntryAndDropsExpiredOne() {
