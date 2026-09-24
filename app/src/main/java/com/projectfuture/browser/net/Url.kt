@@ -238,6 +238,15 @@ data class Url(
             if (it is SSLSocket) {
                 Alpn.offer(it)
                 it.startHandshake()
+                // A host the user already chose to trust despite a certificate warning skips this too.
+                if (!CertificateExceptions.isAllowed(host)) {
+                    try {
+                        TlsHostname.requireMatch(host, it.session)
+                    } catch (e: Exception) {
+                        try { it.close() } catch (_: Exception) {}
+                        throw e
+                    }
+                }
             }
         }
     } else {

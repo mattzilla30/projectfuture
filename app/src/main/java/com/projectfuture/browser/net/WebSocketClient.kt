@@ -7,6 +7,7 @@ import java.net.Socket
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Base64
+import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 
 private const val WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -41,7 +42,10 @@ class WebSocketClient(private val url: Url) {
         Thread {
             try {
                 val sock: Socket = if (url.scheme == "wss") {
-                    SocketConnector.connect(url.host, url.port) { SSLSocketFactory.getDefault().createSocket() as Socket }
+                    (SocketConnector.connect(url.host, url.port) { SSLSocketFactory.getDefault().createSocket() as Socket } as SSLSocket).also {
+                        it.startHandshake()
+                        TlsHostname.requireMatch(url.host, it.session)
+                    }
                 } else {
                     SocketConnector.connect(url.host, url.port) { Socket() }
                 }
