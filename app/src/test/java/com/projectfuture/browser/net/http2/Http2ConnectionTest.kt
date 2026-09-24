@@ -4,9 +4,12 @@ import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -109,5 +112,247 @@ class Http2ConnectionTest {
         } finally {
             server.close()
         }
+    }
+
+    /**
+     * RFC 7540 6.2/6.10: END_HEADERS and END_STREAM are independent flags on a HEADERS frame - a
+     * response can declare "no DATA frames follow" (END_STREAM) while its own header block still
+     * isn't finished (no END_HEADERS) and needs one or more CONTINUATION frames to complete. A
+     * response with a body large/plentiful enough in headers to need CONTINUATION but with no body
+     * at all (e.g. a 204, or a HEAD response with a huge Set-Cookie fan-out) is exactly this shape.
+     */
+    @Test fun headersWithEndStreamButSplitAcrossContinuationStillYieldsTheFullResponse() {
+        val server = ServerSocket(0)
+        val serverDone = CountDownLatch(1)
+        Thread {
+            try {
+                val socket = server.accept()
+                val input = BufferedInputStream(socket.getInputStream())
+                val output = BufferedOutputStream(socket.getOutputStream())
+                val preface = ByteArray(HTTP2_CONNECTION_PREFACE.size)
+                var read = 0
+                while (read < preface.size) read += input.read(preface, read, preface.size - read)
+                // Consume the client's initial SETTINGS frame (and anything else) until its HEADERS arrives.
+                var clientStreamId = 1
+                while (true) {
+                    val frame = Http2FrameIO.readFrame(input)
+                    if (frame.type == FrameType.HEADERS) {
+                        clientStreamId = frame.streamId
+                        break
+                    }
+                }
+
+                val encoder = HpackEncoder()
+                val responseBlock = encoder.encode(
+                    listOf(
+                        HpackHeader(":status", "204"),
+                        HpackHeader("x-part-a", "a".repeat(50)),
+                        HpackHeader("x-part-b", "b".repeat(50))
+                    )
+                )
+                val splitAt = responseBlock.size / 2
+                val first = responseBlock.copyOfRange(0, splitAt)
+                val second = responseBlock.copyOfRange(splitAt, responseBlock.size)
+                // HEADERS: END_STREAM set (no body coming), END_HEADERS NOT set (block continues).
+                Http2FrameIO.writeFrame(output, Http2Frame(FrameType.HEADERS, FrameFlag.END_STREAM, clientStreamId, first))
+                output.flush()
+                // Give the client's reader thread a chance to (incorrectly, pre-fix) finish the
+                // stream here if it's going to - the CONTINUATION below arrives a moment later,
+                // the way a real network interleaving would, not atomically with the HEADERS frame.
+                Thread.sleep(50)
+                Http2FrameIO.writeFrame(output, Http2Frame(FrameType.CONTINUATION, FrameFlag.END_HEADERS, clientStreamId, second))
+                output.flush()
+            } catch (_: Exception) {
+                // Surfaced via the client-side assertions below.
+            } finally {
+                serverDone.countDown()
+            }
+        }.apply { isDaemon = true }.start()
+
+        try {
+            val socket = Socket("127.0.0.1", server.localPort)
+            val connection = Http2Connection(socket)
+            val response = connection.request(
+                listOf(
+                    HpackHeader(":method", "GET"), HpackHeader(":scheme", "http"),
+                    HpackHeader(":authority", "example.test"), HpackHeader(":path", "/no-body")
+                ),
+                body = null
+            )
+            assertEquals(204, response.statusCode)
+            assertEquals("a".repeat(50), response.headers.toMap()["x-part-a"])
+            assertEquals("b".repeat(50), response.headers.toMap()["x-part-b"])
+            assertEquals(0, response.body.size)
+        } finally {
+            serverDone.await(5, TimeUnit.SECONDS)
+            server.close()
+        }
+    }
+
+    /**
+     * RFC 7540 6.9.2: a SETTINGS frame changing SETTINGS_INITIAL_WINDOW_SIZE must adjust the
+     * flow-control window of every stream that's already open by the same delta, not just streams
+     * opened after the SETTINGS frame - it's a retroactive per-connection change, not a value only
+     * used the next time a stream starts.
+     *
+     * The stream here opens with the RFC-default window (65535) and immediately tries to send a
+     * 70000-byte body, so it necessarily stalls partway through, still open, with its per-stream
+     * window driven down near/at zero. A SETTINGS frame then raises SETTINGS_INITIAL_WINDOW_SIZE
+     * well above 65535 (plus a WINDOW_UPDATE to lift the separate connection-level window, which
+     * SETTINGS never touches per 6.9.2) - the request can only complete if that already-open
+     * stream's own window actually receives the (new - old) delta, not just future streams.
+     */
+    @Test fun settingsInitialWindowSizeChangeAdjustsAlreadyOpenStreams() {
+        val server = ServerSocket(0)
+        val bytesReceived = AtomicInteger(0)
+        val bodySize = 70000
+        Thread {
+            try {
+                val socket = server.accept()
+                val input = BufferedInputStream(socket.getInputStream())
+                val output = BufferedOutputStream(socket.getOutputStream())
+                val preface = ByteArray(HTTP2_CONNECTION_PREFACE.size)
+                var read = 0
+                while (read < preface.size) read += input.read(preface, read, preface.size - read)
+                Http2FrameIO.readFrame(input) // client's initial SETTINGS - left at the RFC default (65535).
+
+                val decoder = HpackDecoder()
+                var clientStreamId = 1
+                while (true) {
+                    val frame = Http2FrameIO.readFrame(input)
+                    when (frame.type) {
+                        FrameType.SETTINGS -> {}
+                        FrameType.HEADERS -> {
+                            clientStreamId = frame.streamId
+                            decoder.decode(Http2FrameIO.extractHeaderBlockFragment(frame.payload, frame.flags))
+                        }
+                        FrameType.DATA -> {
+                            bytesReceived.addAndGet(frame.payload.size)
+                            // Once the client has spent its whole initial 65535-byte window (the
+                            // stream is now genuinely stalled, mid-body, waiting), raise the window
+                            // for that already-open stream (SETTINGS) and the connection (WINDOW_UPDATE).
+                            if (bytesReceived.get() >= 65535 && bytesReceived.get() < bodySize) {
+                                Http2FrameIO.writeFrame(output, Http2Frame(FrameType.SETTINGS, 0, 0, Http2FrameIO.encodeSettings(listOf(SettingsId.INITIAL_WINDOW_SIZE to 200000))))
+                                Http2FrameIO.writeFrame(output, Http2Frame(FrameType.WINDOW_UPDATE, 0, 0, Http2FrameIO.encodeWindowUpdate(bodySize)))
+                                output.flush()
+                            }
+                        }
+                        else -> {}
+                    }
+                    if (bytesReceived.get() >= bodySize) break
+                }
+
+                val encoder = HpackEncoder()
+                val responseBlock = encoder.encode(listOf(HpackHeader(":status", "200")))
+                Http2FrameIO.writeFrame(output, Http2Frame(FrameType.HEADERS, FrameFlag.END_HEADERS or FrameFlag.END_STREAM, clientStreamId, responseBlock))
+                output.flush()
+            } catch (_: Exception) {
+                // Surfaced via the client-side assertions/timeout below.
+            }
+        }.apply { isDaemon = true }.start()
+
+        try {
+            val socket = Socket("127.0.0.1", server.localPort)
+            val connection = Http2Connection(socket)
+            val body = ByteArray(bodySize) { it.toByte() }
+            val response = connection.request(
+                listOf(
+                    HpackHeader(":method", "POST"), HpackHeader(":scheme", "http"),
+                    HpackHeader(":authority", "example.test"), HpackHeader(":path", "/upload")
+                ),
+                body = body
+            )
+            assertEquals(200, response.statusCode)
+            assertTrue("server should have received the full $bodySize-byte body once its already-open stream's window grew", bytesReceived.get() >= bodySize)
+        } finally {
+            server.close()
+        }
+    }
+
+    /**
+     * Reproduces the unsynchronized flow-control race directly: many threads concurrently spend a
+     * small, shared connection-level send window at once. Without windowLock serializing the
+     * "check room, then spend it" step, two threads can both see the same leftover window and each
+     * take a full share of it - so this asserts that repeated concurrent draws off the SAME shared
+     * budget never let the total drawn exceed what was actually available, however many times it's
+     * run back to back.
+     */
+    @Test fun concurrentBodyWritesNeverExceedTheSharedConnectionWindow() {
+        val server = ServerSocket(0)
+        val maxObservedOverGrant = AtomicInteger(0)
+        val threadCount = 8
+        Thread {
+            try {
+                val socket = server.accept()
+                val input = BufferedInputStream(socket.getInputStream())
+                val output = BufferedOutputStream(socket.getOutputStream())
+                val preface = ByteArray(HTTP2_CONNECTION_PREFACE.size)
+                var read = 0
+                while (read < preface.size) read += input.read(preface, read, preface.size - read)
+                Http2FrameIO.readFrame(input) // client's initial SETTINGS
+
+                val decoder = HpackDecoder()
+                // The connection-level send window starts at the RFC default, 65535, and this
+                // fixture never sends a single WINDOW_UPDATE - so no matter how many streams are
+                // multiplexed, total DATA bytes across all of them must never exceed 65535. Keep
+                // reading for a fixed window (rather than stopping once all `threadCount` HEADERS
+                // frames are seen) - DATA frames legitimately arrive staggered, some well after the
+                // last HEADERS, and stopping early would silently skip inspecting them.
+                var granted = 65535
+                socket.soTimeout = 3000
+                try {
+                    while (true) {
+                        val frame = Http2FrameIO.readFrame(input)
+                        when (frame.type) {
+                            FrameType.HEADERS -> decoder.decode(Http2FrameIO.extractHeaderBlockFragment(frame.payload, frame.flags))
+                            FrameType.DATA -> {
+                                granted -= frame.payload.size
+                                if (granted < 0) maxObservedOverGrant.set(maxOf(maxObservedOverGrant.get(), -granted))
+                            }
+                            else -> {}
+                        }
+                    }
+                } catch (_: java.net.SocketTimeoutException) {
+                    // Expected: no WINDOW_UPDATE is ever sent, so once every stream has stalled on
+                    // its share (or lack thereof) of the connection window, no more frames arrive.
+                }
+            } catch (_: Exception) {
+                // Surfaced via the client-side assertion below.
+            }
+        }.apply { isDaemon = true }.start()
+
+        try {
+            val socket = Socket("127.0.0.1", server.localPort)
+            val connection = Http2Connection(socket)
+            // A CyclicBarrier (rather than a thread pool's submit-and-hope) lines every thread up
+            // to call request() at effectively the same instant, maximizing the odds two threads'
+            // unsynchronized "check the shared window, then spend it" sequences actually overlap -
+            // the same way real concurrent multiplexed uploads (e.g. several form POSTs firing at
+            // once) would contend for the one connection-level window.
+            val barrier = java.util.concurrent.CyclicBarrier(threadCount)
+            val threads = (0 until threadCount).map { i ->
+                Thread {
+                    try {
+                        barrier.await(5, TimeUnit.SECONDS)
+                        connection.request(
+                            listOf(
+                                HpackHeader(":method", "POST"), HpackHeader(":scheme", "http"),
+                                HpackHeader(":authority", "example.test"), HpackHeader(":path", "/upload$i")
+                            ),
+                            ByteArray(16384) { it.toByte() }
+                        )
+                    } catch (_: Exception) {
+                        // The fixture never ACKs enough window for every stream's whole body, and
+                        // deliberately never grants more via WINDOW_UPDATE - a timeout here is
+                        // expected. Only the server-side accounting above is under test.
+                    }
+                }.apply { isDaemon = true }
+            }
+            threads.forEach { it.start() }
+            threads.forEach { it.join(15000) }
+        } finally {
+            server.close()
+        }
+        assertEquals("client sent more DATA bytes than the connection-level window ever granted", 0, maxObservedOverGrant.get())
     }
 }
