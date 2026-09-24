@@ -1048,7 +1048,7 @@ class Tab(
 
         installWebSocket(interpreter, pageRoot, baseUrl, ::afterAsyncWork)
         installIndexedDb(interpreter, pageRoot)
-        installWorker(interpreter, pageRoot, baseUrl)
+        installWorker(interpreter, pageRoot, baseUrl, ::afterAsyncWork)
         installServiceWorker(interpreter, pageRoot, baseUrl)
         installWebRTC(interpreter, pageRoot)
     }
@@ -1329,8 +1329,17 @@ class Tab(
      * way and become `null`, matching a real structured-clone
      * DataCloneError's spirit if not its exact behavior. No
      * `importScripts`, no nested Workers, no `SharedWorker`.
+     *
+     * The page's own `worker.onmessage`/`worker.onerror` run on the main
+     * thread with full DOM access, just like the `onmessage` handlers
+     * XHR/WebSocket already wire up - so, matching those, both call the
+     * same `afterAsyncWork` re-style/re-layout hook afterward in case the
+     * handler mutated the DOM. (This used to be missing entirely: a
+     * DOM mutation made from inside `worker.onmessage`/`onerror` would sit
+     * unlaid-out until some unrelated later trigger happened to call
+     * `relayout()`.)
      */
-    private fun installWorker(interpreter: Interpreter, pageRoot: ElementNode, baseUrl: Url) {
+    private fun installWorker(interpreter: Interpreter, pageRoot: ElementNode, baseUrl: Url, afterAsyncWork: () -> Unit) {
         fun cloneForThread(value: JsValue): JsValue = if (value is JsObject) {
             try { parseJsonToJsValue(jsonStringify(value)) } catch (_: Exception) { JsUndefined }
         } else {
@@ -1364,6 +1373,7 @@ class Tab(
                                 val event = JsObject()
                                 event.set("data", cloned)
                                 (obj.get("onmessage") as? JsFunction)?.call(interp, obj, listOf(event))
+                                afterAsyncWork()
                             }
                         }
                         JsUndefined
@@ -1382,7 +1392,10 @@ class Tab(
                                     // Worker), but it must still surface to the page via `onerror`
                                     // instead of vanishing silently - this used to just be swallowed.
                                     postMain {
-                                        if (currentDoc === pageRoot) (obj.get("onerror") as? JsFunction)?.call(interp, obj, listOf(makeError(e.message ?: "Worker error")))
+                                        if (currentDoc === pageRoot) {
+                                            (obj.get("onerror") as? JsFunction)?.call(interp, obj, listOf(makeError(e.message ?: "Worker error")))
+                                            afterAsyncWork()
+                                        }
                                     }
                                 }
                             }
@@ -1391,7 +1404,10 @@ class Tab(
                     }
                 } catch (e: Exception) {
                     postMain {
-                        if (currentDoc === pageRoot) (obj.get("onerror") as? JsFunction)?.call(interp, obj, listOf(makeError(e.message ?: "Worker error")))
+                        if (currentDoc === pageRoot) {
+                            (obj.get("onerror") as? JsFunction)?.call(interp, obj, listOf(makeError(e.message ?: "Worker error")))
+                            afterAsyncWork()
+                        }
                     }
                 }
             }.apply { isDaemon = true }.start()
