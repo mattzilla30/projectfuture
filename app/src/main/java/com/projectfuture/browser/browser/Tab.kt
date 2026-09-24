@@ -56,7 +56,9 @@ import com.projectfuture.browser.rtc.PeerConnectionCore
 import com.projectfuture.browser.rtc.RTCDataChannelCore
 import com.projectfuture.browser.rtc.SdpSession
 import java.io.File
+import java.util.concurrent.Callable
 import java.util.concurrent.Executors
+import java.util.concurrent.Future
 import javax.net.ssl.SSLException
 
 sealed class TabState {
@@ -82,6 +84,18 @@ private enum class HistoryAction { PUSH, NONE }
 private const val MOBILE_USER_AGENT = "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36"
 private const val DESKTOP_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 private const val DESKTOP_MEDIA_VIEWPORT_WIDTH = 1024f
+
+/**
+ * A page's subresources - stylesheets, `@font-face` files, `<img>`s - used to be fetched one at
+ * a time on [Tab]'s own serial `executor`, each paying its own full network round trip before the
+ * next one even started (see `collectAuthorCss`/`loadFontFaces`/`collectAndDecodeImages`'s docs).
+ * For a real page with several of each, that stacks into a genuinely slow, user-visible load time
+ * - real browsers fetch subresources concurrently instead. Shared (not one pool per [Tab]) and
+ * bounded to 6, matching the per-host parallel-connection limit real browsers use, so many tabs
+ * loading at once don't spawn an unbounded number of threads.
+ */
+private val subresourceExecutor: java.util.concurrent.ExecutorService =
+    Executors.newFixedThreadPool(6) { r -> Thread(r, "subresource-fetch").apply { isDaemon = true } }
 
 /**
  * Owns one page's lifecycle: fetch -> parse -> style -> layout, all off the
@@ -761,8 +775,8 @@ class Tab(
     }
 
     /**
-     * Fetches and decodes every `<img src>` up front (sequentially, on the
-     * background executor) before layout runs. Image *decoding* itself uses
+     * Fetches and decodes every `<img src>` up front (concurrently, on
+     * [subresourceExecutor]) before layout runs. Image *decoding* itself uses
      * Android's BitmapFactory - a platform media codec, the same boundary
      * already drawn for text glyph shaping - rather than a hand-written
      * JPEG/PNG/WebP decoder, which would each be a substantial project of
@@ -789,7 +803,7 @@ class Tab(
     }
 
     private fun collectAndDecodeImages(root: ElementNode, baseUrl: Url, csp: ContentSecurityPolicy): Map<ElementNode, Bitmap> {
-        val result = HashMap<ElementNode, Bitmap>()
+        val candidates = ArrayList<Pair<ElementNode, Url>>()
         root.walkElements { el ->
             if (el.tag == "img") {
                 val src = el.attr("src")
@@ -798,22 +812,36 @@ class Tab(
                     if (isMixedContent(baseUrl, imgUrl)) return@walkElements
                     if (!csp.allowsImgSrc(baseUrl, imgUrl)) return@walkElements
                     if (TrackingProtection.isBlocked(baseUrl, imgUrl)) return@walkElements
-                    try {
-                        val bytes = imgUrl.fetchBytes(allowCookies = !isPrivate).body
-                        // Decode bounds first (no pixel buffer allocated yet), then decode for
-                        // real with an inSampleSize chosen to bound the allocation - see
-                        // computeInSampleSize's doc for the OOM this avoids on a huge image.
-                        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-                        val options = BitmapFactory.Options().apply {
-                            inSampleSize = computeInSampleSize(bounds.outWidth, bounds.outHeight)
-                        }
-                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)?.let { result[el] = it }
-                    } catch (_: Exception) {
-                        // Broken/unreachable image: skip it rather than failing the whole page load.
-                    }
+                    candidates.add(el to imgUrl)
                 }
             }
+        }
+        // Fetch+decode every image concurrently instead of one at a time - see subresourceExecutor's
+        // doc for why serial fetching here was a real, user-visible page-load slowdown. Order doesn't
+        // matter for this result (a plain element->bitmap map), so futures are just awaited in
+        // whatever order they were submitted.
+        val futures: List<Pair<ElementNode, Future<Bitmap?>>> = candidates.map { (el, imgUrl) ->
+            el to subresourceExecutor.submit(Callable {
+                try {
+                    val bytes = imgUrl.fetchBytes(allowCookies = !isPrivate).body
+                    // Decode bounds first (no pixel buffer allocated yet), then decode for
+                    // real with an inSampleSize chosen to bound the allocation - see
+                    // computeInSampleSize's doc for the OOM this avoids on a huge image.
+                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                    val options = BitmapFactory.Options().apply {
+                        inSampleSize = computeInSampleSize(bounds.outWidth, bounds.outHeight)
+                    }
+                    BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)
+                } catch (_: Exception) {
+                    // Broken/unreachable image: skip it rather than failing the whole page load.
+                    null
+                }
+            })
+        }
+        val result = HashMap<ElementNode, Bitmap>()
+        for ((el, future) in futures) {
+            future.get()?.let { result[el] = it }
         }
         return result
     }
@@ -1724,6 +1752,15 @@ class Tab(
 
     private class AuthorCss(val rules: List<CssRule>, val fontFaces: List<Pair<FontFaceRule, Url>>)
 
+    private class PendingCssSource(val inlineText: String?, val future: Future<String?>?, val base: Url)
+
+    /**
+     * External stylesheets are now fetched concurrently (see [subresourceExecutor]'s doc), but the
+     * cascade is order-sensitive - a later rule of equal specificity must still win over an earlier
+     * one - so the document-order work list is built up front and [PendingCssSource.future]s are
+     * only awaited afterward, in that original order, not in whatever order the network happens to
+     * finish them.
+     */
     private fun collectAuthorCss(root: ElementNode, baseUrl: Url, viewportWidth: Float, csp: ContentSecurityPolicy): AuthorCss {
         val rules = ArrayList<CssRule>()
         val fontFaces = ArrayList<Pair<FontFaceRule, Url>>()
@@ -1735,12 +1772,13 @@ class Tab(
             }
         }
 
+        val sources = ArrayList<PendingCssSource>()
         root.walkElements { el ->
             when {
                 el.tag == "style" -> {
                     if (csp.allowsInlineStyle()) {
                         val text = el.children.filterIsInstance<TextNode>().joinToString("") { it.text }
-                        harvest(CssParser(text, viewportWidth), baseUrl)
+                        sources.add(PendingCssSource(text, null, baseUrl))
                     }
                 }
                 el.tag == "link" && el.attr("rel")?.lowercase()?.contains("stylesheet") == true -> {
@@ -1748,17 +1786,20 @@ class Tab(
                     if (href != null) {
                         val styleSheetUrl = baseUrl.resolve(href)
                         if (!isMixedContent(baseUrl, styleSheetUrl) && csp.allowsStyleSrc(baseUrl, styleSheetUrl) && !TrackingProtection.isBlocked(baseUrl, styleSheetUrl)) {
-                            try {
-                                val response = styleSheetUrl.fetch(allowCookies = !isPrivate)
-                                // url()s inside an external stylesheet resolve against ITS location, not the page's.
-                                harvest(CssParser(response.body, viewportWidth), styleSheetUrl)
-                            } catch (_: Exception) {
-                                // A failed stylesheet fetch shouldn't block the page from rendering.
-                            }
+                            val future = subresourceExecutor.submit(Callable {
+                                try { styleSheetUrl.fetch(allowCookies = !isPrivate).body } catch (_: Exception) { null }
+                            })
+                            sources.add(PendingCssSource(null, future, styleSheetUrl))
                         }
                     }
                 }
             }
+        }
+
+        for (source in sources) {
+            val text = source.inlineText ?: source.future?.get() ?: continue
+            // url()s inside an external stylesheet resolve against ITS location, not the page's.
+            harvest(CssParser(text, viewportWidth), source.base)
         }
         return AuthorCss(rules, fontFaces)
     }
@@ -1772,20 +1813,36 @@ class Tab(
      * (e.g. bold/italic variants declared separately) are ignored, and
      * FontCache synthesizes bold/italic from whichever one loaded.
      */
+    private class PendingFont(val family: String, val future: Future<ByteArray?>?)
+
+    /**
+     * Font files are now fetched concurrently (see [subresourceExecutor]'s doc), but "the first
+     * successfully loaded font for a given family wins" is still resolved sequentially afterward,
+     * in the original entries order, so that guarantee holds regardless of which network fetch
+     * happens to finish first.
+     */
     private fun loadFontFaces(entries: List<Pair<FontFaceRule, Url>>, pageUrl: Url, csp: ContentSecurityPolicy): Map<String, Typeface> {
-        val result = HashMap<String, Typeface>()
-        for ((rule, styleSheetBase) in entries) {
-            val key = rule.family.lowercase()
-            if (result.containsKey(key)) continue
+        val pending = entries.map { (rule, styleSheetBase) ->
             val fontUrl = styleSheetBase.resolve(rule.srcUrl)
-            if (isMixedContent(pageUrl, fontUrl) || !csp.allowsFontSrc(pageUrl, fontUrl) || TrackingProtection.isBlocked(pageUrl, fontUrl)) continue
+            val future = if (isMixedContent(pageUrl, fontUrl) || !csp.allowsFontSrc(pageUrl, fontUrl) || TrackingProtection.isBlocked(pageUrl, fontUrl)) {
+                null
+            } else {
+                subresourceExecutor.submit(Callable {
+                    try { fontUrl.fetchBytes(allowCookies = !isPrivate).body } catch (_: Exception) { null }
+                })
+            }
+            PendingFont(rule.family.lowercase(), future)
+        }
+        val result = HashMap<String, Typeface>()
+        for (p in pending) {
+            if (result.containsKey(p.family)) continue
+            val bytes = p.future?.get() ?: continue
             try {
-                val bytes = fontUrl.fetchBytes(allowCookies = !isPrivate).body
                 val sfnt = FontDecoder.toSfnt(bytes) ?: continue
                 val tempFile = File.createTempFile("font", ".ttf", context.cacheDir)
                 try {
                     tempFile.writeBytes(sfnt)
-                    result[key] = Typeface.createFromFile(tempFile)
+                    result[p.family] = Typeface.createFromFile(tempFile)
                 } finally {
                     tempFile.delete()
                 }
