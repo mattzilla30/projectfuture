@@ -2,7 +2,7 @@ package com.projectfuture.browser.css
 
 enum class FlexDirection { ROW, ROW_REVERSE, COLUMN, COLUMN_REVERSE }
 enum class FlexWrapMode { NOWRAP, WRAP }
-enum class JustifyContent { FLEX_START, FLEX_END, CENTER, SPACE_BETWEEN, SPACE_AROUND }
+enum class JustifyContent { FLEX_START, FLEX_END, CENTER, SPACE_BETWEEN, SPACE_AROUND, SPACE_EVENLY }
 enum class AlignItems { STRETCH, FLEX_START, FLEX_END, CENTER }
 
 data class FlexContainerProps(
@@ -40,7 +40,8 @@ fun resolveFlexContainerProps(style: Map<String, String>, containingWidth: Float
         "flex-end", "end" -> JustifyContent.FLEX_END
         "center" -> JustifyContent.CENTER
         "space-between" -> JustifyContent.SPACE_BETWEEN
-        "space-around", "space-evenly" -> JustifyContent.SPACE_AROUND
+        "space-around" -> JustifyContent.SPACE_AROUND
+        "space-evenly" -> JustifyContent.SPACE_EVENLY
         else -> JustifyContent.FLEX_START
     }
     val alignItems = parseAlign(style["align-items"]) ?: AlignItems.STRETCH

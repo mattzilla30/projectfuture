@@ -160,6 +160,37 @@ data class FloatBox(val left: Float, val right: Float, val top: Float, val botto
  */
 private var currentImages: Map<ElementNode, Bitmap> = emptyMap()
 
+/**
+ * Pure sizing math for `<img>`/`<svg>`/`<canvas>` (extracted from
+ * [BlockLayout.addImage] so it's testable without an android.graphics.Bitmap,
+ * which plain JVM unit tests can't construct): explicit CSS width/height win;
+ * if only one axis is set, the other scales to preserve aspect ratio; with
+ * neither set, the intrinsic pixel size is used directly. `cssHeight` must
+ * already be null for an unresolvable (e.g. percentage) height - passing a
+ * literal 0 there instead would collapse the image to zero height rather
+ * than falling back sensibly.
+ */
+internal fun resolveImageSize(cssWidth: Float?, cssHeight: Float?, intrinsicW: Float, intrinsicH: Float): Pair<Float, Float> =
+    when {
+        cssWidth != null && cssHeight != null -> cssWidth to cssHeight
+        cssWidth != null -> cssWidth to (intrinsicH * (cssWidth / intrinsicW))
+        cssHeight != null -> (intrinsicW * (cssHeight / intrinsicH)) to cssHeight
+        else -> intrinsicW to intrinsicH
+    }
+
+/**
+ * Resolves an `<img>`'s CSS `height` for [resolveImageSize]. A percentage
+ * has no definite containing height to resolve against in this single-pass
+ * layout, so it must come back null (unresolved, falls back to intrinsic/
+ * aspect-ratio sizing) rather than being resolved against a fake 0 base -
+ * which used to silently collapse the image to zero height instead.
+ */
+internal fun resolveCssImageHeight(raw: String?, fontSizePx: Float): Float? {
+    if (raw == null) return null
+    if (raw.trim().endsWith("%")) return null
+    return lengthValue(raw, 0f, fontSizePx)
+}
+
 class DocumentLayout(private val root: ElementNode) {
     var width = 0f
         private set
@@ -551,10 +582,17 @@ class BlockLayout(
                 JustifyContent.FLEX_START -> {}
                 JustifyContent.FLEX_END -> cursorMainX += remaining
                 JustifyContent.CENTER -> cursorMainX += remaining / 2
-                JustifyContent.SPACE_BETWEEN -> if (n > 1) betweenExtra = remaining / (n - 1) else cursorMainX += remaining / 2
+                // With a single item there's nothing to put "between", so per spec it's
+                // flush with the main-start edge (flex-start), not centered.
+                JustifyContent.SPACE_BETWEEN -> if (n > 1) betweenExtra = remaining / (n - 1)
                 JustifyContent.SPACE_AROUND -> {
                     val each = if (n > 0) remaining / n else 0f
                     cursorMainX += each / 2
+                    betweenExtra = each
+                }
+                JustifyContent.SPACE_EVENLY -> {
+                    val each = if (n > 0) remaining / (n + 1) else 0f
+                    cursorMainX += each
                     betweenExtra = each
                 }
             }
@@ -642,10 +680,17 @@ class BlockLayout(
             JustifyContent.FLEX_START -> {}
             JustifyContent.FLEX_END -> cursorMainY += remaining
             JustifyContent.CENTER -> cursorMainY += remaining / 2
-            JustifyContent.SPACE_BETWEEN -> if (n > 1) betweenExtra = remaining / (n - 1) else cursorMainY += remaining / 2
+            // With a single item there's nothing to put "between", so per spec it's
+            // flush with the main-start edge (flex-start), not centered.
+            JustifyContent.SPACE_BETWEEN -> if (n > 1) betweenExtra = remaining / (n - 1)
             JustifyContent.SPACE_AROUND -> {
                 val each = if (n > 0) remaining / n else 0f
                 cursorMainY += each / 2
+                betweenExtra = each
+            }
+            JustifyContent.SPACE_EVENLY -> {
+                val each = if (n > 0) remaining / (n + 1) else 0f
+                cursorMainY += each
                 betweenExtra = each
             }
         }
@@ -960,15 +1005,10 @@ class BlockLayout(
     private fun addImage(bitmap: Bitmap, node: ElementNode) {
         val fontSizePx = parsePx(node.style["font-size"]) ?: 16f
         val cssWidth = node.style["width"]?.let { lengthValue(it, width, fontSizePx) }
-        val cssHeight = node.style["height"]?.let { lengthValue(it, 0f, fontSizePx) }
+        val cssHeight = resolveCssImageHeight(node.style["height"], fontSizePx)
         val intrinsicW = bitmap.width.toFloat().coerceAtLeast(1f)
         val intrinsicH = bitmap.height.toFloat().coerceAtLeast(1f)
-        val (imgW, imgH) = when {
-            cssWidth != null && cssHeight != null -> cssWidth to cssHeight
-            cssWidth != null -> cssWidth to (intrinsicH * (cssWidth / intrinsicW))
-            cssHeight != null -> (intrinsicW * (cssHeight / intrinsicH)) to cssHeight
-            else -> intrinsicW to intrinsicH
-        }
+        val (imgW, imgH) = resolveImageSize(cssWidth, cssHeight, intrinsicW, intrinsicH)
         addFragment(ImageFragment(bitmap, imgW, imgH, node), imgW)
     }
 
