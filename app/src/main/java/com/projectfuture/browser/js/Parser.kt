@@ -48,8 +48,19 @@ class Parser(private val tokens: List<Token>) {
     private fun matchIdentText(text: String): Boolean { if (checkIdentText(text)) { advance(); return true }; return false }
 
     private fun expectPunct(text: String): Token {
-        if (!checkPunct(text)) throw jsError("Parse error: expected '$text' but found '${peek().text}'")
+        if (!checkPunct(text)) throw parseError("expected '$text' but found '${peek().text}'")
         return advance()
+    }
+
+    /** A parse error naming the tokens around the failure, so a log line shows which construct broke. */
+    private fun parseError(message: String): JsException {
+        val from = maxOf(0, pos - 8)
+        val near = (from..minOf(tokens.size - 1, pos + 3)).joinToString(" ") { i ->
+            val t = tokens[i]
+            val text = when (t.type) { TokenType.STRING -> "\"${t.text.take(20)}\""; TokenType.TEMPLATE -> "`...`"; TokenType.REGEX -> "/${t.text.take(20)}/"; TokenType.EOF -> "<end>"; else -> t.text }
+            if (i == pos) ">>$text<<" else text
+        }
+        return jsError("Parse error: $message near: $near")
     }
 
     private fun consumeSemicolon() {
@@ -68,8 +79,10 @@ class Parser(private val tokens: List<Token>) {
         if (checkIdentText("async") && peek(1).type == TokenType.KEYWORD && peek(1).text == "function") { advance(); return parseFunctionDecl(isAsync = true) }
         if (checkKeyword("function")) return parseFunctionDecl()
         if (checkKeyword("return")) return parseReturn()
-        if (checkKeyword("break")) { advance(); consumeSemicolon(); return BreakStmt }
-        if (checkKeyword("continue")) { advance(); consumeSemicolon(); return ContinueStmt }
+        // Labels are parsed but not tracked: `break label`/`continue label` act on the innermost loop.
+        if (checkKeyword("break")) { advance(); skipJumpLabel(); consumeSemicolon(); return BreakStmt }
+        if (checkKeyword("continue")) { advance(); skipJumpLabel(); consumeSemicolon(); return ContinueStmt }
+        if (check(TokenType.IDENT) && peek(1).type == TokenType.PUNCT && peek(1).text == ":") { advance(); advance(); return parseStatement() }
         if (checkKeyword("try")) return parseTry()
         if (checkKeyword("throw")) return parseThrow()
         if (checkIdentText("switch")) return parseSwitch()
@@ -78,6 +91,10 @@ class Parser(private val tokens: List<Token>) {
         val expr = parseExpression()
         consumeSemicolon()
         return ExprStmt(expr)
+    }
+
+    private fun skipJumpLabel() {
+        if (check(TokenType.IDENT) && !peek().newlineBefore) advance()
     }
 
     private fun parseBlock(): Block {
@@ -114,6 +131,9 @@ class Parser(private val tokens: List<Token>) {
     private fun parsePattern(): Pattern {
         if (checkPunct("[")) return parseArrayPattern()
         if (checkPunct("{")) return parseObjectPattern()
+        // Only a name can be bound. Accepting any token let `(()=>{...})()` be misread as an
+        // arrow function whose single parameter was named "(".
+        if (!check(TokenType.IDENT)) throw parseError("expected a binding name but found '${peek().text}'")
         return IdentifierPattern(advance().text)
     }
 
@@ -145,9 +165,18 @@ class Parser(private val tokens: List<Token>) {
     private fun parseObjectPattern(): Pattern {
         expectPunct("{")
         val props = ArrayList<Pair<String, Pattern>>()
+        val computedKeys = HashMap<Int, Expr>()
         var restName: String? = null
         while (!checkPunct("}")) {
             if (matchPunct("...")) { restName = advance().text; break }
+            if (matchPunct("[")) {
+                computedKeys[props.size] = parseAssignment()
+                expectPunct("]")
+                expectPunct(":")
+                props.add("" to parsePatternWithDefault())
+                if (!matchPunct(",")) break
+                continue
+            }
             val key = advance().text
             val pattern = if (matchPunct(":")) {
                 parsePatternWithDefault()
@@ -159,7 +188,7 @@ class Parser(private val tokens: List<Token>) {
             if (!matchPunct(",")) break
         }
         expectPunct("}")
-        return ObjectPattern(props, restName)
+        return ObjectPattern(props, restName, computedKeys = computedKeys)
     }
 
     private fun parseIf(): Stmt {
@@ -193,6 +222,7 @@ class Parser(private val tokens: List<Token>) {
 
     private fun parseFor(): Stmt {
         advance()
+        matchIdentText("await") // `for await (... of ...)`: iterated like `for...of`, values are not awaited
         expectPunct("(")
 
         var declKind: String? = null
@@ -203,7 +233,7 @@ class Parser(private val tokens: List<Token>) {
                 declKind = peek().text
                 advance()
                 val firstPattern = parsePattern()
-                if (checkKeyword("in") || checkKeyword("of")) {
+                if (checkKeyword("in") || checkIdentText("of")) {
                     return finishForInOf(declKind, firstPattern)
                 }
                 val init = if (matchPunct("=")) parseAssignment() else null
@@ -214,9 +244,12 @@ class Parser(private val tokens: List<Token>) {
                     decls.add(p to i)
                 }
                 initStmt = VarDecl(declKind, decls)
+            } else if (check(TokenType.IDENT) && ((peek(1).type == TokenType.KEYWORD && peek(1).text == "in") || peek(1).text == "of")) {
+                // `for (key in obj)` with an existing variable: parsed here, before `key in obj` could be read as an `in` comparison.
+                return finishForInOf(null, IdentifierPattern(advance().text))
             } else {
                 val expr = parseExpression()
-                if (checkKeyword("in") || checkKeyword("of")) {
+                if (checkKeyword("in") || checkIdentText("of")) {
                     val name = (expr as? Identifier)?.name ?: throw jsError("Parse error: invalid for-in/of target")
                     return finishForInOf(null, IdentifierPattern(name))
                 }
@@ -232,7 +265,7 @@ class Parser(private val tokens: List<Token>) {
     }
 
     private fun finishForInOf(declKind: String?, pattern: Pattern): Stmt {
-        val isOf = checkKeyword("of")
+        val isOf = checkIdentText("of")
         advance() // 'in' or 'of'
         val obj = parseExpression()
         expectPunct(")")
@@ -258,7 +291,7 @@ class Parser(private val tokens: List<Token>) {
                     break // a rest parameter must be last
                 }
                 params.add(Param(parsePatternWithDefault()))
-                if (!matchPunct(",")) break
+                if (!matchPunct(",") || checkPunct(")")) break
             }
         }
         expectPunct(")")
@@ -312,7 +345,7 @@ class Parser(private val tokens: List<Token>) {
                 test = null
                 expectPunct(":")
             } else {
-                throw jsError("Parse error: expected 'case' or 'default' in switch body, found '${peek().text}'")
+                throw parseError("expected 'case' or 'default' in switch body, found '${peek().text}'")
             }
             val body = ArrayList<Stmt>()
             while (!checkIdentText("case") && !checkIdentText("default") && !checkPunct("}")) body.add(parseStatement())
@@ -332,13 +365,49 @@ class Parser(private val tokens: List<Token>) {
     private fun parseClassDecl(): Stmt {
         advance() // 'class'
         val name = advance().text
+        val tail = parseClassTail()
+        return ClassDecl(name, tail.superClass, tail.methods, tail.staticFields)
+    }
+
+    private fun parseClassExpr(): Expr {
+        advance() // 'class'
+        val name = if (check(TokenType.IDENT) && peek().text != "extends") advance().text else null
+        val tail = parseClassTail()
+        return ClassExpr(name, tail.superClass, tail.methods, tail.staticFields)
+    }
+
+    private class ClassTail(val superClass: Expr?, val methods: List<MethodDef>, val staticFields: List<FieldDef>)
+
+    /** A class member name: identifier, keyword, string, number, `#private`, or a computed key this engine can resolve statically (null if it can't). */
+    private fun parseClassMemberName(): String? {
+        if (!matchPunct("[")) return advance().text
+        val key = parseAssignment()
+        expectPunct("]")
+        return when {
+            key is StringLit -> key.value
+            key is Member && key.obj == Identifier("Symbol") && key.property == StringLit("iterator") -> WELL_KNOWN_SYMBOL_ITERATOR.internalKey
+            else -> null
+        }
+    }
+
+    /**
+     * Everything after the class name: `extends`, methods, accessors, and fields. Instance fields
+     * are folded into the constructor (right after its `super(...)` call in a derived class), which
+     * is when real JS initializes them; static fields are kept for the interpreter to evaluate.
+     */
+    private fun parseClassTail(): ClassTail {
         val superClass: Expr? = if (matchIdentText("extends")) parseCallMember() else null
         expectPunct("{")
         val methods = ArrayList<MethodDef>()
+        val instanceFields = ArrayList<FieldDef>()
+        val staticFields = ArrayList<FieldDef>()
+        fun endsMemberName(offset: Int) = peek(offset).type == TokenType.PUNCT && peek(offset).text in setOf("(", "=", ";", "}")
         while (!checkPunct("}")) {
             if (matchPunct(";")) continue
-            val isStatic = matchIdentText("static")
-            val isAsyncMethod = checkIdentText("async") && !(peek(1).type == TokenType.PUNCT && peek(1).text == "(")
+            val isStatic = checkIdentText("static") && !endsMemberName(1)
+            if (isStatic) advance()
+            if (isStatic && checkPunct("{")) { parseBlock(); continue } // static initialization block: parsed, not run
+            val isAsyncMethod = checkIdentText("async") && !endsMemberName(1) && !peek(1).newlineBefore
             if (isAsyncMethod) advance()
             val isGeneratorMethod = matchPunct("*")
             val kind = if (looksLikeAccessorPrefix()) {
@@ -346,13 +415,46 @@ class Parser(private val tokens: List<Token>) {
             } else {
                 MethodKind.NORMAL
             }
-            val methodName = advance().text
-            val params = parseParamList()
-            val body = parseBlockStatements()
-            methods.add(MethodDef(methodName, params, body, isStatic, kind, isGeneratorMethod, isAsyncMethod))
+            val name = parseClassMemberName()
+            if (checkPunct("(")) {
+                val params = parseParamList()
+                val body = parseBlockStatements()
+                if (name != null) methods.add(MethodDef(name, params, body, isStatic, kind, isGeneratorMethod, isAsyncMethod))
+            } else {
+                val value = if (matchPunct("=")) parseAssignment() else null
+                consumeSemicolon()
+                if (name != null) (if (isStatic) staticFields else instanceFields).add(FieldDef(name, value))
+            }
         }
         expectPunct("}")
-        return ClassDecl(name, superClass, methods)
+        if (instanceFields.isNotEmpty()) addFieldInitializers(methods, instanceFields, derived = superClass != null)
+        return ClassTail(superClass, methods, staticFields)
+    }
+
+    private fun addFieldInitializers(methods: MutableList<MethodDef>, fields: List<FieldDef>, derived: Boolean) {
+        val inits = fields.map { ExprStmt(Assign("=", Member(ThisExpr, StringLit(it.name), computed = false), it.value ?: UndefinedLit)) }
+        val index = methods.indexOfFirst { it.name == "constructor" && !it.isStatic }
+        if (index >= 0) {
+            val ctor = methods[index]
+            val superCall = if (derived) ctor.body.indexOfFirst { isSuperCall(it) } else -1
+            val body = if (superCall >= 0) {
+                ctor.body.subList(0, superCall + 1) + inits + ctor.body.subList(superCall + 1, ctor.body.size)
+            } else {
+                inits + ctor.body
+            }
+            methods[index] = ctor.copy(body = body)
+        } else if (derived) {
+            val superCall = ExprStmt(Call(SuperExpr, listOf(SpreadElement(Identifier("args")))))
+            methods.add(MethodDef("constructor", listOf(Param(IdentifierPattern("args"), rest = true)), listOf(superCall) + inits, isStatic = false))
+        } else {
+            methods.add(MethodDef("constructor", emptyList(), inits, isStatic = false))
+        }
+    }
+
+    private fun isSuperCall(stmt: Stmt): Boolean {
+        val expr = (stmt as? ExprStmt)?.expr ?: return false
+        val first = if (expr is Sequence) expr.expressions.first() else expr
+        return first is Call && first.callee is SuperExpr
     }
 
     // ---- expressions (precedence climbing, low to high) ----
@@ -367,7 +469,7 @@ class Parser(private val tokens: List<Token>) {
 
     // Matches Lexer.kt's `multiCharPuncts`: every compound-assignment punctuator the lexer tokenizes
     // as a single token must be recognized here too, or valid JS using it fails to parse.
-    private val assignOps = setOf("=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "**=", ">>>=")
+    private val assignOps = setOf("=", "+=", "-=", "*=", "/=", "%=", "&=", "|=", "^=", "**=", ">>>=", "<<=", ">>=", "&&=", "||=", "??=")
 
     private fun parseAssignment(): Expr {
         if (checkIdentText("yield")) return parseYield()
@@ -416,29 +518,32 @@ class Parser(private val tokens: List<Token>) {
             // not to be followed by "=>", this was some other parenthesized expression (e.g. a
             // destructuring assignment `([a,b] = arr)`), so any parse error here just means
             // "not an arrow function", not a real syntax error - caught and backtracked below.
+            // Only the parameter list is speculative. The body is parsed after the `try`, so an
+            // error inside an arrow's body is reported as itself instead of being swallowed here
+            // and resurfacing as a misleading "unexpected token '=>'".
+            var params: List<Param>? = null
             try {
                 advance()
-                val params = ArrayList<Param>()
+                val parsed = ArrayList<Param>()
                 if (!checkPunct(")")) {
                     while (true) {
                         if (matchPunct("...")) {
-                            params.add(Param(IdentifierPattern(advance().text), rest = true))
+                            parsed.add(Param(parsePattern(), rest = true))
                             break
                         }
-                        params.add(Param(parsePatternWithDefault()))
-                        if (!matchPunct(",")) break
+                        parsed.add(Param(parsePatternWithDefault()))
+                        if (!matchPunct(",") || checkPunct(")")) break
                     }
                 }
-                if (checkPunct(")")) {
+                if (checkPunct(")") && peek(1).type == TokenType.PUNCT && peek(1).text == "=>") {
                     advance()
-                    if (checkPunct("=>")) {
-                        advance()
-                        return finishArrow(params, isAsync)
-                    }
+                    advance()
+                    params = parsed
                 }
             } catch (_: Exception) {
-                // Fall through to backtrack - wasn't an arrow function parameter list after all.
+                // Not an arrow function parameter list after all.
             }
+            if (params != null) return finishArrow(params, isAsync)
             pos = saved
         }
         pos = startPos // not an arrow function (async or otherwise) after all - let 'async' parse normally
@@ -583,19 +688,39 @@ class Parser(private val tokens: List<Token>) {
 
     private fun parseCallMember(): Expr {
         var expr = if (matchKeyword("new")) parseNewExpr() else parsePrimary()
+        var optionalChain = false
         while (true) {
             expr = when {
                 matchPunct(".") -> Member(expr, StringLit(advance().text), computed = false)
+                matchPunct("?.") -> {
+                    optionalChain = true
+                    when {
+                        checkPunct("(") -> Call(expr, parseArgs(), optional = true)
+                        matchPunct("[") -> {
+                            val prop = parseExpression()
+                            expectPunct("]")
+                            Member(expr, prop, computed = true, optional = true)
+                        }
+                        else -> Member(expr, StringLit(advance().text), computed = false, optional = true)
+                    }
+                }
                 matchPunct("[") -> {
                     val prop = parseExpression()
                     expectPunct("]")
                     Member(expr, prop, computed = true)
                 }
                 checkPunct("(") -> Call(expr, parseArgs())
-                else -> return expr
+                // Tagged template: ``tag`a${x}b` `` calls tag(["a", "b"], x).
+                check(TokenType.TEMPLATE) -> {
+                    val tok = advance()
+                    Call(expr, listOf(TemplateStrings(tok.templateParts)) + parseTemplateExprs(tok))
+                }
+                else -> return if (optionalChain) OptionalChain(expr) else expr
             }
         }
     }
+
+    private fun parseTemplateExprs(tok: Token): List<Expr> = tok.templateExprs.map { src -> Parser(Lexer(src).tokenize()).parseExpression() }
 
     private fun parseNewExpr(): Expr {
         val callee = parseCallMemberNoCallForNew()
@@ -626,7 +751,7 @@ class Parser(private val tokens: List<Token>) {
         if (!checkPunct(")")) {
             while (true) {
                 args.add(if (matchPunct("...")) SpreadElement(parseAssignment()) else parseAssignment())
-                if (!matchPunct(",")) break
+                if (!matchPunct(",") || checkPunct(")")) break // `f(a, b,)` allows a trailing comma
             }
         }
         expectPunct(")")
@@ -640,12 +765,12 @@ class Parser(private val tokens: List<Token>) {
             TokenType.STRING -> { advance(); return StringLit(tok.text) }
             TokenType.TEMPLATE -> {
                 advance()
-                val exprs = tok.templateExprs.map { src -> Parser(Lexer(src).tokenize()).parseExpression() }
-                return TemplateLit(tok.templateParts, exprs)
+                return TemplateLit(tok.templateParts, parseTemplateExprs(tok))
             }
             TokenType.REGEX -> { advance(); return RegexLit(tok.text, tok.regexFlags) }
             TokenType.IDENT -> {
                 if (tok.text == "super") { advance(); return SuperExpr }
+                if (tok.text == "class") return parseClassExpr()
                 if (tok.text == "async" && peek(1).type == TokenType.KEYWORD && peek(1).text == "function" && !peek(1).newlineBefore) {
                     advance() // 'async'
                     return parseFunctionExpr(isAsync = true)
@@ -677,7 +802,7 @@ class Parser(private val tokens: List<Token>) {
             }
             TokenType.EOF -> {}
         }
-        throw jsError("Parse error: unexpected token '${tok.text}'")
+        throw parseError("unexpected token '${tok.text}'")
     }
 
     private fun parseFunctionExpr(isAsync: Boolean = false): Expr {
@@ -693,6 +818,7 @@ class Parser(private val tokens: List<Token>) {
         expectPunct("[")
         val elements = ArrayList<Expr>()
         while (!checkPunct("]")) {
+            if (matchPunct(",")) { elements.add(UndefinedLit); continue } // a hole: `[1, , 3]`
             elements.add(if (matchPunct("...")) SpreadElement(parseAssignment()) else parseAssignment())
             if (!matchPunct(",")) break
         }

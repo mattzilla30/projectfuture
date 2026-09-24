@@ -145,16 +145,21 @@ class Interpreter {
     }
 
     private fun execClassDecl(stmt: ClassDecl, env: Environment) {
-        val superFn = stmt.superClass?.let { evalExpr(it, env) as? JsFunction }
-        val ctor = stmt.methods.firstOrNull { it.name == "constructor" && !it.isStatic }
-        val instanceMethods = stmt.methods.filter { !it.isStatic && it.name != "constructor" }
-        val staticMethods = stmt.methods.filter { it.isStatic }
+        env.declare(stmt.name, buildClass(stmt.name, stmt.superClass, stmt.methods, stmt.staticFields, env))
+    }
+
+    /** Shared by class declarations and class expressions. */
+    private fun buildClass(name: String, superClass: Expr?, methods: List<MethodDef>, staticFields: List<FieldDef>, env: Environment): ClassConstructor {
+        val superFn = superClass?.let { evalExpr(it, env) as? JsFunction }
+        val ctor = methods.firstOrNull { it.name == "constructor" && !it.isStatic }
+        val instanceMethods = methods.filter { !it.isStatic && it.name != "constructor" }
+        val staticMethods = methods.filter { it.isStatic }
         // A dedicated environment layer between the class body and its declaration site, holding
         // `__superclassctor__` so instance/static method closures (not just the constructor, which
         // used to declare it only in its own per-call env) can resolve `super`/`super.method()` too.
         val classBodyEnv = Environment(env)
         superFn?.let { classBodyEnv.declare("__superclassctor__", it) }
-        val classFn = ClassConstructor(stmt.name, superFn, ctor?.params, ctor?.body, instanceMethods, classBodyEnv)
+        val classFn = ClassConstructor(name, superFn, ctor?.params, ctor?.body, instanceMethods, classBodyEnv)
         for (m in staticMethods) {
             val fn = Closure(m.name, m.params, m.body, classBodyEnv, isArrow = false, isGenerator = m.isGenerator, isAsync = m.isAsync)
             when (m.kind) {
@@ -163,7 +168,11 @@ class Interpreter {
                 MethodKind.NORMAL -> classFn.set(m.name, fn)
             }
         }
-        env.declare(stmt.name, classFn)
+        if (staticFields.isNotEmpty()) {
+            val staticEnv = Environment(classBodyEnv).also { it.declare("this", classFn) }
+            for (field in staticFields) classFn.set(field.name, field.value?.let { evalExpr(it, staticEnv) } ?: JsUndefined)
+        }
+        return classFn
     }
 
     /**
@@ -295,7 +304,16 @@ class Interpreter {
         }
         is Call -> evalCall(expr, env)
         is New -> evalNew(expr, env)
-        is Member -> memberKey(expr, env).let { getProperty(evalExpr(expr.obj, env), it) }
+        is Member -> {
+            val obj = evalExpr(expr.obj, env)
+            if (expr.optional && (obj == JsNull || obj == JsUndefined)) throw OptionalShortCircuit
+            getProperty(obj, memberKey(expr, env))
+        }
+        is OptionalChain -> try { evalExpr(expr.expression, env) } catch (_: OptionalShortCircuit) { JsUndefined }
+        is TemplateStrings -> JsArray(expr.parts.map { JsString(it) as JsValue }.toMutableList()).also { strings ->
+            strings.set("raw", JsArray(expr.parts.map { JsString(it) as JsValue }.toMutableList()))
+        }
+        is ClassExpr -> buildClass(expr.name ?: "", expr.superClass, expr.methods, expr.staticFields, env)
         is FunctionExpr -> {
             val capturedThis = if (expr.isArrow && env.has("this")) env.get("this") else null
             Closure(expr.name ?: "", expr.params, expr.body, env, expr.isArrow, capturedThis, isGenerator = expr.isGenerator, isAsync = expr.isAsync)
@@ -387,8 +405,10 @@ class Interpreter {
 
     private fun evalCall(expr: Call, env: Environment): JsValue {
         if (expr.callee is SuperExpr) {
-            val superFn = env.get("__superclassctor__") as? JsFunction
-                ?: throw jsError("'super' keyword is only valid inside a derived class's constructor")
+            // A class extending a built-in this engine can't call as a constructor (`extends Object`,
+            // `extends HTMLElement`) records no superclass constructor; its `super(...)` does nothing.
+            val superFn = (if (env.has("__superclassctor__")) env.get("__superclassctor__") else null) as? JsFunction
+                ?: run { evalArgs(expr.args, env); return JsUndefined }
             return superFn.call(this, env.get("this"), evalArgs(expr.args, env))
         }
         if (expr.callee is Member && expr.callee.obj is SuperExpr) {
@@ -407,7 +427,12 @@ class Interpreter {
         }
         if (expr.callee is Member) {
             val obj = evalExpr(expr.callee.obj, env)
+            if (expr.callee.optional && (obj == JsNull || obj == JsUndefined)) throw OptionalShortCircuit
             val key = memberKey(expr.callee, env)
+            if (expr.optional) {
+                val candidate = getProperty(obj, key)
+                if (candidate == JsNull || candidate == JsUndefined) throw OptionalShortCircuit
+            }
             val args = evalArgs(expr.args, env)
             builtinMethodCall(this, obj, key, args)?.let { return it }
             val fn = getProperty(obj, key)
@@ -415,6 +440,7 @@ class Interpreter {
             return fn.call(this, obj, args)
         }
         val callee = evalExpr(expr.callee, env)
+        if (expr.optional && (callee == JsNull || callee == JsUndefined)) throw OptionalShortCircuit
         val args = evalArgs(expr.args, env)
         if (callee !is JsFunction) throw jsError("value is not a function", "TypeError")
         return callee.call(this, JsUndefined, args)
@@ -566,7 +592,7 @@ class Interpreter {
         for (param in params) {
             if (param.rest) {
                 val restItems = if (argIdx < args.size) ArrayList(args.subList(argIdx, args.size)) else ArrayList()
-                env.declare((param.pattern as IdentifierPattern).name, JsArray(restItems))
+                bindPattern(param.pattern, JsArray(restItems), env, "let")
             } else {
                 bindPattern(param.pattern, args.getOrElse(argIdx) { JsUndefined }, env, "let")
                 argIdx++
@@ -600,7 +626,9 @@ class Interpreter {
             is ObjectPattern -> {
                 val obj = value as? JsObject
                 val used = HashSet<String>()
-                for ((key, p) in pattern.props) {
+                for ((index, entry) in pattern.props.withIndex()) {
+                    val p = entry.second
+                    val key = pattern.computedKeys[index]?.let { propertyKeyOf(evalExpr(it, env)) } ?: entry.first
                     used.add(key)
                     bindPattern(p, obj?.get(key) ?: JsUndefined, env, kind)
                 }
@@ -614,6 +642,19 @@ class Interpreter {
     }
 
     private fun evalAssign(expr: Assign, env: Environment): JsValue {
+        // `a &&= b`, `a ||= b`, `a ??= b` only evaluate and assign `b` when the test calls for it.
+        if (expr.op == "&&=" || expr.op == "||=" || expr.op == "??=") {
+            val current = evalExpr(expr.target, env)
+            val keep = when (expr.op) {
+                "&&=" -> !isTruthy(current)
+                "||=" -> isTruthy(current)
+                else -> current != JsNull && current != JsUndefined
+            }
+            if (keep) return current
+            val value = evalExpr(expr.value, env)
+            assignTo(expr.target, value, env)
+            return value
+        }
         val newValue = if (expr.op == "=") {
             evalExpr(expr.value, env)
         } else {
@@ -826,4 +867,9 @@ fun runScript(source: String, interpreter: Interpreter = Interpreter()): Interpr
     val program = Parser(tokens).parseProgram()
     interpreter.run(program)
     return interpreter
+}
+
+/** Thrown by a `?.` link whose object is null or undefined; caught by the enclosing [OptionalChain]. */
+private object OptionalShortCircuit : RuntimeException(null, null, false, false) {
+    private fun readResolve(): Any = OptionalShortCircuit
 }

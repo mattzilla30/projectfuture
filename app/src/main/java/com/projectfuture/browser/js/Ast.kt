@@ -23,9 +23,17 @@ data class Assign(val op: String, val target: Expr, val value: Expr) : Expr()
 data class Conditional(val test: Expr, val consequent: Expr, val alternate: Expr) : Expr()
 /** The comma operator: `a(), b()` evaluates each in order and yields the last value. */
 data class Sequence(val expressions: List<Expr>) : Expr()
-data class Call(val callee: Expr, val args: List<Expr>) : Expr()
+/** [optional]: `f?.()`, which yields undefined (via [OptionalChain]) when `f` is null or undefined. */
+data class Call(val callee: Expr, val args: List<Expr>, val optional: Boolean = false) : Expr()
 data class New(val callee: Expr, val args: List<Expr>) : Expr()
-data class Member(val obj: Expr, val property: Expr, val computed: Boolean) : Expr()
+/** [optional]: `a?.b` / `a?.[k]`, which yields undefined (via [OptionalChain]) when `a` is null or undefined. */
+data class Member(val obj: Expr, val property: Expr, val computed: Boolean, val optional: Boolean = false) : Expr()
+/** Wraps a member/call chain containing `?.`: a nullish link short-circuits the rest of the chain to undefined. */
+data class OptionalChain(val expression: Expr) : Expr()
+/** The first argument of a tagged template call (``tag`a${x}b` ``): the literal parts as an array, with a `raw` copy. */
+data class TemplateStrings(val parts: List<String>) : Expr()
+/** `class [Name] [extends X] { ... }` used as a value. */
+data class ClassExpr(val name: String?, val superClass: Expr?, val methods: List<MethodDef>, val staticFields: List<FieldDef>) : Expr()
 data class FunctionExpr(
     val name: String?,
     val params: List<Param>,
@@ -54,7 +62,8 @@ data class AwaitExpr(val argument: Expr) : Expr()
 sealed class Pattern { abstract val default: Expr? }
 data class IdentifierPattern(val name: String, override val default: Expr? = null) : Pattern()
 data class ArrayPattern(val elements: List<Pattern?>, val restName: String? = null, override val default: Expr? = null) : Pattern()
-data class ObjectPattern(val props: List<Pair<String, Pattern>>, val restName: String? = null, override val default: Expr? = null) : Pattern()
+/** [computedKeys]: prop index -> key expression, for `{ [expr]: target }` entries (whose name in [props] is unused). */
+data class ObjectPattern(val props: List<Pair<String, Pattern>>, val restName: String? = null, override val default: Expr? = null, val computedKeys: Map<Int, Expr> = emptyMap()) : Pattern()
 
 /** A single function parameter; [rest] marks a trailing `...name` that collects remaining arguments into an array. */
 data class Param(val pattern: Pattern, val rest: Boolean = false)
@@ -90,4 +99,6 @@ data class MethodDef(
     val isGenerator: Boolean = false,
     val isAsync: Boolean = false
 )
-data class ClassDecl(val name: String, val superClass: Expr?, val methods: List<MethodDef>) : Stmt()
+/** A `static name = value` class field; instance fields are folded into the constructor by the parser. */
+data class FieldDef(val name: String, val value: Expr?)
+data class ClassDecl(val name: String, val superClass: Expr?, val methods: List<MethodDef>, val staticFields: List<FieldDef> = emptyList()) : Stmt()
