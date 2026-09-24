@@ -70,6 +70,103 @@ class HtmlParserTest {
         assertEquals("AA", text)
     }
 
+    @Test fun scriptContentWithClosingTagLookalikeInsideAStringLiteralIsNotTagParsed() {
+        // A </div> inside a JS string must not be treated as a real closing tag
+        // or otherwise cause the script's raw text to be split early.
+        val root = HtmlParser("<div><script>var x = \"</div>\";</script>After</div>").parse()
+        val divs = root.walkElementsCollect("div")
+        assertEquals(1, divs.size)
+        val script = divs[0].children.filterIsInstance<ElementNode>().first { it.tag == "script" }
+        assertEquals("var x = \"</div>\";", collectText(script))
+        assertEquals("After", collectText(divs[0]).substringAfter(";"))
+    }
+
+    @Test fun scriptClosingTagMustBeFollowedByATagTerminatingCharacter() {
+        // "</scriptable>" merely starts with "</script" but is not the real
+        // closing tag - the tokenizer must not stop the raw-text run there.
+        val root = HtmlParser("<script>var s = \"</scriptable>\";</script>").parse()
+        val script = root.walkElementsCollect("script").first()
+        assertEquals("var s = \"</scriptable>\";", collectText(script))
+    }
+
+    @Test fun scriptContainingAnOldStyleHtmlCommentHidesItAsRawText() {
+        val root = HtmlParser("<script><!-- var x = 1; --></script>").parse()
+        val script = root.walkElementsCollect("script").first()
+        assertEquals("<!-- var x = 1; -->", collectText(script))
+    }
+
+    @Test fun styleContentWithAngleBracketishCssValueIsNotTagParsed() {
+        val root = HtmlParser("<style>.x::before{content:\"<\"}</style><p>ok</p>").parse()
+        val style = root.walkElementsCollect("style").first()
+        assertEquals(".x::before{content:\"<\"}", collectText(style))
+        assertEquals("ok", collectText(root.walkElementsCollect("p").first()))
+    }
+
+    @Test fun scriptContentIsNotEntityDecoded() {
+        // Script/style content is raw text per spec - it must reach the JS
+        // engine byte-for-byte, not have "&amp;" etc silently decoded.
+        val root = HtmlParser("<script>var x = \"a &amp; b\";</script>").parse()
+        val script = root.walkElementsCollect("script").first()
+        assertEquals("var x = \"a &amp; b\";", collectText(script))
+    }
+
+    @Test fun commentContainingAngleBracketsIsSkippedEntirely() {
+        val root = HtmlParser("<p>before</p><!-- a < b > c --><p>after</p>").parse()
+        val ps = root.walkElementsCollect("p")
+        assertEquals(2, ps.size)
+        assertEquals("before", collectText(ps[0]))
+        assertEquals("after", collectText(ps[1]))
+    }
+
+    @Test fun unterminatedCommentConsumesRestOfDocumentWithoutHangingOrCrashing() {
+        val root = HtmlParser("<p>before</p><!-- never closed <p>ghost</p>").parse()
+        val ps = root.walkElementsCollect("p")
+        assertEquals(1, ps.size)
+        assertEquals("before", collectText(ps[0]))
+    }
+
+    @Test fun emptyCommentImmediatelyClosedDoesNotSwallowRestOfDocument() {
+        // "<!-->" is a (weird, but spec-valid) empty comment - parsing must
+        // resume normally right after it, not run to the next "-->" anywhere
+        // later in the document.
+        val root = HtmlParser("<p>a</p><!--><p>b</p>").parse()
+        val ps = root.walkElementsCollect("p")
+        assertEquals(2, ps.size)
+        assertEquals("a", collectText(ps[0]))
+        assertEquals("b", collectText(ps[1]))
+    }
+
+    @Test fun unescapedGreaterThanInsideQuotedAttributeValueDoesNotEndTagEarly() {
+        val root = HtmlParser("<a title=\"click > here\">text</a>").parse()
+        val a = root.walkElementsCollect("a").first()
+        assertEquals("click > here", a.attr("title"))
+        assertEquals("text", collectText(a))
+    }
+
+    @Test fun tagAndAttributeNamesAreCaseInsensitive() {
+        val root = HtmlParser("<DIV CLASS=\"x\"><SPAN>hi</SPAN></DIV>").parse()
+        val divs = root.walkElementsCollect("div")
+        assertEquals(1, divs.size)
+        assertEquals("x", divs[0].attr("class"))
+        assertEquals("hi", collectText(root.walkElementsCollect("span").first()))
+    }
+
+    @Test fun commonRealWorldNamedEntitiesDecode() {
+        val root = HtmlParser(
+            "<p>&trade;&reg;&deg;&plusmn;&times;&divide;&bull;</p>"
+        ).parse()
+        val text = collectText(root.walkElementsCollect("p").first())
+        assertEquals("™®°±×÷•", text)
+    }
+
+    @Test fun legacyWindows1252NumericReferenceIsRemappedPerSpec() {
+        // &#146; is a common malformed "smart quote" export that real
+        // browsers remap to U+2019 rather than emitting literal U+0092.
+        val root = HtmlParser("<p>don&#146;t</p>").parse()
+        val text = collectText(root.walkElementsCollect("p").first())
+        assertEquals("don’t", text)
+    }
+
     private fun ElementNode.walkElementsCollect(tag: String): List<ElementNode> {
         val out = ArrayList<ElementNode>()
         walkElements { if (it.tag == tag) out.add(it) }

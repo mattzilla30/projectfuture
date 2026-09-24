@@ -27,6 +27,14 @@ class HtmlParser(private val source: String) {
             val c = source[i]
             if (c == '<') {
                 if (source.startsWith("<!--", i)) {
+                    // Per spec, "<!-->" (comment start immediately followed by
+                    // '>') is an abrupt-closing empty comment, not the start
+                    // of a comment that runs until the next "-->" anywhere
+                    // later in the document.
+                    if (i + 4 < n && source[i + 4] == '>') {
+                        i += 5
+                        continue
+                    }
                     val end = source.indexOf("-->", i + 4)
                     i = if (end == -1) n else end + 3
                     continue
@@ -50,9 +58,11 @@ class HtmlParser(private val source: String) {
                 val tagName = tagContent.trim().substringBefore(' ').lowercase().removePrefix("/")
                 if (tagName == "script" || tagName == "style") {
                     val closeTag = "</$tagName"
-                    val closeIdx = indexOfIgnoreCase(source, closeTag, i)
+                    val closeIdx = findRawTextCloseTag(source, closeTag, i)
                     val rawEnd = if (closeIdx == -1) n else closeIdx
-                    if (rawEnd > i) addText(source.substring(i, rawEnd))
+                    // Raw text per spec: not tag-parsed and not entity-decoded
+                    // (script/style content must reach consumers byte-for-byte).
+                    if (rawEnd > i) addRawText(source.substring(i, rawEnd))
                     if (closeIdx != -1) {
                         val closeTagEnd = source.indexOf('>', closeIdx)
                         if (closeTagEnd != -1) {
@@ -81,6 +91,14 @@ class HtmlParser(private val source: String) {
         val decoded = decodeEntities(rawText)
         val parent = unfinished.lastOrNull() ?: return
         parent.children.add(TextNode(decoded, parent))
+    }
+
+    /** Like [addText], but for raw-text element content (script/style): no entity decoding. */
+    private fun addRawText(rawText: String) {
+        if (rawText.isBlank() && unfinished.isEmpty()) return
+        if (unfinished.isEmpty()) implicitTags("")
+        val parent = unfinished.lastOrNull() ?: return
+        parent.children.add(TextNode(rawText, parent))
     }
 
     private fun addTag(rawTagContent: String) {
@@ -255,13 +273,32 @@ class HtmlParser(private val source: String) {
     }
 
     private fun indexOfIgnoreCase(haystack: String, needle: String, from: Int): Int {
-        val lowerHaystack = haystack
         var i = from
         while (i <= haystack.length - needle.length) {
             if (haystack.regionMatches(i, needle, 0, needle.length, ignoreCase = true)) return i
             i++
         }
         return -1
+    }
+
+    /**
+     * Finds the raw-text closing tag (e.g. `</script`) for a script/style
+     * element, requiring it be followed by a tag-terminating character
+     * (`>`, `/`, or whitespace) or end-of-input - a bare prefix match like
+     * `</scriptable>` inside a JS string literal must not be mistaken for
+     * the real closing tag.
+     */
+    private fun findRawTextCloseTag(haystack: String, closeTag: String, from: Int): Int {
+        var i = from
+        while (true) {
+            val idx = indexOfIgnoreCase(haystack, closeTag, i)
+            if (idx == -1) return -1
+            val after = idx + closeTag.length
+            if (after >= haystack.length || haystack[after] == '>' || haystack[after] == '/' || haystack[after].isWhitespace()) {
+                return idx
+            }
+            i = idx + 1
+        }
     }
 
     companion object {
@@ -353,6 +390,13 @@ class HtmlParser(private val source: String) {
                 "lsquo" -> "‘"
                 "rdquo" -> "”"
                 "ldquo" -> "“"
+                "trade" -> "™"
+                "reg" -> "®"
+                "deg" -> "°"
+                "plusmn" -> "±"
+                "times" -> "×"
+                "divide" -> "÷"
+                "bull" -> "•"
                 else -> null
             }
         }
@@ -365,7 +409,27 @@ class HtmlParser(private val source: String) {
          * the whole document. Per spec, an invalid numeric reference
          * becomes U+FFFD instead.
          */
-        private fun codePointToString(code: Int): String =
-            if (Character.isValidCodePoint(code)) String(Character.toChars(code)) else "�"
+        private fun codePointToString(code: Int): String {
+            // Per the HTML spec's numeric-character-reference-end error
+            // recovery table, these Windows-1252 control-range code points
+            // (0x80-0x9F) must be remapped to the characters authors
+            // actually meant, not emitted literally - real-world malformed
+            // markup (Word/legacy-CMS exports, mis-encoded smart quotes)
+            // relies on this "legacy" substitution.
+            val remapped = WINDOWS_1252_LEGACY_REMAP[code]
+            if (remapped != null) return remapped.toString()
+            return if (Character.isValidCodePoint(code)) String(Character.toChars(code)) else "�"
+        }
+
+        /** WHATWG "numeric character reference end state" error-recovery table for 0x80-0x9F. */
+        private val WINDOWS_1252_LEGACY_REMAP: Map<Int, Char> = mapOf(
+            0x80 to '€', 0x82 to '‚', 0x83 to 'ƒ', 0x84 to '„',
+            0x85 to '…', 0x86 to '†', 0x87 to '‡', 0x88 to 'ˆ',
+            0x89 to '‰', 0x8A to 'Š', 0x8B to '‹', 0x8C to 'Œ',
+            0x8E to 'Ž', 0x91 to '‘', 0x92 to '’', 0x93 to '“',
+            0x94 to '”', 0x95 to '•', 0x96 to '–', 0x97 to '—',
+            0x98 to '˜', 0x99 to '™', 0x9A to 'š', 0x9B to '›',
+            0x9C to 'œ', 0x9E to 'ž', 0x9F to 'Ÿ'
+        )
     }
 }
