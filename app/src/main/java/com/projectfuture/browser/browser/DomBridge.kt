@@ -182,6 +182,11 @@ class DomBridge(private val root: ElementNode) {
                 val options = observeArgs.getOrNull(1) as? JsObject
                 if (target != null && callback != null) {
                     val subtree = options?.get("subtree")?.let { isTruthy(it) } ?: false
+                    // Per spec, observing a target that's already observed by this same
+                    // observer replaces the existing registration rather than adding a
+                    // second one - otherwise every future mutation on that target would
+                    // deliver the callback once per redundant observe() call.
+                    mutationObservers.removeAll { it.callback === callback && it.target === target }
                     mutationObservers.add(ObserverRegistration(callback, target, subtree))
                 }
                 JsUndefined
