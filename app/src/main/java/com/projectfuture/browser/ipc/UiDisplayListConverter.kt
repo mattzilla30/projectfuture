@@ -1,0 +1,72 @@
+package com.projectfuture.browser.ipc
+
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import com.projectfuture.browser.html.ElementNode
+import com.projectfuture.browser.layout.DisplayCommand
+import com.projectfuture.browser.layout.DrawFormControl
+import com.projectfuture.browser.layout.DrawImage
+import com.projectfuture.browser.layout.DrawRect
+import com.projectfuture.browser.layout.DrawText
+import com.projectfuture.browser.layout.FormControlType
+import com.projectfuture.browser.layout.TextStyle
+import java.util.IdentityHashMap
+
+/**
+ * UI-process-only mirror of [EngineToUiConverter]: turns received
+ * [WireDisplayCommand]s and image bytes back into real `DisplayCommand`
+ * objects so [com.projectfuture.browser.view.BrowserView] can paint a
+ * sandboxed tab exactly like an in-process one, completely unmodified.
+ *
+ * No real `ElementNode` ever crosses the process boundary (see
+ * `WireDisplayCommand`'s doc), so a "shadow" node - inert, empty tag/
+ * attributes, existing only as an identity token - is created once per
+ * elementId and reused across relayouts (stable identity matters:
+ * BrowserView keys its overlay EditText views and find-in-page match
+ * highlighting off `DisplayCommand.sourceElement` object identity). A tap
+ * or text edit on a shadow element is translated back to its elementId via
+ * [elementIdFor] and shipped to the engine process by [TabEngineClient] -
+ * this class never runs any DOM/JS logic itself.
+ */
+class UiDisplayListConverter {
+    private val shadowElements = HashMap<Int, ElementNode>()
+    private val idsByShadowElement = IdentityHashMap<ElementNode, Int>()
+    private val images = HashMap<Int, Bitmap>()
+
+    fun onImageReceived(imageId: Int, pngBytes: ByteArray) {
+        images[imageId] = BitmapFactory.decodeByteArray(pngBytes, 0, pngBytes.size)
+    }
+
+    /** The elementId a shadow ElementNode (from a BrowserView callback) stands in for, or null if it's not one of ours. */
+    fun elementIdFor(shadow: ElementNode): Int? = idsByShadowElement[shadow]
+
+    fun convert(wireCommands: List<WireDisplayCommand>): List<DisplayCommand> =
+        wireCommands.mapNotNull { cmd ->
+            when (cmd) {
+                is WireDrawText -> DrawText(
+                    cmd.x, cmd.baselineY, cmd.text, textStyle(cmd.style),
+                    cmd.left, cmd.right, cmd.boxTop, cmd.boxBottom, cmd.fixed, shadowFor(cmd.elementId)
+                )
+                is WireDrawRect -> DrawRect(cmd.left, cmd.top, cmd.right, cmd.bottom, cmd.colorArgb, cmd.fixed, shadowFor(cmd.elementId))
+                is WireDrawImage -> images[cmd.imageId]?.let { bitmap ->
+                    DrawImage(cmd.left, cmd.top, cmd.right, cmd.bottom, bitmap, cmd.fixed, shadowFor(cmd.elementId))
+                }
+                is WireDrawFormControl -> DrawFormControl(
+                    cmd.left, cmd.top, cmd.right, cmd.bottom, FormControlType.values()[cmd.controlType],
+                    cmd.value, cmd.checked, cmd.placeholder, textStyle(cmd.style), cmd.fixed, shadowFor(cmd.elementId)
+                )
+            }
+        }
+
+    private fun shadowFor(elementId: Int): ElementNode? {
+        if (elementId == 0) return null
+        return shadowElements.getOrPut(elementId) {
+            ElementNode(tag = "").also { idsByShadowElement[it] = elementId }
+        }
+    }
+
+    private fun textStyle(style: WireTextStyle) = TextStyle(
+        style.sizePx, style.bold, style.italic, style.monospace, style.colorArgb,
+        style.underline, style.strikethrough, style.linkHref, style.fontFamilyName
+    )
+}

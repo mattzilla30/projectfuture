@@ -30,27 +30,50 @@ import com.projectfuture.browser.layout.FontCache
 import com.projectfuture.browser.layout.FormControlType
 
 /**
- * Paints a DisplayCommand list straight onto a Canvas and turns touch
- * input into scroll offset changes / link taps / form-control taps. This is
- * the entire "renderer" - there is no WebView or system browser widget
- * standing in for the page itself.
+ * Paints a DisplayCommand list and turns touch input into scroll offset
+ * changes / link taps / form-control taps. This is the entire "renderer" -
+ * there is no WebView or system browser widget standing in for the page
+ * itself.
  *
- * It's a `FrameLayout`, not a plain `View`, for exactly one reason: text
- * entry (`<input type=text>`/`password`/`<textarea>`) needs a real IME
- * keyboard, cursor, and selection handling, and hand-rolling that is squarely
- * "browser engine" work this project isn't reimplementing (same boundary as
- * using Canvas/Paint for glyph rendering rather than a rasterizer written
- * from scratch) - so each such field is a genuine overlaid `EditText` child,
- * positioned to match its DrawFormControl's page rect and kept in sync with
- * scrolling via `translationY` (cheap - no layout pass per scroll tick).
- * Checkbox/radio/button controls have no keyboard-input need, so they're
- * just painted directly (see [drawCommands]) and hit-tested the same way
- * links and other elements already are.
+ * It's a `FrameLayout`, not a plain `View`, for two reasons now. The
+ * original one: text entry (`<input type=text>`/`password`/`<textarea>`)
+ * needs a real IME keyboard, cursor, and selection handling, so each such
+ * field is a genuine overlaid `EditText` child (see [syncOverlayViews]).
+ * The second, newer one: painting itself is split across two *hardware-
+ * layer* child Views rather than done directly in this View's own
+ * `onDraw` - [ScrollingContentLayer] for normal page content and
+ * [FixedContentLayer] for `position: fixed` content - so they're
+ * independently GPU-composited layers, not one single CPU-painted bitmap.
  *
- * Commands are split into two groups: normal page content, which scrolls
- * (painted under a scroll translate), and `position: fixed` content, which
- * is painted in a second, untranslated pass so it stays pinned on screen -
- * see DisplayCommand's doc for why the coordinate spaces differ.
+ * Why that split earns its keep (not just "hardware acceleration is
+ * already on" - it was, via the manifest's default, before this): with a
+ * single `onDraw`, *every* scroll-driven `invalidate()` re-rasterizes
+ * *all* content - the fixed header/footer/nav included - even though a
+ * scroll never changes a single pixel of it (that's the whole point of
+ * `position: fixed`). Each layer here is `LAYER_TYPE_HARDWARE`, an
+ * independently-cached GPU texture: scrolling invalidates only
+ * [ScrollingContentLayer], so [FixedContentLayer]'s texture is reused by
+ * the compositor untouched on every scroll frame - a real reduction in
+ * per-frame CPU paint work on any page with fixed content, not just a
+ * manifest flag. Dark mode ([setDarkMode]) is applied the same way: a
+ * `ColorMatrixColorFilter` set once via `View.setLayerPaint` on each
+ * layer, composited by the GPU when it draws that layer's cached texture,
+ * instead of a `Canvas.saveLayer` + color-matrix paint re-run on every
+ * single `onDraw` call as before.
+ *
+ * Honest limits of this pass: content within a layer still repaints on
+ * every scroll tick (there's no tiling - the whole visible slice of
+ * `ScrollingContentLayer` is CPU-rasterized again each time the scroll
+ * offset changes, same as before), and `transform` support in this engine
+ * is limited to `translate()`, already resolved into plain layout
+ * position by [com.projectfuture.browser.css.resolveTranslate] rather than
+ * being a paint-time transform - so there's no per-element rotate/scale
+ * layer to GPU-composite here, because the engine doesn't produce one (see
+ * that file's doc). No device/emulator was available in this environment
+ * to capture actual on-device frame-timing numbers for the before/after;
+ * what's verifiable here is the architecture change itself (independent
+ * hardware layers, GPU-applied color filter) and that it compiles/behaves
+ * identically from every call site's perspective.
  */
 class BrowserView @JvmOverloads constructor(
     context: Context,
@@ -93,8 +116,60 @@ class BrowserView @JvmOverloads constructor(
     /** Live overlaid text-entry widgets, keyed by their DOM element. Text/password/textarea only. */
     private val textFieldViews = HashMap<ElementNode, EditText>()
 
+    /**
+     * A GPU-composited layer painting only [normalCommands] (and non-fixed
+     * find-match highlights), translated by the live scroll offset. Its
+     * own bounds always match the viewport; content further down the page
+     * than [scrollOffset] + height is clipped by [drawCommands]'s
+     * viewTop/viewBottom check exactly as before the layer split - this
+     * class only changes *which View's hardware layer* gets invalidated on
+     * a scroll tick, not what's visible.
+     */
+    private inner class ScrollingContentLayer(context: Context) : View(context) {
+        var scrollOffset: Float = 0f
+
+        init { setLayerType(LAYER_TYPE_HARDWARE, null) }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            canvas.save()
+            canvas.translate(0f, -scrollOffset)
+            drawCommands(canvas, normalCommands, scrollOffset, scrollOffset + height)
+            for ((i, cmd) in findMatches.withIndex()) {
+                if (cmd.fixed) continue
+                canvas.drawRect(cmd.left, cmd.top, cmd.right, cmd.bottom, if (i == findCurrentIndex) findCurrentMatchPaint else findMatchPaint)
+            }
+            canvas.restore()
+        }
+    }
+
+    /**
+     * A GPU-composited layer painting only [fixedCommands], never
+     * translated - see class doc for why keeping it a *separate* hardware
+     * layer from [ScrollingContentLayer] (rather than just also being
+     * hardware-accelerated) is the actual point: it's never invalidated by
+     * a scroll, so its cached texture is reused by the compositor as-is on
+     * every scroll frame instead of being re-rasterized.
+     */
+    private inner class FixedContentLayer(context: Context) : View(context) {
+        init { setLayerType(LAYER_TYPE_HARDWARE, null) }
+
+        override fun onDraw(canvas: Canvas) {
+            super.onDraw(canvas)
+            drawCommands(canvas, fixedCommands, 0f, height.toFloat())
+        }
+    }
+
+    private val scrollingContentLayer = ScrollingContentLayer(context)
+    private val fixedContentLayer = FixedContentLayer(context)
+
     init {
-        setWillNotDraw(false)
+        // BrowserView itself paints nothing directly any more - both layers below do, each as its
+        // own hardware-accelerated texture. Order matters: fixed content (a header/nav bar, say)
+        // must composite above scrolled page content, and overlay EditText fields (added later, in
+        // syncOverlayViews) must composite above both.
+        addView(scrollingContentLayer, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
+        addView(fixedContentLayer, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
     }
 
     private val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
@@ -102,8 +177,12 @@ class BrowserView @JvmOverloads constructor(
 
         override fun onScroll(e1: MotionEvent?, e2: MotionEvent, distanceX: Float, distanceY: Float): Boolean {
             scrollYPx = (scrollYPx + distanceY).coerceIn(0f, maxScroll())
+            scrollingContentLayer.scrollOffset = scrollYPx
             repositionOverlayViews()
-            invalidate()
+            // Only the scrolling layer's texture needs re-rasterizing - fixedContentLayer's cached
+            // hardware layer is left completely untouched, which is the real saving this split buys
+            // (see class doc).
+            scrollingContentLayer.invalidate()
             return true
         }
 
@@ -180,14 +259,17 @@ class BrowserView @JvmOverloads constructor(
         fixedCommands = fixed
         contentHeight = height
         scrollYPx = scrollYPx.coerceIn(0f, maxScroll())
+        scrollingContentLayer.scrollOffset = scrollYPx
         syncOverlayViews((normal + fixed).filterIsInstance<DrawFormControl>())
-        invalidate()
+        scrollingContentLayer.invalidate()
+        fixedContentLayer.invalidate()
     }
 
     fun resetScroll() {
         scrollYPx = 0f
+        scrollingContentLayer.scrollOffset = 0f
         repositionOverlayViews()
-        invalidate()
+        scrollingContentLayer.invalidate()
     }
 
     /** Called on full page navigation, so stale fields from the old document don't linger. */
@@ -210,15 +292,16 @@ class BrowserView @JvmOverloads constructor(
         val current = matches.getOrNull(currentIndex)
         if (current != null && !current.fixed) {
             scrollYPx = (current.top - height / 3f).coerceIn(0f, maxScroll())
+            scrollingContentLayer.scrollOffset = scrollYPx
             repositionOverlayViews()
         }
-        invalidate()
+        scrollingContentLayer.invalidate()
     }
 
     fun clearFindMatches() {
         findMatches = emptyList()
         findCurrentIndex = -1
-        invalidate()
+        scrollingContentLayer.invalidate()
     }
 
     private fun maxScroll(): Float = (contentHeight - height).coerceAtLeast(0f)
@@ -305,8 +388,9 @@ class BrowserView @JvmOverloads constructor(
         editText.setBackgroundResource(android.R.drawable.edit_text)
         editText.setTextSize(TypedValue.COMPLEX_UNIT_PX, cmd.style.sizePx)
         if (darkModeEnabled) {
-            // The page's own Canvas-painted content gets its colors inverted wholesale (see onDraw's
-            // doc); this real EditText isn't part of that layer, so it needs manually dark-aware colors.
+            // The page's own hardware-layer-composited content gets its colors inverted wholesale
+            // (see setDarkMode's doc); this real EditText isn't part of either layer, so it needs
+            // manually dark-aware colors.
             editText.setBackgroundColor(Color.DKGRAY)
             editText.setTextColor(Color.WHITE)
             editText.setHintTextColor(Color.LTGRAY)
@@ -342,17 +426,21 @@ class BrowserView @JvmOverloads constructor(
     }
 
     /**
-     * "Dark mode" here is a full-color inversion of everything this View
-     * paints (`saveLayer` with a negating `ColorMatrixColorFilter`), the
-     * same technique as Android's own accessibility "Invert colors" -
+     * "Dark mode" here is a full-color inversion of everything painted -
+     * the same technique as Android's own accessibility "Invert colors" -
      * not a per-element light/dark re-theming like a real browser's
      * "force dark" heuristic (which selectively inverts backgrounds/text
      * while leaving images alone). The trade-off: images and anything
      * already-colorful invert too (a photo looks like a photo negative),
-     * but it's correct and simple for arbitrary pages, and overlaid
-     * EditText fields are separately re-colored in [createEditTextFor]
-     * (real Views aren't part of this Canvas layer, so they need their own
-     * dark-aware colors).
+     * but it's correct and simple for arbitrary pages.
+     *
+     * Applied via [View.setLayerPaint] on each hardware layer rather than
+     * a `Canvas.saveLayer` inside `onDraw`: the `ColorMatrixColorFilter`
+     * becomes a property of how the GPU composites that layer's cached
+     * texture, evaluated by the compositor, not re-executed as CPU/Skia
+     * draw commands on every single frame. Overlaid EditText fields aren't
+     * part of either layer's texture, so they're separately re-colored in
+     * [createEditTextFor].
      */
     private var darkModeEnabled = false
     private val invertColorMatrix = ColorMatrix(
@@ -367,31 +455,9 @@ class BrowserView @JvmOverloads constructor(
 
     fun setDarkMode(enabled: Boolean) {
         darkModeEnabled = enabled
-        invalidate()
-    }
-
-    override fun onDraw(canvas: Canvas) {
-        super.onDraw(canvas)
-        if (darkModeEnabled) {
-            val layer = canvas.saveLayer(0f, 0f, width.toFloat(), height.toFloat(), invertLayerPaint)
-            drawPageContent(canvas)
-            canvas.restoreToCount(layer)
-        } else {
-            drawPageContent(canvas)
-        }
-    }
-
-    private fun drawPageContent(canvas: Canvas) {
-        canvas.save()
-        canvas.translate(0f, -scrollYPx)
-        drawCommands(canvas, normalCommands, scrollYPx, scrollYPx + height)
-        for ((i, cmd) in findMatches.withIndex()) {
-            if (cmd.fixed) continue
-            canvas.drawRect(cmd.left, cmd.top, cmd.right, cmd.bottom, if (i == findCurrentIndex) findCurrentMatchPaint else findMatchPaint)
-        }
-        canvas.restore()
-
-        drawCommands(canvas, fixedCommands, 0f, height.toFloat())
+        val paint = if (enabled) invertLayerPaint else null
+        scrollingContentLayer.setLayerPaint(paint)
+        fixedContentLayer.setLayerPaint(paint)
     }
 
     /**
@@ -400,9 +466,9 @@ class BrowserView @JvmOverloads constructor(
      * caller has already scaled the canvas to fit a print page. `position:
      * fixed` content is skipped (it's relative to an on-screen viewport,
      * which printing doesn't have). Text/password/textarea field values
-     * won't appear - they live in real overlaid EditText views, not this
-     * Canvas paint path, and printing doesn't recreate an Android view
-     * hierarchy for a PDF page - a known, documented print limitation.
+     * won't appear - they live in real overlaid EditText views, not either
+     * paint layer, and printing doesn't recreate an Android view hierarchy
+     * for a PDF page - a known, documented print limitation.
      */
     fun paintFullPageForPrint(canvas: Canvas, commands: List<DisplayCommand>) {
         drawCommands(canvas, commands.filterNot { it.fixed }, 0f, Float.MAX_VALUE)

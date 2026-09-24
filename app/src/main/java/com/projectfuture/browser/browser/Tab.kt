@@ -178,6 +178,9 @@ class Tab(
     /** Fired for `<a download href="...">` taps; MainActivity hands the URL off to Android's own DownloadManager (a platform primitive, not "browser engine" logic). */
     var onDownloadRequested: ((url: String, suggestedFilename: String?) -> Unit)? = null
 
+    /** Fired when a detected login form (see [LoginFormDetector]) is submitted with a non-blank username+password; MainActivity offers to save it via [CredentialStore]. */
+    var onLoginFormSubmitted: ((origin: String, username: String, password: String) -> Unit)? = null
+
     /**
      * A per-tab text-size multiplier - see [textScaleFactor]'s doc for why
      * this is the practical stand-in for "pinch-to-zoom" on this engine.
@@ -486,6 +489,18 @@ class Tab(
         mutateAndRefresh()
     }
 
+    /** The current document's origin (`scheme://host:port`), for matching saved credentials - null if nothing's loaded. */
+    fun currentOrigin(): String? = currentUrl?.credentialOrigin()
+
+    /** The first login-shaped form in the current document, if any - see [LoginFormDetector]. Used by MainActivity to offer autofill after a page loads. */
+    fun detectLoginForm(): LoginFormFields? = currentDoc?.let { LoginFormDetector.findLoginForm(it) }
+
+    /** Fills in a detected login form's fields (from [detectLoginForm]) with a saved credential and re-lays-out, same as any other field edit. */
+    fun autofillLoginForm(fields: LoginFormFields, username: String, password: String) {
+        setFieldValue(fields.usernameField, username)
+        setFieldValue(fields.passwordField, password)
+    }
+
     fun setSelectValue(select: ElementNode, chosenOption: ElementNode) {
         select.children.filterIsInstance<ElementNode>().forEach { if (it.tag == "option") it.attributes.remove("selected") }
         chosenOption.attributes["selected"] = "selected"
@@ -506,6 +521,12 @@ class Tab(
         val baseUrl = currentUrl ?: return
         val action = form.attr("action")?.takeIf { it.isNotBlank() }?.let { baseUrl.resolve(it) } ?: baseUrl
         val method = (form.attr("method") ?: "get").trim().lowercase()
+
+        LoginFormDetector.findLoginForm(form)?.let { fields ->
+            LoginFormDetector.extractSubmittedCredentials(fields)?.let { (username, password) ->
+                onLoginFormSubmitted?.invoke(baseUrl.credentialOrigin(), username, password)
+            }
+        }
 
         val params = ArrayList<Pair<String, String>>()
         form.walkElements { el ->
