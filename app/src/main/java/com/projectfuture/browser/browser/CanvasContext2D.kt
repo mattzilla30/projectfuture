@@ -36,6 +36,55 @@ import com.projectfuture.browser.js.toNumber
  * dashed lines, text alignment/baseline. `fillStyle`/`strokeStyle`
  * only round-trips as a hex color string, not whatever format was set.
  */
+/** Snapshot of the mutable drawing-style state save()/restore() must round-trip, kept
+ *  separate from the Android Canvas's own matrix/clip stack (Canvas.save/restore only
+ *  covers transform+clip, never fillStyle/strokeStyle/lineWidth/font/globalAlpha). */
+internal data class CanvasStyleSnapshot(
+    val fillColor: Int,
+    val strokeColor: Int,
+    val lineWidthPx: Float,
+    val fontSizePx: Float,
+    val globalAlphaValue: Float,
+)
+
+/** Pure LIFO stack backing save()/restore(), Android-free so it's directly unit-testable
+ *  and so a restore() called more times than save() can no-op instead of letting
+ *  Canvas.restore() throw IllegalStateException ("Underflow in restore/restoreToCount"). */
+internal class CanvasStyleStack {
+    private val stack = ArrayDeque<CanvasStyleSnapshot>()
+    val depth: Int get() = stack.size
+    fun push(snapshot: CanvasStyleSnapshot) {
+        stack.addLast(snapshot)
+    }
+
+    /** Returns null (leaving the stack untouched) when there is nothing left to restore. */
+    fun pop(): CanvasStyleSnapshot? = if (stack.isEmpty()) null else stack.removeLast()
+}
+
+/** Pure translation of Canvas 2D's arc(x, y, radius, startAngle, endAngle, anticlockwise)
+ *  into the oval-bounds + start/sweep-degrees form Android's Path.addArc wants. Returns
+ *  null for a negative radius (invalid per spec) instead of handing addArc an inverted
+ *  oval rect, which would otherwise silently draw a mirrored/garbage arc rather than
+ *  nothing. Zero radius is allowed through (degenerate arc that draws nothing, same as
+ *  what addArc would already do with a zero-size oval).
+ */
+internal fun computeArcGeometry(
+    cx: Float,
+    cy: Float,
+    r: Float,
+    startAngleRad: Float,
+    endAngleRad: Float,
+    anticlockwise: Boolean,
+): FloatArray? {
+    if (r < 0f) return null
+    val startDeg = Math.toDegrees(startAngleRad.toDouble()).toFloat()
+    val endDeg = Math.toDegrees(endAngleRad.toDouble()).toFloat()
+    var sweep = endDeg - startDeg
+    if (anticlockwise && sweep > 0) sweep -= 360f
+    if (!anticlockwise && sweep < 0) sweep += 360f
+    return floatArrayOf(cx - r, cy - r, cx + r, cy + r, startDeg, sweep)
+}
+
 class CanvasContext2D(val bitmap: Bitmap) : JsObject() {
     private val canvas = Canvas(bitmap)
     private var fillColor = Color.BLACK
@@ -44,6 +93,7 @@ class CanvasContext2D(val bitmap: Bitmap) : JsObject() {
     private var fontSizePx = 10f
     private var globalAlphaValue = 1f
     private var path = Path()
+    private val styleStack = CanvasStyleStack()
 
     // Paint.alpha overwrites whatever alpha `color` carried, so this combines the
     // color's own alpha with globalAlpha before assigning, rather than losing one of them.
@@ -91,16 +141,10 @@ class CanvasContext2D(val bitmap: Bitmap) : JsObject() {
             JsUndefined
         }
         "arc" -> NativeFunction("arc", 5) { _, _, a ->
-            val cx = f(a, 0)
-            val cy = f(a, 1)
-            val r = f(a, 2)
-            val startDeg = Math.toDegrees(f(a, 3).toDouble()).toFloat()
-            val endDeg = Math.toDegrees(f(a, 4).toDouble()).toFloat()
             val anticlockwise = (a.getOrNull(5) as? JsBoolean)?.value ?: false
-            var sweep = endDeg - startDeg
-            if (anticlockwise && sweep > 0) sweep -= 360f
-            if (!anticlockwise && sweep < 0) sweep += 360f
-            path.addArc(cx - r, cy - r, cx + r, cy + r, startDeg, sweep)
+            computeArcGeometry(f(a, 0), f(a, 1), f(a, 2), f(a, 3), f(a, 4), anticlockwise)?.let { g ->
+                path.addArc(g[0], g[1], g[2], g[3], g[4], g[5])
+            }
             JsUndefined
         }
         "fill" -> NativeFunction("fill", 0) { _, _, _ -> canvas.drawPath(path, fillPaint()); JsUndefined }
@@ -117,8 +161,25 @@ class CanvasContext2D(val bitmap: Bitmap) : JsObject() {
             val w = Paint().apply { textSize = fontSizePx }.measureText(toJsString(a.getOrElse(0) { JsUndefined }))
             JsObject().apply { set("width", JsNumber(w.toDouble())) }
         }
-        "save" -> NativeFunction("save", 0) { _, _, _ -> canvas.save(); JsUndefined }
-        "restore" -> NativeFunction("restore", 0) { _, _, _ -> canvas.restore(); JsUndefined }
+        "save" -> NativeFunction("save", 0) { _, _, _ ->
+            styleStack.push(CanvasStyleSnapshot(fillColor, strokeColor, lineWidthPx, fontSizePx, globalAlphaValue))
+            canvas.save()
+            JsUndefined
+        }
+        "restore" -> NativeFunction("restore", 0) { _, _, _ ->
+            // A restore() with no matching save() must no-op, not throw - Canvas.restore()
+            // itself would throw IllegalStateException on an empty stack, so only call it
+            // when the style stack (kept 1:1 with canvas.save() calls) actually has an entry.
+            styleStack.pop()?.let { s ->
+                fillColor = s.fillColor
+                strokeColor = s.strokeColor
+                lineWidthPx = s.lineWidthPx
+                fontSizePx = s.fontSizePx
+                globalAlphaValue = s.globalAlphaValue
+                canvas.restore()
+            }
+            JsUndefined
+        }
         "translate" -> NativeFunction("translate", 2) { _, _, a -> canvas.translate(f(a, 0), f(a, 1)); JsUndefined }
         "scale" -> NativeFunction("scale", 2) { _, _, a -> canvas.scale(f(a, 0), f(a, 1)); JsUndefined }
         "rotate" -> NativeFunction("rotate", 1) { _, _, a -> canvas.rotate(Math.toDegrees(f(a, 0).toDouble()).toFloat()); JsUndefined }
