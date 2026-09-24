@@ -65,16 +65,33 @@ object FontDecoder {
             pos += 20
         }
 
-        val tableData = ArrayList<ByteArray>(numTables)
+        // Decompress (or pass through, for compLength == origLength "stored" tables) every
+        // table, then pair each with its entry and sort by tag: the OpenType spec requires the
+        // sfnt table directory to be in ascending tag order, and WOFF table directories are not
+        // guaranteed to already be sorted that way (real-world WOFF files routinely aren't -
+        // e.g. fontTools emits GDEF/GPOS/GSUB before head/hhea). This also matters for
+        // checkSumAdjustment below: that value is only meaningful for one specific byte layout,
+        // so the layout produced here must be the spec-mandated one.
+        data class Entry(val entry: TableEntry, val data: ByteArray)
+        val decoded = ArrayList<Entry>(numTables)
         for (e in entries) {
             if (e.offset < 0 || e.compLength < 0 || e.offset.toLong() + e.compLength > bytes.size) return null
-            val data = if (e.compLength == e.origLength) {
+            var data = if (e.compLength == e.origLength) {
                 bytes.copyOfRange(e.offset, e.offset + e.compLength)
             } else {
                 inflate(bytes, e.offset, e.compLength, e.origLength) ?: return null
             }
-            tableData.add(data)
+            if (e.tag == 0x68656164L && data.size >= 12) { // 'head'
+                // Per the OpenType spec's font-checksum algorithm, checkSumAdjustment is
+                // zeroed before computing *any* checksum (this table's own directory-entry
+                // checksum included, which real fonts leave computed against the zeroed value
+                // forever - it is never updated to reflect the real, final adjustment).
+                data = data.copyOf()
+                data[8] = 0; data[9] = 0; data[10] = 0; data[11] = 0
+            }
+            decoded.add(Entry(e, data))
         }
+        decoded.sortBy { it.entry.tag }
 
         val entrySelector = 31 - Integer.numberOfLeadingZeros(numTables)
         val searchRange = (1 shl entrySelector) * 16
@@ -88,11 +105,13 @@ object FontDecoder {
         writeU16(out, rangeShift)
 
         var dataOffset = 12 + numTables * 16
+        var headOffset = -1
         val directory = ByteArrayOutputStream()
         val dataSection = ByteArrayOutputStream()
-        for ((i, e) in entries.withIndex()) {
-            val data = tableData[i]
-            writeU32(directory, e.tag)
+        for (d in decoded) {
+            val data = d.data
+            if (d.entry.tag == 0x68656164L) headOffset = dataOffset // 'head'
+            writeU32(directory, d.entry.tag)
             writeU32(directory, checksum(data))
             writeU32(directory, dataOffset.toLong())
             writeU32(directory, data.size.toLong())
@@ -103,8 +122,29 @@ object FontDecoder {
         }
 
         out.write(directory.toByteArray())
-        out.write(dataSection.toByteArray())
-        return out.toByteArray()
+        val dataBytes = dataSection.toByteArray()
+        out.write(dataBytes)
+        val sfnt = out.toByteArray()
+
+        // The 'head' table carries a checkSumAdjustment field (4 bytes at offset 8 within the
+        // table) that must equal 0xB1B0AFBA minus the checksum of the whole file, computed with
+        // that field zeroed - see the OpenType spec's `head` table and font-checksum algorithm.
+        // The value inflated out of the WOFF was only ever valid for whatever byte layout the
+        // WOFF encoder itself used when it computed it (a different table order/offsets than
+        // this reconstruction uses), so it must be recomputed here for the actual bytes written.
+        // `data` already has this field zeroed (see above), so `sfnt`'s checksum right now *is*
+        // the "with checkSumAdjustment zeroed" checksum the spec wants - only the final in-place
+        // patch below is needed; the table's own directory-entry checksum, computed above while
+        // it was still zeroed, is intentionally left as-is (matching real-world fonts, which
+        // never update it to reflect the real, final adjustment either).
+        if (headOffset >= 0 && headOffset + 12 <= sfnt.size) {
+            val adjustment = (0xB1B0AFBAL - checksum(sfnt)) and 0xFFFFFFFFL
+            sfnt[headOffset + 8] = ((adjustment shr 24) and 0xFF).toByte()
+            sfnt[headOffset + 9] = ((adjustment shr 16) and 0xFF).toByte()
+            sfnt[headOffset + 10] = ((adjustment shr 8) and 0xFF).toByte()
+            sfnt[headOffset + 11] = (adjustment and 0xFF).toByte()
+        }
+        return sfnt
     }
 
     private fun inflate(src: ByteArray, offset: Int, compLength: Int, origLength: Int): ByteArray? {
