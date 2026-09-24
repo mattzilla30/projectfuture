@@ -42,7 +42,4 @@
     <color name="md_outline">#FF73777F</color>
     <color name="md_outline_variant">#FFC3C7CF</color>
     <color name="md_scrim">#FF000000</color>
-
-    <!-- Link color for rendered page text; not part of the Material role set. -->
-    <color name="link_color">#FF2F5FA8</color>
 </resources>

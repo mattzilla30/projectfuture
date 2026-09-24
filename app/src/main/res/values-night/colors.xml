@@ -41,6 +41,4 @@
     <color name="md_outline">#FF8D9199</color>
     <color name="md_outline_variant">#FF43474E</color>
     <color name="md_scrim">#FF000000</color>
-
-    <color name="link_color">#FFAAC7FF</color>
 </resources>

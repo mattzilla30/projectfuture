@@ -2,17 +2,14 @@ package com.projectfuture.browser
 
 import android.content.Context
 import android.os.Bundle
-import android.text.TextUtils
-import android.util.TypedValue
-import android.view.Gravity
 import android.view.KeyEvent
+import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.BaseAdapter
 import android.widget.ImageButton
-import android.widget.LinearLayout
 import android.widget.ListView
 import android.widget.PopupMenu
 import android.widget.TextView
@@ -184,24 +181,15 @@ class MainActivity : AppCompatActivity() {
             override fun getItemId(position: Int) = position.toLong()
             override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                 val tab = tabs[position]
-                val row = listRow(this@MainActivity)
                 val activeMarker = if (position == tabManager.activeIndex) "●  " else ""
                 val label = tabTitles[tab] ?: tab.currentUrl?.toString() ?: getString(R.string.untitled_tab)
-                row.addView(
-                    listRowLabel(this@MainActivity, activeMarker + label)
+                return buildListRow(
+                    parent,
+                    label = activeMarker + label,
+                    onTap = { switchToTab(position); dialog.dismiss() },
+                    onRemove = { closeTabAt(position); dialog.dismiss() }
                 )
-                row.addView(
-                    listRowCloseButton(this@MainActivity) {
-                        closeTabAt(position)
-                        dialog.dismiss()
-                    }
-                )
-                return row
             }
-        }
-        listView.setOnItemClickListener { _, _, position, _ ->
-            switchToTab(position)
-            dialog.dismiss()
         }
         dialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.tabs_dialog_title)
@@ -241,11 +229,11 @@ class MainActivity : AppCompatActivity() {
         popup.show()
     }
 
-    /** Shared row builder for the bookmarks/history dialogs: a label, tap to navigate, X to remove. */
-    private fun buildListRow(label: String, onTap: () -> Unit, onRemove: () -> Unit): View {
-        val row = listRow(this)
-        row.addView(listRowLabel(this, label))
-        row.addView(listRowCloseButton(this, onRemove))
+    /** Shared row builder for the tabs/bookmarks/history dialogs: a label, tap to act, X to remove. */
+    private fun buildListRow(parent: ViewGroup, label: String, onTap: () -> Unit, onRemove: () -> Unit): View {
+        val row = LayoutInflater.from(this).inflate(R.layout.dialog_list_row, parent, false)
+        row.findViewById<TextView>(R.id.rowLabel).text = label
+        row.findViewById<ImageButton>(R.id.rowClose).setOnClickListener { onRemove() }
         row.setOnClickListener { onTap() }
         return row
     }
@@ -262,6 +250,7 @@ class MainActivity : AppCompatActivity() {
                 override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                     val bookmark = bookmarks[position]
                     return buildListRow(
+                        parent,
                         label = bookmark.title,
                         onTap = { tabManager.activeTab?.navigate(bookmark.url); dialog.dismiss() },
                         onRemove = { bookmarkStore.remove(bookmark.url); bind() }
@@ -290,6 +279,7 @@ class MainActivity : AppCompatActivity() {
                 override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                     val entry = entries[position]
                     return buildListRow(
+                        parent,
                         label = entry.title,
                         onTap = { tabManager.activeTab?.navigate(entry.url); dialog.dismiss() },
                         onRemove = { historyStore.remove(entry.url); bind() }
@@ -331,39 +321,4 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         tabManager.destroyAll()
     }
-}
-
-/** Builds a themed, rippling row container shared by the tabs/bookmarks/history dialogs. */
-private fun listRow(context: Context): LinearLayout = LinearLayout(context).apply {
-    orientation = LinearLayout.HORIZONTAL
-    gravity = Gravity.CENTER_VERTICAL
-    setPadding(24, 20, 8, 20)
-    val outValue = TypedValue()
-    context.theme.resolveAttribute(android.R.attr.selectableItemBackground, outValue, true)
-    setBackgroundResource(outValue.resourceId)
-}
-
-private fun listRowLabel(context: Context, label: String): TextView = TextView(context).apply {
-    text = label
-    layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-    maxLines = 1
-    ellipsize = TextUtils.TruncateAt.END
-    setTextAppearance(com.google.android.material.R.style.TextAppearance_Material3_BodyLarge)
-    setTextColor(resolveThemeColor(context, com.google.android.material.R.attr.colorOnSurface))
-}
-
-private fun listRowCloseButton(context: Context, onRemove: () -> Unit): ImageButton = ImageButton(context).apply {
-    setImageResource(R.drawable.ic_close)
-    background = null
-    imageTintList = android.content.res.ColorStateList.valueOf(
-        resolveThemeColor(context, com.google.android.material.R.attr.colorOnSurfaceVariant)
-    )
-    contentDescription = context.getString(R.string.action_close)
-    setOnClickListener { onRemove() }
-}
-
-private fun resolveThemeColor(context: Context, attr: Int): Int {
-    val value = TypedValue()
-    context.theme.resolveAttribute(attr, value, true)
-    return value.data
 }
