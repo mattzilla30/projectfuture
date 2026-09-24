@@ -107,16 +107,29 @@ class Interpreter {
                 } while (isTruthy(evalExpr(stmt.test, env)))
             }
             is For -> {
-                val forEnv = Environment(env)
-                stmt.init?.let { execStmt(it, forEnv) }
-                while (stmt.test == null || isTruthy(evalExpr(stmt.test, forEnv))) {
+                // `for (let i ...)`/`for (const i ...)` must give each iteration its own binding of the
+                // loop variable(s), so a closure created in the body captures that iteration's value
+                // rather than one binding shared (and mutated) across every iteration - the classic
+                // `for (let i...)` vs `for (var i...)` closure-capture distinction. Achieved by copying
+                // the lexical loop variables into a fresh Environment before each iteration's body/update
+                // run, and copying their post-update values forward into the next iteration's copy.
+                val isLexical = stmt.init is VarDecl && stmt.init.kind != "var"
+                val loopVarNames = if (isLexical) (stmt.init as VarDecl).declarations.flatMap { patternNames(it.first) } else emptyList()
+                var iterEnv = Environment(env)
+                stmt.init?.let { execStmt(it, iterEnv) }
+                while (stmt.test == null || isTruthy(evalExpr(stmt.test, iterEnv))) {
                     try {
-                        execStmt(stmt.body, forEnv)
+                        execStmt(stmt.body, iterEnv)
                     } catch (b: BreakException) {
                         break
                     } catch (c: ContinueException) {
                     }
-                    stmt.update?.let { evalExpr(it, forEnv) }
+                    if (isLexical) {
+                        val nextEnv = Environment(env)
+                        for (name in loopVarNames) nextEnv.declare(name, iterEnv.get(name))
+                        iterEnv = nextEnv
+                    }
+                    stmt.update?.let { evalExpr(it, iterEnv) }
                 }
             }
             is ForIn -> execForIn(stmt, env)
@@ -180,6 +193,13 @@ class Interpreter {
         } catch (b: BreakException) {
             // break exits the switch
         }
+    }
+
+    /** All identifier names a pattern binds, including nested destructuring and rest names - used by the `For` loop's per-iteration `let`/`const` rebinding above. */
+    private fun patternNames(pattern: Pattern): List<String> = when (pattern) {
+        is IdentifierPattern -> listOf(pattern.name)
+        is ArrayPattern -> pattern.elements.filterNotNull().flatMap { patternNames(it) } + listOfNotNull(pattern.restName)
+        is ObjectPattern -> pattern.props.flatMap { patternNames(it.second) } + listOfNotNull(pattern.restName)
     }
 
     private fun execForIn(stmt: ForIn, env: Environment) {
@@ -348,8 +368,15 @@ class Interpreter {
             val superCtor = (if (env.has("__superclassctor__")) env.get("__superclassctor__") else null) as? ClassConstructor
                 ?: throw jsError("'super' keyword is only valid inside a derived class's method")
             val key = memberKey(expr.callee, env)
-            val method = findSuperMethod(superCtor, key) ?: throw jsError("super.$key is not a function")
-            return method.call(this, env.get("this"), evalArgs(expr.args, env))
+            val thisVal = env.get("this")
+            // Inside a *static* method, `this` is the class constructor itself (see evalCall's plain
+            // Member-call path, which passes the callee object as thisArg) rather than an instance, so
+            // `super.foo()` there must resolve `foo` as a static method up the superclass chain instead
+            // of searching instanceMethods - otherwise a static method's own `super.staticMethod()` call
+            // never finds anything, even though the superclass plainly has one.
+            val method = (if (thisVal is JsFunction) findSuperStaticMethod(superCtor, key) else findSuperMethod(superCtor, key))
+                ?: throw jsError("super.$key is not a function")
+            return method.call(this, thisVal, evalArgs(expr.args, env))
         }
         if (expr.callee is Member) {
             val obj = evalExpr(expr.callee.obj, env)
@@ -372,6 +399,13 @@ class Interpreter {
         if (m != null) return Closure(m.name, m.params, m.body, ctor.declEnv, isArrow = false, isGenerator = m.isGenerator, isAsync = m.isAsync)
         val parentCtor = ctor.superClassFn as? ClassConstructor ?: return null
         return findSuperMethod(parentCtor, name)
+    }
+
+    /** `super.staticMethod()` from within a static method - walks the superclass chain looking for a same-named static method (an ordinary property on the class constructor object itself, see [ClassConstructor]'s static-method handling in execClassDecl), mirroring [findSuperMethod]'s instance-method walk. */
+    private fun findSuperStaticMethod(ctor: ClassConstructor, name: String): JsFunction? {
+        (ctor.get(name) as? JsFunction)?.let { return it }
+        val parentCtor = ctor.superClassFn as? ClassConstructor ?: return null
+        return findSuperStaticMethod(parentCtor, name)
     }
 
     private fun evalNew(expr: New, env: Environment): JsValue {

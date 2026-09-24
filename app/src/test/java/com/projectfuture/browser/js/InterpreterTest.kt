@@ -572,4 +572,61 @@ class InterpreterTest {
         clonedObj.set("a", JsNumber(999.0))
         assertEquals(1.0, (original.get("a") as JsNumber).value, 0.0)
     }
+
+    /** The classic closure-over-loop-variable footgun: `for (let i ...)` must give each iteration its own binding of `i`, unlike `for (var i ...)`. */
+    @Test fun forLetGivesEachIterationItsOwnBindingForClosures() {
+        assertEquals(
+            "0,1,2",
+            str(
+                """
+                var fns = [];
+                for (let i = 0; i < 3; i++) {
+                    fns.push(function() { return i; });
+                }
+                var result = fns.map(function(f) { return f(); }).join(',');
+                """.trimIndent()
+            )
+        )
+    }
+
+    @Test fun forVarSharesOneBindingAcrossIterationsForClosures() {
+        assertEquals(
+            "3,3,3",
+            str(
+                """
+                var fns = [];
+                for (var i = 0; i < 3; i++) {
+                    fns.push(function() { return i; });
+                }
+                var result = fns.map(function(f) { return f(); }).join(',');
+                """.trimIndent()
+            )
+        )
+    }
+
+    @Test fun jsonStringifyThrowsOnCircularReferenceInsteadOfHangingOrCrashing() {
+        try {
+            runScript(
+                """
+                var o = {};
+                o.self = o;
+                JSON.stringify(o);
+                """.trimIndent()
+            )
+            throw AssertionError("expected JSON.stringify to throw on a circular reference")
+        } catch (e: JsException) {
+            // expected
+        }
+    }
+
+    /** The lexer already tokenizes these as single compound-assignment punctuators (see Lexer.kt's
+     * `multiCharPuncts`), but the parser's `assignOps` set only recognized `=`/`+=`/`-=`/`*=`/`/=`/`%=` -
+     * an inconsistency that made otherwise-valid JS using `&=`/`|=`/`^=`/`**=`/`>>>=` fail to parse. */
+    @Test fun bitwiseAndExponentCompoundAssignmentOperatorsParseAndEvaluate() {
+        assertNum(6.0, "var result = 7; result &= 6;")
+        assertNum(6.0, "var result = 2; result |= 4;")
+        assertNum(6.0, "var result = 7; result ^= 1;")
+        assertNum(8.0, "var result = 2; result **= 3;")
+        assertNum(2.0, "var result = 8; result >>>= 2;")
+    }
 }
