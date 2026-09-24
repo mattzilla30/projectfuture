@@ -85,6 +85,17 @@ import com.projectfuture.browser.html.TextNode
  * display list already points to, a later re-layout (e.g. a setInterval
  * tick) picks up newly-drawn pixels automatically.
  *
+ * Form controls (`<input>`, `<textarea>`, `<select>`, `<button>`) are
+ * replaced inline elements too, the same shape as `<img>`: a chrome box
+ * (border + fill) with a label drawn inside - the current value (or a
+ * greyed-out placeholder), the selected `<option>`'s text for `<select>`,
+ * or the button's own label. `<input type=hidden>` paints nothing. There's
+ * no native text cursor/caret or in-place typing - BrowserView routes a tap
+ * on one of these back to MainActivity (via [DisplayCommand.sourceElement]),
+ * which edits the value through a dialog and re-lays-out; see Tab's
+ * setFieldValue/toggleCheckbox/selectRadio/setSelectValue/submitForm.
+ * `<input type=file>` and `type=image` aren't interactive (no file picker).
+ *
  * `transform: translate()`/`translateX()`/`translateY()` folds into an
  * element's position the same way `position: relative`'s offset does.
  * `scale`/`rotate`/`skew` and animated `transition`/`@keyframes` are not
@@ -124,6 +135,8 @@ private const val LINE_LEADING = 1.25f
 private val SKIPPED_TAGS = setOf("script", "style", "head", "title", "meta", "link", "noscript")
 
 private enum class LayoutMode { BLOCK, INLINE, FLEX, GRID, TABLE }
+
+private enum class FormControlKind { TEXT_FIELD, CHECKBOX, RADIO, BUTTON, SELECT }
 
 /** The containing block used to resolve absolute/fixed descendants' geometry. */
 data class PositionContext(
@@ -224,6 +237,16 @@ class BlockLayout(
         LineFragment(trailingSpace, sourceElement)
     private class ImageFragment(val bitmap: Bitmap, val imgWidth: Float, val imgHeight: Float, sourceElement: ElementNode?) :
         LineFragment(false, sourceElement)
+    private class FormControlFragment(
+        val kind: FormControlKind,
+        val text: String,
+        val isPlaceholder: Boolean,
+        val checked: Boolean,
+        val boxWidth: Float,
+        val boxHeight: Float,
+        val style: TextStyle,
+        sourceElement: ElementNode?
+    ) : LineFragment(false, sourceElement)
 
     fun layout() {
         val currentColor = parseCssColor(node.style["color"]) ?: Color.BLACK
@@ -797,7 +820,9 @@ class BlockLayout(
                     }
                 }
                 is ElementNode -> {
-                    if (isSkipped(n) || n.tag == "br" || n.tag == "img" || n.tag == "svg" || n.tag == "canvas") return
+                    // "select"'s children are <option>s - summing their text would wildly
+                    // overcount versus what actually paints (just the selected one's label).
+                    if (isSkipped(n) || n.tag == "br" || n.tag == "img" || n.tag == "svg" || n.tag == "canvas" || n.tag == "select") return
                     val href = if (n.tag == "a") n.attr("href") else linkHref
                     for (c in n.children) walk(c, href)
                 }
@@ -829,6 +854,10 @@ class BlockLayout(
                 }
                 if (n.tag == "img" || n.tag == "svg" || n.tag == "canvas") {
                     currentImages[n]?.let { addImage(it, n) }
+                    return
+                }
+                if (n.tag == "input" || n.tag == "textarea" || n.tag == "select" || n.tag == "button") {
+                    if (!(n.tag == "input" && (n.attr("type") ?: "text").lowercase() == "hidden")) addFormControl(n)
                     return
                 }
                 val linkHref = if (n.tag == "a") n.attr("href") else currentLinkHref
@@ -943,6 +972,91 @@ class BlockLayout(
         addFragment(ImageFragment(bitmap, imgW, imgH, node), imgW)
     }
 
+    private fun formControlKind(el: ElementNode): FormControlKind = when (el.tag) {
+        "textarea" -> FormControlKind.TEXT_FIELD
+        "select" -> FormControlKind.SELECT
+        "button" -> FormControlKind.BUTTON
+        else -> when ((el.attr("type") ?: "text").lowercase()) {
+            "checkbox" -> FormControlKind.CHECKBOX
+            "radio" -> FormControlKind.RADIO
+            "submit", "button", "reset" -> FormControlKind.BUTTON
+            else -> FormControlKind.TEXT_FIELD
+        }
+    }
+
+    private fun directTextContent(el: ElementNode): String =
+        el.children.filterIsInstance<TextNode>().joinToString("") { it.text }.trim()
+
+    private fun buttonLabel(el: ElementNode): String {
+        if (el.tag == "button") return directTextContent(el).ifEmpty { "Submit" }
+        el.attr("value")?.takeIf { it.isNotEmpty() }?.let { return it }
+        return when ((el.attr("type") ?: "submit").lowercase()) {
+            "reset" -> "Reset"
+            "button" -> "Button"
+            else -> "Submit"
+        }
+    }
+
+    private fun selectedOptionLabel(el: ElementNode): String {
+        val options = el.children.filterIsInstance<ElementNode>().filter { it.tag == "option" }
+        val chosen = options.firstOrNull { it.attr("selected") != null } ?: options.firstOrNull()
+        return chosen?.let { directTextContent(it).ifEmpty { it.attr("value") ?: "" } } ?: ""
+    }
+
+    /** (displayed text, is-a-placeholder) - a placeholder paints in grey rather than the real value's color. */
+    private fun fieldTextAndPlaceholder(el: ElementNode): Pair<String, Boolean> {
+        if (el.tag == "textarea") {
+            val v = directTextContent(el)
+            return if (v.isNotEmpty()) v to false else (el.attr("placeholder") ?: "") to true
+        }
+        val v = el.attr("value")
+        if (!v.isNullOrEmpty()) {
+            val masked = if ((el.attr("type") ?: "").lowercase() == "password") "•".repeat(v.length) else v
+            return masked to false
+        }
+        return (el.attr("placeholder") ?: "") to true
+    }
+
+    /**
+     * Builds the box for a form control the same way [addImage] builds one
+     * for `<img>`: measure it, then push it through the shared inline-line
+     * fragment path so it wraps/aligns like any other inline content.
+     */
+    private fun addFormControl(el: ElementNode) {
+        val fontSizePx = parsePx(el.style["font-size"]) ?: 16f
+        val style = textStyleForElement(el, null)
+        val paint = FontCache.paintFor(style)
+        val kind = formControlKind(el)
+        when (kind) {
+            FormControlKind.CHECKBOX, FormControlKind.RADIO -> {
+                val size = fontSizePx * 1.1f
+                val checked = el.attr("checked") != null
+                addFragment(FormControlFragment(kind, "", false, checked, size, size, style, el), size)
+            }
+            FormControlKind.BUTTON -> {
+                val label = buttonLabel(el)
+                val w = (paint.measureText(label) + fontSizePx * 1.6f).coerceAtLeast(fontSizePx * 3f)
+                val h = fontSizePx * 1.8f
+                addFragment(FormControlFragment(kind, label, false, false, w, h, style, el), w)
+            }
+            FormControlKind.SELECT -> {
+                val label = selectedOptionLabel(el) + " ▾"
+                val w = (paint.measureText(label) + fontSizePx * 1.6f).coerceAtLeast(fontSizePx * 5f)
+                val h = fontSizePx * 1.8f
+                addFragment(FormControlFragment(kind, label, false, false, w, h, style, el), w)
+            }
+            FormControlKind.TEXT_FIELD -> {
+                val explicitWidth = el.style["width"]?.let { lengthValue(it, width, fontSizePx) }
+                val sizeAttr = el.attr("size")?.toIntOrNull()
+                val w = explicitWidth ?: sizeAttr?.let { it * paint.measureText("0") } ?: (fontSizePx * 10f)
+                val rows = if (el.tag == "textarea") (el.attr("rows")?.toIntOrNull() ?: 2).coerceAtLeast(1) else 1
+                val h = fontSizePx * 1.6f * rows
+                val (text, isPlaceholder) = fieldTextAndPlaceholder(el)
+                addFragment(FormControlFragment(kind, text, isPlaceholder, false, w, h, style, el), w)
+            }
+        }
+    }
+
     private fun addFragment(fragment: LineFragment, fragmentWidth: Float) {
         if (lineBuffer.isEmpty()) {
             val (li, ri) = floatInsetsAt(y + cursorY)
@@ -986,6 +1100,10 @@ class BlockLayout(
                 is ImageFragment -> {
                     widths[i] = f.imgWidth
                     maxAscent = maxOf(maxAscent, f.imgHeight) // baseline-aligned: sits entirely above the baseline
+                }
+                is FormControlFragment -> {
+                    widths[i] = f.boxWidth
+                    maxAscent = maxOf(maxAscent, f.boxHeight) // baseline-aligned, same as ImageFragment
                 }
             }
         }
@@ -1033,6 +1151,46 @@ class BlockLayout(
                             fixed = fixedContext, sourceElement = f.sourceElement
                         )
                     )
+                }
+                is FormControlFragment -> {
+                    val boxBottom = y + baseline
+                    val boxTop = boxBottom - f.boxHeight
+                    val boxLeft = fragX
+                    val boxRight = fragX + widths[i]
+                    if (f.kind == FormControlKind.CHECKBOX || f.kind == FormControlKind.RADIO) {
+                        inlineDisplay.add(DrawRect(boxLeft, boxTop, boxRight, boxBottom, 0xFF888888.toInt(), fixed = fixedContext, sourceElement = f.sourceElement))
+                        inlineDisplay.add(DrawRect(boxLeft + 2f, boxTop + 2f, boxRight - 2f, boxBottom - 2f, Color.WHITE, fixed = fixedContext, sourceElement = f.sourceElement))
+                        if (f.checked) {
+                            val inset = f.boxWidth * 0.3f
+                            inlineDisplay.add(DrawRect(boxLeft + inset, boxTop + inset, boxRight - inset, boxBottom - inset, 0xFF1A73E8.toInt(), fixed = fixedContext, sourceElement = f.sourceElement))
+                        }
+                    } else {
+                        val fillColor = if (f.kind == FormControlKind.BUTTON) 0xFFE0E0E0.toInt() else Color.WHITE
+                        inlineDisplay.add(DrawRect(boxLeft, boxTop, boxRight, boxBottom, 0xFF999999.toInt(), fixed = fixedContext, sourceElement = f.sourceElement))
+                        inlineDisplay.add(DrawRect(boxLeft + 1f, boxTop + 1f, boxRight - 1f, boxBottom - 1f, fillColor, fixed = fixedContext, sourceElement = f.sourceElement))
+                        if (f.text.isNotEmpty()) {
+                            val labelPaint = FontCache.paintFor(f.style)
+                            val fm = labelPaint.fontMetrics
+                            val textBaselineY = boxTop + (f.boxHeight - (fm.descent - fm.ascent)) / 2f - fm.ascent
+                            val textX = if (f.kind == FormControlKind.BUTTON) {
+                                boxLeft + (f.boxWidth - labelPaint.measureText(f.text)) / 2f
+                            } else {
+                                boxLeft + f.boxWidth * 0.08f
+                            }
+                            inlineDisplay.add(
+                                DrawText(
+                                    x = textX,
+                                    baselineY = textBaselineY,
+                                    text = f.text,
+                                    style = if (f.isPlaceholder) f.style.copy(color = 0xFF9AA0A6.toInt()) else f.style,
+                                    left = boxLeft, right = boxRight,
+                                    boxTop = boxTop, boxBottom = boxBottom,
+                                    fixed = fixedContext,
+                                    sourceElement = f.sourceElement
+                                )
+                            )
+                        }
+                    }
                 }
             }
             runningX += widths[i]
