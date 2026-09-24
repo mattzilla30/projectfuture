@@ -5,8 +5,8 @@ package com.projectfuture.browser.net
  * `style-src`/`img-src`/`font-src`/`connect-src`, each understanding
  * `'self'`, `'none'`, `*`, `'unsafe-inline'` (script-src/style-src only,
  * for inline `<script>`/`<style>` blocks - not nonces or hashes), and
- * explicit `scheme://host` or bare `host` sources with a leading `*.`
- * wildcard for subdomains. Not implemented: `nonce-`/`sha256-` sources,
+ * scheme sources (`https:`, `data:`), and explicit `scheme://host` or bare
+ * `host` sources with a leading `*.` wildcard for subdomains. Not implemented: `nonce-`/`sha256-` sources,
  * `report-uri`/`report-to`, `frame-ancestors` and other non-fetch
  * directives, multiple policies combined (only the first
  * `Content-Security-Policy` response header is used). A directive that
@@ -61,13 +61,18 @@ class ContentSecurityPolicy(private val directives: Map<String, List<String>>) {
 }
 
 private fun matchesHostSource(source: String, target: Url): Boolean {
+    // A scheme source such as `https:` allows every URL with that scheme. Real sites rely on it:
+    // hellomagazine.com sends `style-src https: 'unsafe-inline'`, and reading `https:` as a host
+    // name blocked both of its stylesheets.
+    if (source.endsWith(":") && !source.contains("/")) return source.dropLast(1).equals(target.scheme, ignoreCase = true)
     var s = source
     var scheme: String? = null
     if (s.contains("://")) {
         scheme = s.substringBefore("://")
         s = s.substringAfter("://")
     }
-    val host = s.substringBefore("/")
+    // Ports aren't compared: `host:443` or `host:*` matches the host on any port.
+    val host = s.substringBefore("/").substringBefore(":")
     if (scheme != null && !scheme.equals(target.scheme, ignoreCase = true)) return false
     return if (host.startsWith("*.")) {
         // CSP Level 3: a leading "*." wildcard source matches proper subdomains only -

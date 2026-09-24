@@ -1933,9 +1933,23 @@ class Tab(
                     val href = el.attr("href")
                     if (href != null) {
                         val styleSheetUrl = baseUrl.resolveOrNull(href)
-                        if (styleSheetUrl != null && !isMixedContent(baseUrl, styleSheetUrl) && csp.allowsStyleSrc(baseUrl, styleSheetUrl) && !TrackingProtection.isBlocked(baseUrl, styleSheetUrl)) {
+                        val blockedBy = when {
+                            styleSheetUrl == null -> "bad URL"
+                            isMixedContent(baseUrl, styleSheetUrl) -> "mixed content"
+                            !csp.allowsStyleSrc(baseUrl, styleSheetUrl) -> "CSP style-src"
+                            TrackingProtection.isBlocked(baseUrl, styleSheetUrl) -> "tracking protection"
+                            else -> null
+                        }
+                        if (blockedBy != null || styleSheetUrl == null) {
+                            BrowserLog.w("css", "skipped stylesheet ${logUrl(styleSheetUrl ?: baseUrl)}: $blockedBy")
+                        } else {
                             val future = subresourceExecutor.submit(Callable {
-                                try { styleSheetUrl.fetch(allowCookies = !isPrivate).body } catch (_: Exception) { null }
+                                try {
+                                    styleSheetUrl.fetch(allowCookies = !isPrivate).body
+                                } catch (e: Exception) {
+                                    BrowserLog.w("css", "stylesheet ${logUrl(styleSheetUrl)} failed: ${e.message ?: e.javaClass.simpleName}")
+                                    null
+                                }
                             })
                             sources.add(PendingCssSource(null, future, styleSheetUrl))
                         }
