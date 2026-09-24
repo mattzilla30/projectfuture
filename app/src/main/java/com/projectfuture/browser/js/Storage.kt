@@ -60,4 +60,13 @@ class JsStorage(private val origin: String, private val backing: StorageBacking)
     }
 
     override fun has(name: String): Boolean = backing.get(origin, name) != null
+
+    /**
+     * `Object.keys(localStorage)`/`for...in` (see Interpreter's use of
+     * ownKeys()) need the actual stored keys, not the base JsObject's
+     * unused `properties` map - JsStorage never writes to that map since
+     * everything is routed through [backing] instead, so without this
+     * override enumeration always saw an empty object.
+     */
+    override fun ownKeys(): List<String> = backing.keys(origin)
 }
