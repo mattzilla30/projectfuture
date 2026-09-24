@@ -86,7 +86,9 @@ class HtmlParser(private val source: String) {
     }
 
     private fun addText(rawText: String) {
-        if (rawText.isBlank() && unfinished.isEmpty()) return
+        // Whitespace between `</head>` and `<body>` (or before `<head>`) must not open an implicit
+        // body: the explicit `<body>` that follows would otherwise nest inside it.
+        if (rawText.isBlank() && (unfinished.isEmpty() || unfinished.last().tag == "html")) return
         if (unfinished.isEmpty()) implicitTags("")
         val decoded = decodeEntities(rawText)
         val parent = unfinished.lastOrNull() ?: return
@@ -111,8 +113,27 @@ class HtmlParser(private val source: String) {
         if (tag.isEmpty()) return
 
         if (isClosing) {
+            // Per the HTML spec, `</body>` and `</html>` close nothing: content that follows them
+            // (a trailing `<script>`, or a page that ends in `</div></html>` with `<body>` still
+            // open) still belongs in the body. Popping here used to drop the root `<html>` itself
+            // whenever anything else was open, discarding the whole document.
+            if (tag == "html" || tag == "body") return
             closeTag(tag)
             return
+        }
+
+        // A repeated `<html>`/`<body>`/`<head>` start tag merges into the element already open
+        // instead of nesting a second one inside it, matching the spec's "in body" handling.
+        if (tag == "html" && unfinished.isNotEmpty()) {
+            mergeAttributes(unfinished[0], attributes)
+            return
+        }
+        if (tag == "body" || tag == "head") {
+            val existing = unfinished.firstOrNull { it.tag == "body" }
+            if (existing != null) {
+                if (tag == "body") mergeAttributes(existing, attributes)
+                return
+            }
         }
 
         autoCloseForNewTag(tag)
@@ -165,11 +186,18 @@ class HtmlParser(private val source: String) {
         }
     }
 
+    private fun mergeAttributes(target: ElementNode, attributes: Map<String, String>) {
+        for ((key, value) in attributes) {
+            if (target.attr(key) == null) target.attributes[key] = value
+        }
+    }
+
     private fun closeTag(tag: String) {
         if (unfinished.size <= 1) return
-        // Find a matching open element; if none, ignore the stray close tag.
+        // Find a matching open element; if none, ignore the stray close tag. Index 0 is the root and
+        // is never popped: it has no parent to attach to, so popping it would lose the document.
         val idx = unfinished.indexOfLast { it.tag == tag }
-        if (idx == -1) return
+        if (idx <= 0) return
         while (unfinished.size - 1 >= idx) {
             val node = unfinished.removeAt(unfinished.size - 1)
             val parent = unfinished.lastOrNull()

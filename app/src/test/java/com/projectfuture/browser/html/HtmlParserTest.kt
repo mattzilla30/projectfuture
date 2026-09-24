@@ -167,6 +167,41 @@ class HtmlParserTest {
         assertEquals("don’t", text)
     }
 
+    @Test fun scriptAfterClosingBodyDoesNotDiscardTheDocument() {
+        // Hacker News's real markup shape: a <script> after </body>, then </html>.
+        val root = HtmlParser(
+            "<html lang=\"en\"><head><title>t</title></head><body><p>hello</p></body>" +
+                "<script type='text/javascript'>x = 1</script></html>\n"
+        ).parse()
+        assertEquals("html", root.tag)
+        assertEquals("en", root.attr("lang"))
+        val bodies = root.walkElementsCollect("body")
+        assertEquals(1, bodies.size)
+        assertEquals("hello", collectText(root.walkElementsCollect("p").single()))
+        assertEquals("body", root.walkElementsCollect("script").single().parent?.tag)
+    }
+
+    @Test fun closingHtmlWhileBodyIsStillOpenKeepsTheContent() {
+        val root = HtmlParser("<html><body><div>content</div></html>").parse()
+        assertEquals("content", collectText(root.walkElementsCollect("div").single()))
+    }
+
+    @Test fun whitespaceBetweenHeadAndBodyDoesNotNestASecondBody() {
+        val root = HtmlParser("<!DOCTYPE html>\n<html>\n<head>\n<title>t</title>\n</head>\n<body class=\"page\">\n<p>x</p>\n</body>\n</html>\n").parse()
+        val bodies = root.walkElementsCollect("body")
+        assertEquals(1, bodies.size)
+        assertEquals("page", bodies.single().attr("class"))
+        assertEquals(root, bodies.single().parent)
+    }
+
+    @Test fun repeatedBodyStartTagMergesAttributesInsteadOfNesting() {
+        val root = HtmlParser("<p>early</p><body class=\"late\"><p>later</p>").parse()
+        val bodies = root.walkElementsCollect("body")
+        assertEquals(1, bodies.size)
+        assertEquals("late", bodies.single().attr("class"))
+        assertEquals(2, root.walkElementsCollect("p").size)
+    }
+
     private fun ElementNode.walkElementsCollect(tag: String): List<ElementNode> {
         val out = ArrayList<ElementNode>()
         walkElements { if (it.tag == tag) out.add(it) }
