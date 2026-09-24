@@ -10,13 +10,18 @@ import java.util.zip.Inflater
  * `java.util.zip.Inflater` - a standard JDK/Android compression utility,
  * the same tier as `BitmapFactory` for images, not "browser engine" logic.
  *
- * WOFF2 is NOT supported: it compresses the whole font with Brotli, which
- * has no equivalent in the standard library - implementing a Brotli
- * decoder from scratch would be a substantial project of its own, on the
- * order of a PNG or JPEG decoder. Since WOFF2 is the default format most
- * font CDNs (e.g. Google Fonts) serve today, a `@font-face` pointing only
- * at a `.woff2` file will simply fail to load and fall back to the
- * inherited/system font - this is a real, known gap, not a bug.
+ * WOFF2 is still NOT supported here, even though a Brotli decoder now
+ * exists in this codebase (`net/BrotliDecoder.kt`, added for
+ * `Content-Encoding: br`) and could in principle decompress a WOFF2
+ * file's Brotli stream. WOFF2 needs more than raw decompression, though:
+ * it also reorders and re-encodes the `glyf`/`loca` glyph tables into a
+ * transposed, delta-coded transform format that has to be reconstructed
+ * back into normal SFNT table bytes - a second, separate spec on top of
+ * Brotli. Since WOFF2 is the default format most font CDNs (e.g. Google
+ * Fonts) serve today, a `@font-face` pointing only at a `.woff2` file will
+ * simply fail to load and fall back to the inherited/system font - this is
+ * a real, known gap, not a bug, and unlike the Brotli-for-HTTP-bodies case
+ * it wasn't in scope for this pass.
  *
  * This conversion is unverified beyond compiling: there's no emulator or
  * device available in this environment to visually confirm a WOFF file

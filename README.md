@@ -42,6 +42,14 @@ Roughly following the project's own feature roadmap (Phase 1: engine
 correctness) - see commit history for the detailed limitations of each:
 
 - HTTP and HTTPS (TLS via `SSLSocketFactory`), redirects, chunked bodies
+- HTTP/2 (`net/http2/`) over ALPN-negotiated TLS - real binary framing,
+  HPACK header compression (static + dynamic table, Huffman coding),
+  and genuinely multiplexed request streams on one connection, falling
+  back to HTTP/1.1 wherever a server doesn't offer `h2` (including every
+  plain `http://` URL, and pre-API-29 devices - see `Alpn.kt`)
+- Brotli (`Content-Encoding: br`) response decompression, via a vendored
+  copy of Google's reference Java decoder (see `BrotliDecoder.kt` for why
+  vendoring rather than a from-scratch decoder was the right call here)
 - Tag-soup HTML parsing with implied end tags and quote-safe tag scanning
 - `<link rel=stylesheet>` and `<style>` CSS, box model, flexbox, grid,
   tables, floats, positioning, z-index
@@ -62,6 +70,24 @@ Not yet implemented: CSS transitions/animations, `transform: scale()`/
 cursor/in-place typing (form field edits go through a dialog rather than
 on-canvas text editing). These are natural next milestones - see the
 project roadmap for the fuller list.
+
+**HTTP/3 (QUIC) is deliberately not implemented.** Unlike HTTP/2 (a framing
+layer over the TLS/TCP stack this project already has), HTTP/3 replaces the
+transport itself: it needs a from-scratch QUIC implementation over raw UDP
+`DatagramSocket`s, including its own packet-number-based loss detection and
+retransmission, a TLS 1.3 handshake carried inside QUIC frames rather than a
+normal `SSLSocket` handshake (the JDK/Android TLS stack has no supported way
+to drive a handshake over an arbitrary transport instead of a `Socket`, so
+this alone means vendoring or writing a TLS 1.3 state machine), stream
+multiplexing with its own flow control independent of TCP's, and a real
+congestion controller (at minimum a NewReno/CUBIC-style implementation) to
+be a good network citizen. That's multiple independent, substantial
+subsystems - realistically a multi-week project on its own even before
+QPACK (HTTP/3's HPACK equivalent, itself different from HPACK because it
+has to tolerate out-of-order delivery) or connection migration. Rather than
+ship a partial QUIC stack that silently falls over on real servers, or a
+"HTTP/3 support" that's actually just HTTP/2 or HTTP/1.1 underneath, this
+project sticks to HTTP/2 with an HTTP/1.1 fallback for now.
 
 ## Building
 
