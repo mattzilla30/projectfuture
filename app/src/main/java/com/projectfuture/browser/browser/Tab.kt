@@ -51,6 +51,9 @@ import com.projectfuture.browser.net.ContentSecurityPolicy
 import com.projectfuture.browser.net.corsAllows
 import com.projectfuture.browser.net.isMixedContent
 import com.projectfuture.browser.net.isSameOrigin
+import com.projectfuture.browser.rtc.PeerConnectionCore
+import com.projectfuture.browser.rtc.RTCDataChannelCore
+import com.projectfuture.browser.rtc.SdpSession
 import java.io.File
 import java.net.URLEncoder
 import java.util.concurrent.Executors
@@ -121,6 +124,17 @@ class Tab(
     /** `sessionStorage` is per-tab (unlike `localStorage`, which is shared via [sharedLocalStorage]) - see JsStorage's doc. */
     private val sessionStorageBacking = InMemoryStorageBacking()
     private val indexedDbStore = IndexedDbStore()
+    /**
+     * Service Worker registrations and Cache Storage are shared across
+     * every tab of the same origin and persist across app restarts (real
+     * per-origin, cross-session state, unlike sessionStorage/IndexedDbStore
+     * above) - via the module-level [sharedServiceWorkerRegistry]/
+     * [sharedCacheStorageStore], falling back to a private in-memory
+     * instance only if MainActivity hasn't set those up yet (e.g. in a
+     * test harness that constructs a Tab directly).
+     */
+    private val serviceWorkerRegistry: ServiceWorkerRegistry = sharedServiceWorkerRegistry ?: ServiceWorkerRegistry(InMemoryStorageBacking())
+    private val cacheStorageStore: CacheStorageStore = sharedCacheStorageStore ?: CacheStorageStore(InMemoryStorageBacking())
 
     /**
      * True once this (background) tab's heavy in-memory state has been
@@ -853,6 +867,17 @@ class Tab(
                 (options?.get("headers") as? JsObject)?.let { h -> for (k in h.ownKeys()) headers[k] = toJsString(h.get(k)) }
                 executor.execute {
                     try {
+                        // A registered, installed Service Worker whose scope covers this page gets first
+                        // look at every GET - see interceptWithServiceWorker's doc. Its response (if any)
+                        // never touches the network, matching the real Fetch/Service Worker spec's ordering.
+                        val swResponse = interceptWithServiceWorker(origin, requestUrl, method)
+                        if (swResponse != null) {
+                            mainHandler.post {
+                                promise.resolve(makeFetchResponse(HttpResponse(swResponse.status, emptyMap(), swResponse.body, requestUrl)))
+                                afterAsyncWork()
+                            }
+                            return@execute
+                        }
                         val response = requestUrl.fetch(method, bodyText?.toByteArray(Charsets.UTF_8), headers, allowCookies = !isPrivate)
                         mainHandler.post {
                             if (isSameOrigin(baseUrl, response.url) || corsAllows(baseUrl, response.headers)) {
@@ -944,6 +969,270 @@ class Tab(
         installWebSocket(interpreter, pageRoot, baseUrl, ::afterAsyncWork)
         installIndexedDb(interpreter, pageRoot)
         installWorker(interpreter, pageRoot, baseUrl)
+        installServiceWorker(interpreter, pageRoot, baseUrl)
+        installWebRTC(interpreter, pageRoot)
+    }
+
+    /**
+     * `navigator.serviceWorker.register(scriptUrl, {scope})`: persists a
+     * [ServiceWorkerRegistration] (see [serviceWorkerRegistry]) and runs
+     * its `install`/`activate` events once, off the main thread, via
+     * [ServiceWorkerHost] - the same executor already used for
+     * `fetch()`/XHR network I/O. Resolves to a minimal
+     * `ServiceWorkerRegistration`-shaped object (`scope`, `unregister()`).
+     * Fetch interception itself is wired into the `fetch()` builtin below
+     * (see its own doc) rather than here, since that's where requests
+     * actually originate.
+     */
+    private fun installServiceWorker(interpreter: Interpreter, pageRoot: ElementNode, baseUrl: Url) {
+        val origin = "${baseUrl.scheme}://${baseUrl.host}:${baseUrl.port}"
+        val serviceWorkerObj = JsObject()
+        serviceWorkerObj.set("register", NativeFunction("register", 2) { _, _, args ->
+            val promise = JsPromise()
+            val scriptUrlString = toJsString(args.getOrElse(0) { JsUndefined })
+            val scriptUrl = try { baseUrl.resolve(scriptUrlString) } catch (e: Exception) {
+                promise.reject(makeError("Invalid Service Worker script URL: $scriptUrlString")); return@NativeFunction promise
+            }
+            val options = args.getOrNull(1) as? JsObject
+            val scopeOption = options?.get("scope")?.takeIf { it != JsUndefined }?.let { toJsString(it) }
+            // Default scope is the script's own directory, matching the real spec.
+            val scope = scopeOption ?: scriptUrl.path.substringBeforeLast('/', "").let { if (it.isEmpty()) "/" else "$it/" }
+            executor.execute {
+                val reg = serviceWorkerRegistry.register(origin, scope, scriptUrl.toString())
+                mainHandler.post {
+                    if (currentDoc !== pageRoot) return@post
+                    val regObj = JsObject()
+                    regObj.set("scope", JsString(reg.scope))
+                    regObj.set("active", JsObject().apply { set("scriptURL", JsString(reg.scriptUrl)) })
+                    regObj.set("unregister", NativeFunction("unregister", 0) { _, _, _ ->
+                        JsPromise().apply { resolve(JsBoolean(serviceWorkerRegistry.unregister(origin, scope))) }
+                    })
+                    promise.resolve(regObj)
+                }
+            }
+            promise
+        })
+        serviceWorkerObj.set("ready", JsPromise().apply { resolve(serviceWorkerObj) })
+        val navigatorObj = (if (interpreter.globalEnv.has("navigator")) interpreter.globalEnv.get("navigator") as? JsObject else null)
+            ?: JsObject().also { interpreter.globalEnv.declare("navigator", it) }
+        navigatorObj.set("serviceWorker", serviceWorkerObj)
+        navigatorObj.set("userAgent", JsString(MOBILE_USER_AGENT))
+        (interpreter.globalEnv.get("window") as? JsObject)?.set("navigator", navigatorObj)
+
+        // caches: also exposed to the page itself (not just inside a service worker) per spec -
+        // a page can read/populate Cache Storage directly, without going through a worker at all.
+        interpreter.globalEnv.declare("caches", cachesForPage(origin))
+    }
+
+    /** The page-visible (non-worker) `caches` object: same [cacheStorageStore] backing, no `self`/event plumbing needed. */
+    private fun cachesForPage(origin: String): JsObject {
+        val caches = JsObject()
+        fun cacheObject(name: String): JsObject {
+            val cache = JsObject()
+            cache.set("put", NativeFunction("put", 2) { _, _, args ->
+                val reqUrl = args.getOrElse(0) { JsUndefined }.let { if (it is JsObject) toJsString(it.get("url")) else toJsString(it) }
+                val respArg = args.getOrElse(1) { JsUndefined } as? JsObject
+                val body = respArg?.get("body")?.let { if (it is JsString) it.value else "" } ?: ""
+                val status = (respArg?.get("status") as? JsNumber)?.value?.toInt() ?: 200
+                cacheStorageStore.put(origin, name, reqUrl, status, "OK", body)
+                JsPromise().apply { resolve(JsUndefined) }
+            })
+            cache.set("match", NativeFunction("match", 1) { _, _, args ->
+                val reqUrl = args.getOrElse(0) { JsUndefined }.let { if (it is JsObject) toJsString(it.get("url")) else toJsString(it) }
+                val entry = cacheStorageStore.match(origin, name, reqUrl)
+                JsPromise().apply {
+                    resolve(entry?.let { e -> JsObject().apply { set("status", JsNumber(e.status.toDouble())); set("ok", JsBoolean(e.status in 200..299)); set("body", JsString(e.body)); set("text", NativeFunction("text", 0) { _, _, _ -> JsPromise().apply { resolve(JsString(e.body)) } }) } } ?: JsUndefined)
+                }
+            })
+            cache.set("delete", NativeFunction("delete", 1) { _, _, args ->
+                val reqUrl = args.getOrElse(0) { JsUndefined }.let { if (it is JsObject) toJsString(it.get("url")) else toJsString(it) }
+                JsPromise().apply { resolve(JsBoolean(cacheStorageStore.deleteEntry(origin, name, reqUrl))) }
+            })
+            cache.set("keys", NativeFunction("keys", 0) { _, _, _ ->
+                JsPromise().apply { resolve(JsArray(cacheStorageStore.keys(origin, name).map { JsObject().apply { set("url", JsString(it)) } as JsValue }.toMutableList())) }
+            })
+            return cache
+        }
+        caches.set("open", NativeFunction("open", 1) { _, _, args ->
+            val name = toJsString(args.getOrElse(0) { JsUndefined })
+            cacheStorageStore.open(origin, name)
+            JsPromise().apply { resolve(cacheObject(name)) }
+        })
+        caches.set("match", NativeFunction("match", 1) { _, _, args ->
+            val reqUrl = args.getOrElse(0) { JsUndefined }.let { if (it is JsObject) toJsString(it.get("url")) else toJsString(it) }
+            val entry = cacheStorageStore.matchAny(origin, reqUrl)
+            JsPromise().apply {
+                resolve(entry?.let { e -> JsObject().apply { set("status", JsNumber(e.status.toDouble())); set("ok", JsBoolean(e.status in 200..299)); set("body", JsString(e.body)); set("text", NativeFunction("text", 0) { _, _, _ -> JsPromise().apply { resolve(JsString(e.body)) } }) } } ?: JsUndefined)
+            }
+        })
+        caches.set("delete", NativeFunction("delete", 1) { _, _, args -> JsPromise().apply { resolve(JsBoolean(cacheStorageStore.deleteCache(origin, toJsString(args.getOrElse(0) { JsUndefined })))) } })
+        caches.set("keys", NativeFunction("keys", 0) { _, _, _ -> JsPromise().apply { resolve(JsArray(cacheStorageStore.cacheNames(origin).map { JsString(it) as JsValue }.toMutableList())) } })
+        return caches
+    }
+
+    /**
+     * A Service Worker script whose `fetch` event handler calls
+     * `respondWith(...)` intercepts a matching page's requests. Only GET
+     * `fetch()` calls are checked here (matching [ServiceWorkerHost]'s own
+     * scope) - if a registration controls this page (its `scope` is a
+     * prefix of the request path, on the same origin) and its script
+     * actually handles this URL, the request never touches the network at
+     * all; otherwise this returns null and the caller falls through to a
+     * real `Url.fetch()`.
+     */
+    private fun interceptWithServiceWorker(origin: String, requestUrl: Url, method: String): SwResponse? {
+        if (requestUrl.scheme != "http" && requestUrl.scheme != "https") return null
+        val reg = serviceWorkerRegistry.findControlling(origin, requestUrl.path) ?: return null
+        val scriptCode = try { Url.parse(reg.scriptUrl).fetch().body } catch (_: Exception) { null } ?: return null
+        val host = ServiceWorkerHost(scriptCode, origin, reg.scope, serviceWorkerRegistry, cacheStorageStore, networkFetcher = { url ->
+            try {
+                val r = Url.parse(url).fetch()
+                SwResponse(r.statusCode, "OK", r.body)
+            } catch (_: Exception) { null }
+        })
+        return host.handleFetch(requestUrl.toString(), method)
+    }
+
+    /**
+     * `new RTCPeerConnection()` / `RTCDataChannel`: a thin JS-facing
+     * wrapper around [PeerConnectionCore] - all the actual SDP/ICE/
+     * transport logic (and, critically, an honest account of what does
+     * and doesn't really work) lives there, not here. This function only
+     * translates between JS objects/Promises and that engine's plain
+     * Kotlin API, using the same `mainHandler.post` + `currentDoc ===
+     * pageRoot` pattern as WebSocket/Worker above for every callback that
+     * crosses from a background thread back into this page's script.
+     */
+    private fun installWebRTC(interpreter: Interpreter, pageRoot: ElementNode) {
+        fun makeSdpObject(type: String, sdp: SdpSession): JsObject = JsObject().apply {
+            set("type", JsString(type))
+            set("sdp", JsString(sdp.toSdpString()))
+        }
+
+        fun makeDataChannelObject(interp: Interpreter, core: RTCDataChannelCore): JsObject {
+            val dc = JsObject()
+            dc.set("label", JsString(core.label))
+            dc.set("readyState", JsString(core.readyState))
+            dc.set("bufferedAmount", JsNumber(0.0))
+            dc.set("send", NativeFunction("send", 1) { _, _, args -> core.send(toJsString(args.getOrElse(0) { JsUndefined })); JsUndefined })
+            dc.set("close", NativeFunction("close", 0) { _, _, _ -> core.close(); JsUndefined })
+            core.onOpen = {
+                mainHandler.post {
+                    if (currentDoc === pageRoot) {
+                        dc.set("readyState", JsString("open"))
+                        (dc.get("onopen") as? JsFunction)?.call(interp, dc, listOf(JsEvent("open", dc)))
+                    }
+                }
+            }
+            core.onMessage = { text ->
+                mainHandler.post {
+                    if (currentDoc === pageRoot) {
+                        val event = JsEvent("message", dc)
+                        event.set("data", JsString(text))
+                        (dc.get("onmessage") as? JsFunction)?.call(interp, dc, listOf(event))
+                        afterAsyncWorkForRtc(pageRoot)
+                    }
+                }
+            }
+            core.onClose = {
+                mainHandler.post {
+                    if (currentDoc === pageRoot) {
+                        dc.set("readyState", JsString("closed"))
+                        (dc.get("onclose") as? JsFunction)?.call(interp, dc, listOf(JsEvent("close", dc)))
+                    }
+                }
+            }
+            return dc
+        }
+
+        val ctor = NativeFunction("RTCPeerConnection", 0) { interp, thisArg, _ ->
+            val obj = thisArg as? JsObject ?: JsObject()
+            val core = PeerConnectionCore()
+            obj.set("connectionState", JsString("new"))
+            obj.set("iceConnectionState", JsString("new"))
+
+            obj.set("createDataChannel", NativeFunction("createDataChannel", 1) { _, _, args ->
+                val label = toJsString(args.getOrElse(0) { JsUndefined })
+                makeDataChannelObject(interp, core.createDataChannel(label))
+            })
+            obj.set("createOffer", NativeFunction("createOffer", 0) { _, _, _ ->
+                JsPromise().apply { resolve(makeSdpObject("offer", core.createOffer())) }
+            })
+            obj.set("createAnswer", NativeFunction("createAnswer", 0) { _, _, _ ->
+                JsPromise().apply { resolve(makeSdpObject("answer", core.createAnswer())) }
+            })
+            obj.set("setLocalDescription", NativeFunction("setLocalDescription", 1) { _, _, args ->
+                val desc = args.getOrElse(0) { JsUndefined } as? JsObject
+                val sdpText = desc?.get("sdp")?.let { if (it != JsUndefined) toJsString(it) else null }
+                val promise = JsPromise()
+                if (sdpText == null) {
+                    promise.reject(makeError("setLocalDescription requires a session description with an sdp string"))
+                } else {
+                    executor.execute {
+                        try {
+                            core.setLocalDescription(SdpSession.parse(sdpText))
+                            mainHandler.post { promise.resolve(JsUndefined) }
+                        } catch (e: Exception) {
+                            mainHandler.post { promise.reject(makeError(e.message ?: "Invalid SDP")) }
+                        }
+                    }
+                }
+                promise
+            })
+            obj.set("setRemoteDescription", NativeFunction("setRemoteDescription", 1) { _, _, args ->
+                val desc = args.getOrElse(0) { JsUndefined } as? JsObject
+                val sdpText = desc?.get("sdp")?.let { if (it != JsUndefined) toJsString(it) else null }
+                val promise = JsPromise()
+                if (sdpText == null) {
+                    promise.reject(makeError("setRemoteDescription requires a session description with an sdp string"))
+                } else {
+                    executor.execute {
+                        try {
+                            core.setRemoteDescription(SdpSession.parse(sdpText))
+                            mainHandler.post { promise.resolve(JsUndefined) }
+                        } catch (e: Exception) {
+                            mainHandler.post { promise.reject(makeError(e.message ?: "Invalid SDP")) }
+                        }
+                    }
+                }
+                promise
+            })
+            // Non-trickle only (see PeerConnectionCore's class doc): the one host candidate this engine
+            // ever generates already travels inline in the offer/answer SDP, so there is nothing further
+            // for addIceCandidate to add - it's accepted (so real trickle-ICE-shaped calling code doesn't
+            // throw) and simply resolves.
+            obj.set("addIceCandidate", NativeFunction("addIceCandidate", 1) { _, _, _ -> JsPromise().apply { resolve(JsUndefined) } })
+            obj.set("close", NativeFunction("close", 0) { _, _, _ -> core.close(); JsUndefined })
+
+            core.onConnectionStateChange = {
+                mainHandler.post {
+                    if (currentDoc === pageRoot) {
+                        obj.set("connectionState", JsString(core.connectionState))
+                        obj.set("iceConnectionState", JsString(if (core.connectionState == "connected") "connected" else core.connectionState))
+                        (obj.get("onconnectionstatechange") as? JsFunction)?.call(interp, obj, listOf(JsEvent("connectionstatechange", obj)))
+                    }
+                }
+            }
+            core.onDataChannel = { channelCore ->
+                mainHandler.post {
+                    if (currentDoc === pageRoot) {
+                        val event = JsObject()
+                        event.set("channel", makeDataChannelObject(interp, channelCore))
+                        (obj.get("ondatachannel") as? JsFunction)?.call(interp, obj, listOf(event))
+                    }
+                }
+            }
+            obj
+        }
+        interpreter.globalEnv.declare("RTCPeerConnection", ctor)
+    }
+
+    /** Same re-style/re-layout hook `afterAsyncWork` provides elsewhere in this file, for WebRTC callbacks specifically (installWebRTC is called before that closure exists in scope). */
+    private fun afterAsyncWorkForRtc(pageRoot: ElementNode) {
+        if (currentDoc !== pageRoot) return
+        computeStyles(pageRoot, currentAuthorRules)
+        relayout()
+        currentUrl?.let { onStateChanged(TabState.Updated(it, extractTitle(pageRoot))) }
     }
 
     /**

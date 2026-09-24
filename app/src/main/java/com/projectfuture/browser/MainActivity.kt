@@ -42,6 +42,11 @@ import com.projectfuture.browser.browser.BookmarkStore
 import com.projectfuture.browser.browser.HistoryStore
 import com.projectfuture.browser.browser.LocalStorageStore
 import com.projectfuture.browser.browser.sharedLocalStorage
+import com.projectfuture.browser.browser.CacheStorageStore
+import com.projectfuture.browser.browser.ServiceWorkerRegistry
+import com.projectfuture.browser.browser.SharedPrefsStorageBacking
+import com.projectfuture.browser.browser.sharedCacheStorageStore
+import com.projectfuture.browser.browser.sharedServiceWorkerRegistry
 import com.projectfuture.browser.browser.Settings
 import com.projectfuture.browser.browser.Tab
 import com.projectfuture.browser.browser.TabManager
@@ -83,6 +88,8 @@ class MainActivity : AppCompatActivity() {
         TrackingProtection.enabled = settings.trackingProtectionEnabled
         if (sharedCookieJar == null) sharedCookieJar = CookieJar(applicationContext)
         if (sharedLocalStorage == null) sharedLocalStorage = LocalStorageStore(applicationContext)
+        if (sharedServiceWorkerRegistry == null) sharedServiceWorkerRegistry = ServiceWorkerRegistry(SharedPrefsStorageBacking(applicationContext, "service_workers"))
+        if (sharedCacheStorageStore == null) sharedCacheStorageStore = CacheStorageStore(SharedPrefsStorageBacking(applicationContext, "cache_storage"))
 
         binding.browserView.onSizeAvailable = { width, height ->
             lastViewportWidth = width
