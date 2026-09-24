@@ -1,5 +1,15 @@
-<shape xmlns:android="http://schemas.android.com/apk/res/android"
-    android:shape="rectangle">
-    <solid android:color="?attr/colorSecondaryContainer" />
-    <corners android:radius="14dp" />
-</shape>
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The ripple lives here, masked to the same rounded-rect shape as the pill fill below it -
+     it used to be a separate `android:foreground="?attr/selectableItemBackgroundBorderless"`
+     on the TextView, which draws an unmasked ripple that ignores this shape entirely, so the
+     tap feedback visibly spilled outside (or didn't fill) the rounded pill instead of matching
+     it exactly. -->
+<ripple xmlns:android="http://schemas.android.com/apk/res/android"
+    android:color="?attr/colorOnSecondaryContainer">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="?attr/colorSecondaryContainer" />
+            <corners android:radius="14dp" />
+        </shape>
+    </item>
+</ripple>

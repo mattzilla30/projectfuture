@@ -63,7 +63,6 @@
             android:layout_height="40dp"
             android:layout_marginStart="4dp"
             android:background="@drawable/bg_tab_count"
-            android:foreground="?attr/selectableItemBackgroundBorderless"
             android:clickable="true"
             android:focusable="true"
             android:contentDescription="@string/action_tabs"
