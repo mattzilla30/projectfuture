@@ -33,6 +33,8 @@ class RemoteTabHandle(context: Context, tabIndex: Int, isPrivate: Boolean, onSta
     override val desktopMode get() = client.desktopMode
     override val readerModeActive get() = client.readerModeActive
     override val textScale get() = client.textScale
+    /** Always null - see [TabHandle.currentDoc]'s doc: the DOM doesn't cross the process boundary. */
+    override val currentDoc: ElementNode? get() = null
 
     override var onDownloadRequested: ((String, String?) -> Unit)?
         get() = client.onDownloadRequested

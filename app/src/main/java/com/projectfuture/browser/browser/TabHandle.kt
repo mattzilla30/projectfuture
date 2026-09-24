@@ -45,6 +45,18 @@ interface TabHandle {
     val desktopMode: Boolean
     val readerModeActive: Boolean
     val textScale: Float
+    /**
+     * The page's live DOM root, used only to rebuild the accessibility
+     * tree (see `BrowserView.setContent`/`updateAccessibilityTree`). Real
+     * for [LocalTabHandle] ([Tab.currentDoc] itself); always `null` for
+     * [com.projectfuture.browser.ipc.RemoteTabHandle] - the full DOM isn't
+     * proxied across the process boundary (only the display list and
+     * per-command shadow elements are), so a sandboxed tab falls back to
+     * the page-load announcement alone rather than the virtual
+     * accessibility tree. Making the DOM itself cross-process would be
+     * real, substantial additional work, not attempted here.
+     */
+    val currentDoc: ElementNode?
 
     /** Fired for `<a download href="...">` taps; MainActivity hands the URL off to Android's own DownloadManager. */
     var onDownloadRequested: ((url: String, suggestedFilename: String?) -> Unit)?
@@ -94,6 +106,7 @@ class LocalTabHandle(context: android.content.Context, isPrivate: Boolean, onSta
     override val desktopMode get() = tab.desktopMode
     override val readerModeActive get() = tab.readerModeActive
     override val textScale get() = tab.textScale
+    override val currentDoc get() = tab.currentDoc
 
     override var onDownloadRequested: ((String, String?) -> Unit)?
         get() = tab.onDownloadRequested
