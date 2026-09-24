@@ -10,7 +10,6 @@ import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
-import java.net.InetSocketAddress
 import java.net.Socket
 import java.nio.charset.Charset
 import java.security.SecureRandom
@@ -235,17 +234,14 @@ data class Url(
         // SSLContext instead of the platform default - scoped to just that host, so accepting one
         // bad certificate never weakens validation for any other site.
         val factory = if (CertificateExceptions.isAllowed(host)) trustAllSocketFactory() else SSLSocketFactory.getDefault()
-        (factory.createSocket() as Socket).also {
-            it.connect(InetSocketAddress(host, port), 15000)
-            // SNI + hostname verification happen automatically for SSLSocket
-            // created against a host/port pair on modern Android.
+        SocketConnector.connect(host, port) { factory.createSocket() as Socket }.also {
             if (it is SSLSocket) {
                 Alpn.offer(it)
                 it.startHandshake()
             }
         }
     } else {
-        Socket().also { it.connect(InetSocketAddress(host, port), 15000) }
+        SocketConnector.connect(host, port) { Socket() }
     }
 
     private fun trustAllSocketFactory(): SSLSocketFactory {

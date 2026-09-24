@@ -3,7 +3,6 @@ package com.projectfuture.browser.net
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
-import java.net.InetSocketAddress
 import java.net.Socket
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -42,9 +41,9 @@ class WebSocketClient(private val url: Url) {
         Thread {
             try {
                 val sock: Socket = if (url.scheme == "wss") {
-                    (SSLSocketFactory.getDefault().createSocket() as Socket).also { it.connect(InetSocketAddress(url.host, url.port), 15000) }
+                    SocketConnector.connect(url.host, url.port) { SSLSocketFactory.getDefault().createSocket() as Socket }
                 } else {
-                    Socket().also { it.connect(InetSocketAddress(url.host, url.port), 15000) }
+                    SocketConnector.connect(url.host, url.port) { Socket() }
                 }
                 socket = sock
 
