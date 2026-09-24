@@ -24,10 +24,24 @@ class ElementNode(
 
     fun attr(name: String): String? = attributes[name]
 
-    fun classList(): List<String> = (attributes["class"] ?: "").split(Regex("\\s+")).filter { it.isNotEmpty() }
+    // Style matching asks for this once per class selector per element, so it's cached against the
+    // attribute string it was split from (scripts can change `class` at any time).
+    private var classListSource: String? = null
+    private var classListCache: List<String> = emptyList()
+
+    fun classList(): List<String> {
+        val raw = attributes["class"] ?: ""
+        if (raw != classListSource) {
+            classListCache = raw.split(WHITESPACE).filter { it.isNotEmpty() }
+            classListSource = raw
+        }
+        return classListCache
+    }
 
     override fun toString() = "<$tag>"
 }
+
+private val WHITESPACE = Regex("\\s+")
 
 /** Depth-first walk over an element and its descendants (element nodes only). */
 fun ElementNode.walkElements(action: (ElementNode) -> Unit) {

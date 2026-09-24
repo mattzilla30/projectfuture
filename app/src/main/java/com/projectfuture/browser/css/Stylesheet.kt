@@ -44,10 +44,70 @@ private val BASE_STYLE = mapOf(
  */
 fun computeStyles(root: ElementNode, authorRules: List<CssRule>) {
     val rules = (CssParser(DEFAULT_STYLESHEET).parseRules() + authorRules).sortedBy { it.selector.priority }
-    styleNode(root, rules, BASE_STYLE)
+    styleNode(root, RuleIndex(rules), BASE_STYLE)
 }
 
-private fun styleNode(node: Node, rules: List<CssRule>, parentStyle: Map<String, String>) {
+/**
+ * Buckets rules by the id, class, or tag their rightmost compound selector requires, so each
+ * element only tests the rules that could possibly match it instead of every rule on the page
+ * (thousands on a real site). A rule's position in the priority-sorted list is kept, and
+ * candidates are applied in that order, so the cascade result is identical to testing every rule.
+ */
+internal class RuleIndex(rules: List<CssRule>) {
+    private class Entry(val order: Int, val rule: CssRule)
+
+    private val byId = HashMap<String, MutableList<Entry>>()
+    private val byClass = HashMap<String, MutableList<Entry>>()
+    private val byTag = HashMap<String, MutableList<Entry>>()
+    private val universal = ArrayList<Entry>()
+
+    init {
+        for ((order, rule) in rules.withIndex()) {
+            val entry = Entry(order, rule)
+            when (val key = bucketSelector(rule.selector)) {
+                NeverMatchSelector -> {}
+                is IdSelector -> byId.getOrPut(key.id) { ArrayList() }.add(entry)
+                is ClassSelector -> byClass.getOrPut(key.className) { ArrayList() }.add(entry)
+                is TagSelector -> byTag.getOrPut(key.tag) { ArrayList() }.add(entry)
+                else -> universal.add(entry)
+            }
+        }
+    }
+
+    /** The most selective simple selector every match must satisfy, or [UniversalSelector] when there isn't one. */
+    private fun bucketSelector(selector: Selector): Selector = when (selector) {
+        is DescendantSelector -> bucketSelector(selector.descendant)
+        is CompoundSelector -> {
+            if (selector.parts.any { it === NeverMatchSelector }) NeverMatchSelector
+            else selector.parts.firstOrNull { it is IdSelector }
+                ?: selector.parts.firstOrNull { it is ClassSelector }
+                ?: selector.parts.firstOrNull { it is TagSelector }
+                ?: UniversalSelector
+        }
+        else -> selector
+    }
+
+    /** Rules that match [node], in cascade order. */
+    fun matching(node: ElementNode): List<CssRule> {
+        val candidates = ArrayList<Entry>()
+        node.attr("id")?.let { id -> byId[id]?.let { candidates.addAll(it) } }
+        for (cls in node.classList()) byClass[cls]?.let { candidates.addAll(it) }
+        byTag[node.tag]?.let { candidates.addAll(it) }
+        candidates.addAll(universal)
+        candidates.sortBy { it.order }
+        val result = ArrayList<CssRule>(candidates.size)
+        var lastOrder = -1
+        for (entry in candidates) {
+            // A repeated class (`class="a a"`) would list the same bucket twice.
+            if (entry.order == lastOrder) continue
+            lastOrder = entry.order
+            if (entry.rule.selector.matches(node)) result.add(entry.rule)
+        }
+        return result
+    }
+}
+
+private fun styleNode(node: Node, rules: RuleIndex, parentStyle: Map<String, String>) {
     if (node !is ElementNode) return
 
     node.style.clear()
@@ -59,9 +119,7 @@ private fun styleNode(node: Node, rules: List<CssRule>, parentStyle: Map<String,
         if (key.startsWith("--")) node.style[key] = value
     }
 
-    for (rule in rules) {
-        if (rule.selector.matches(node)) node.style.putAll(rule.properties)
-    }
+    for (rule in rules.matching(node)) node.style.putAll(rule.properties)
 
     val inline = node.attr("style")
     if (!inline.isNullOrBlank()) {
