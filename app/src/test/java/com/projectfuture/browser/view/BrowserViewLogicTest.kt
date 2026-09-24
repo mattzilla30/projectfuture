@@ -162,4 +162,40 @@ class BrowserViewLogicTest {
         assertTrue(gate.shouldForwardToTapDetector(ACTION_DOWN, scaleInProgress = false))
         assertTrue(gate.shouldForwardToTapDetector(ACTION_UP, scaleInProgress = false))
     }
+
+    // ---- editTextColorScheme -------------------------------------------------------------------
+
+    @Test fun editTextColorSchemeUsesDarkColorsWhenDarkModeIsOn() {
+        // Real bug this backs the fix for: BrowserView used to compute an overlay EditText's
+        // dark-mode colors only once, at creation time, so toggling dark mode later never
+        // recomputed them. This is the pure decision both createEditTextFor and setDarkMode now
+        // share, so they can't drift out of sync with each other again.
+        val scheme = BrowserViewLogic.editTextColorScheme(darkMode = true, originalTextColor = -0x1000000)
+        assertEquals(BrowserViewLogic.DARK_MODE_EDIT_BACKGROUND, scheme.backgroundColor)
+        assertEquals(BrowserViewLogic.DARK_MODE_EDIT_TEXT, scheme.textColor)
+        assertEquals(BrowserViewLogic.DARK_MODE_EDIT_HINT, scheme.hintColor)
+    }
+
+    @Test fun editTextColorSchemeRestoresThePageOwnTextColorWhenDarkModeIsOff() {
+        val originalColor = -0x10000 // an arbitrary page-supplied text color
+        val scheme = BrowserViewLogic.editTextColorScheme(darkMode = false, originalTextColor = originalColor)
+        // null background means "use the default bordered drawable", not a literal color -
+        // light mode never painted a solid background here.
+        assertNull(scheme.backgroundColor)
+        assertEquals(originalColor, scheme.textColor)
+        assertEquals(BrowserViewLogic.LIGHT_MODE_EDIT_HINT, scheme.hintColor)
+    }
+
+    @Test fun editTextColorSchemeTogglingBackOffRestoresTheExactOriginalColorEvenAfterDarkMode() {
+        val originalColor = -0x654321
+        val onScheme = BrowserViewLogic.editTextColorScheme(darkMode = true, originalTextColor = originalColor)
+        assertEquals(BrowserViewLogic.DARK_MODE_EDIT_TEXT, onScheme.textColor)
+
+        // Toggling back off must recover the field's own original color, not the dark-mode
+        // color it was showing a moment ago - this only works because BrowserView now keeps
+        // each field's original color around (textFieldOriginalColor) rather than reading it
+        // back off the already-recolored EditText.
+        val offScheme = BrowserViewLogic.editTextColorScheme(darkMode = false, originalTextColor = originalColor)
+        assertEquals(originalColor, offScheme.textColor)
+    }
 }

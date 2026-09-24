@@ -116,6 +116,12 @@ class BrowserView @JvmOverloads constructor(
     /** Live overlaid text-entry widgets, keyed by their DOM element. Text/password/textarea only. */
     private val textFieldViews = HashMap<ElementNode, EditText>()
 
+    /** Each field's own page-supplied text color (from its DrawFormControl.style), independent
+     * of whatever dark-mode-aware color is currently painted onto its EditText - needed so
+     * [setDarkMode] can restore the correct light-mode color when toggling dark mode back off,
+     * not just apply dark colors when toggling it on. See [BrowserViewLogic.editTextColorScheme]. */
+    private val textFieldOriginalColor = HashMap<ElementNode, Int>()
+
     /**
      * A GPU-composited layer painting only [normalCommands] (and non-fixed
      * find-match highlights), translated by the live scroll offset. Its
@@ -293,6 +299,7 @@ class BrowserView @JvmOverloads constructor(
     fun clearOverlayViews() {
         for (view in textFieldViews.values) removeView(view)
         textFieldViews.clear()
+        textFieldOriginalColor.clear()
     }
 
     /**
@@ -313,12 +320,23 @@ class BrowserView @JvmOverloads constructor(
             repositionOverlayViews()
         }
         scrollingContentLayer.invalidate()
+        // Real bug: a match landing inside `position: fixed` content (e.g. a sticky header) is
+        // drawn by FixedContentLayer.onDraw (see drawFindHighlights/BrowserViewLogic.
+        // findMatchesForLayer), but that layer is its own separately-cached hardware texture
+        // (see class doc) - unlike ScrollingContentLayer above, it was never told to
+        // re-rasterize here, so a fixed-content match's highlight (or a change in which match is
+        // "current") silently never appeared on screen until something unrelated (e.g. a scroll)
+        // happened to invalidate it.
+        fixedContentLayer.invalidate()
     }
 
     fun clearFindMatches() {
         findMatches = emptyList()
         findCurrentIndex = -1
         scrollingContentLayer.invalidate()
+        // Same reasoning as setFindMatches: without this, a highlight previously drawn on
+        // FixedContentLayer would stay stuck on screen after "clear" until an unrelated redraw.
+        fixedContentLayer.invalidate()
     }
 
     private fun maxScroll(): Float = BrowserViewLogic.maxScroll(contentHeight, height.toFloat())
@@ -349,6 +367,7 @@ class BrowserView @JvmOverloads constructor(
             if (el !in liveElements) {
                 removeView(view)
                 iter.remove()
+                textFieldOriginalColor.remove(el)
             }
         }
 
@@ -404,18 +423,12 @@ class BrowserView @JvmOverloads constructor(
         editText.setPadding(8, 4, 8, 4)
         editText.setBackgroundResource(android.R.drawable.edit_text)
         editText.setTextSize(TypedValue.COMPLEX_UNIT_PX, cmd.style.sizePx)
-        if (darkModeEnabled) {
-            // The page's own hardware-layer-composited content gets its colors inverted wholesale
-            // (see setDarkMode's doc); this real EditText isn't part of either layer, so it needs
-            // manually dark-aware colors.
-            editText.setBackgroundColor(Color.DKGRAY)
-            editText.setTextColor(Color.WHITE)
-            editText.setHintTextColor(Color.LTGRAY)
-        } else {
-            editText.setBackgroundResource(android.R.drawable.edit_text)
-            editText.setTextColor(cmd.style.color)
-            editText.setHintTextColor(Color.GRAY)
-        }
+        // The page's own hardware-layer-composited content gets its colors inverted wholesale
+        // (see setDarkMode's doc); this real EditText isn't part of either layer, so it needs
+        // manually dark-aware colors - see applyEditTextColorScheme for why this also has to be
+        // re-run later, not just here at creation.
+        cmd.sourceElement?.let { textFieldOriginalColor[it] = cmd.style.color }
+        applyEditTextColorScheme(editText, BrowserViewLogic.editTextColorScheme(darkModeEnabled, cmd.style.color))
         editText.hint = cmd.placeholder
         editText.setText(cmd.value)
         autofillHintsFor(cmd.sourceElement)?.let { hints ->
@@ -475,6 +488,26 @@ class BrowserView @JvmOverloads constructor(
         val paint = if (enabled) invertLayerPaint else null
         scrollingContentLayer.setLayerPaint(paint)
         fixedContentLayer.setLayerPaint(paint)
+        // Real bug fixed here: overlay EditText fields used to only get dark-mode-aware colors
+        // at the moment they were first created (in createEditTextFor), so toggling dark mode
+        // after a field already existed left it showing stale colors - a light-themed text box
+        // on a dark-inverted page, or vice versa. Re-apply the scheme to every live field now.
+        for ((el, view) in textFieldViews) {
+            val originalColor = textFieldOriginalColor[el] ?: continue
+            applyEditTextColorScheme(view, BrowserViewLogic.editTextColorScheme(enabled, originalColor))
+        }
+    }
+
+    /** Applies a [BrowserViewLogic.EditTextColorScheme] to a live overlay field - shared by
+     * [createEditTextFor] and [setDarkMode] so both stay in sync (see setDarkMode's doc). */
+    private fun applyEditTextColorScheme(view: EditText, scheme: BrowserViewLogic.EditTextColorScheme) {
+        if (scheme.backgroundColor != null) {
+            view.setBackgroundColor(scheme.backgroundColor)
+        } else {
+            view.setBackgroundResource(android.R.drawable.edit_text)
+        }
+        view.setTextColor(scheme.textColor)
+        view.setHintTextColor(scheme.hintColor)
     }
 
     /**
