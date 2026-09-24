@@ -107,10 +107,68 @@ class WebSocketClientTest {
         assertTrue("client should receive the server's message", messageLatch.await(5, TimeUnit.SECONDS))
         assertEquals("world", receivedByClient.get())
         assertTrue("close should be delivered", closeLatch.await(5, TimeUnit.SECONDS))
-        assertEquals(1000, closeCode)
+        // The server's close frame carried no payload at all, so per RFC 6455 5.5.1 there was no
+        // status code on the wire - "No Status Rcvd" (1005), not a fabricated 1000.
+        assertEquals(1005, closeCode)
 
         assertTrue(serverDone.await(5, TimeUnit.SECONDS))
         assertEquals("hello", receivedFromClient.get())
+        server.close()
+    }
+
+    /**
+     * A close frame's payload is a real 2-byte status code (+ optional UTF-8 reason), and real
+     * servers send codes other than 1000 - e.g. 1001 "Going Away" - which the client must surface
+     * as-is rather than always reporting a hardcoded 1000. Reproduces the bug fixed in
+     * WebSocketClient.readFrames: before the fix this assertion failed with closeCode == 1000.
+     */
+    @Test fun closeFrameStatusCodeIsParsedNotHardcoded() {
+        val server = ServerSocket(0)
+        val serverDone = CountDownLatch(1)
+
+        Thread {
+            try {
+                val socket = server.accept()
+                val input = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.US_ASCII))
+                var clientKey: String? = null
+                var line = input.readLine()
+                while (line != null && line.isNotEmpty()) {
+                    if (line.startsWith("Sec-WebSocket-Key:", ignoreCase = true)) {
+                        clientKey = line.substringAfter(":").trim()
+                    }
+                    line = input.readLine()
+                }
+                val accept = acceptKeyFor(clientKey!!)
+                val response = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: $accept\r\n\r\n"
+                socket.getOutputStream().write(response.toByteArray(Charsets.US_ASCII))
+                socket.getOutputStream().flush()
+
+                // Close frame payload: status code 1001 ("Going Away") + reason "bye".
+                val reasonBytes = "bye".toByteArray(Charsets.UTF_8)
+                val closePayload = ByteArray(2 + reasonBytes.size)
+                closePayload[0] = ((1001 shr 8) and 0xFF).toByte()
+                closePayload[1] = (1001 and 0xFF).toByte()
+                reasonBytes.copyInto(closePayload, 2)
+                writeServerFrame(socket.getOutputStream(), 0x8, closePayload)
+                socket.close()
+            } catch (_: Exception) {
+            } finally {
+                serverDone.countDown()
+            }
+        }.apply { isDaemon = true }.start()
+
+        val port = server.localPort
+        val client = WebSocketClient(Url.parse("ws://127.0.0.1:$port/socket"))
+        val closeLatch = CountDownLatch(1)
+        var closeCode = -1
+        var closeReason = ""
+        client.onClose = { code, reason -> closeCode = code; closeReason = reason; closeLatch.countDown() }
+        client.connect()
+
+        assertTrue("close should be delivered", closeLatch.await(5, TimeUnit.SECONDS))
+        assertEquals(1001, closeCode)
+        assertEquals("bye", closeReason)
+        assertTrue(serverDone.await(5, TimeUnit.SECONDS))
         server.close()
     }
 }

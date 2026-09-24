@@ -94,4 +94,43 @@ class UrlConnectionPoolTest {
             server.close()
         }
     }
+
+    /**
+     * Real servers send `charset=` in any position within `Content-Type`, not only as the last
+     * parameter (e.g. `Content-Type: text/html; charset=iso-8859-1; boundary=x`, a legal RFC 2045
+     * parameter list). Before the fix, `charsetFromContentType` handed everything from `charset=`
+     * to the end of the header - including any later parameters - to `Charset.forName`, which threw
+     * for a value like `iso-8859-1; boundary=x` and silently fell back to UTF-8, corrupting the
+     * decoded body of every response whose declared charset wasn't ASCII-compatible with UTF-8
+     * (the actual bug this reproduces: a single non-ASCII Latin-1 byte, 0xE9 = 'é' in ISO-8859-1,
+     * decodes as mojibake under UTF-8).
+     */
+    @Test fun charsetIsParsedWhenFollowedByAnotherContentTypeParameter() {
+        val server = ServerSocket(0)
+        Thread {
+            try {
+                val socket = server.accept()
+                val input = BufferedReader(InputStreamReader(socket.getInputStream()))
+                var line = input.readLine()
+                while (line != null && line.isNotEmpty()) line = input.readLine()
+                // 0xE9 is 'é' in ISO-8859-1 but a lone continuation byte (invalid/mojibake) in UTF-8.
+                val bodyBytes = byteArrayOf('h'.code.toByte(), 0xE9.toByte(), 'x'.code.toByte())
+                val head = "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=iso-8859-1; boundary=x\r\n" +
+                    "Content-Length: ${bodyBytes.size}\r\nConnection: close\r\n\r\n"
+                val output = socket.getOutputStream()
+                output.write(head.toByteArray(Charsets.US_ASCII))
+                output.write(bodyBytes)
+                output.flush()
+                socket.close()
+            } catch (_: Exception) {
+            }
+        }.apply { isDaemon = true }.start()
+        try {
+            val port = server.localPort
+            val response = Url.parse("http://127.0.0.1:$port/x").fetch()
+            assertEquals("héx", response.body)
+        } finally {
+            server.close()
+        }
+    }
 }
