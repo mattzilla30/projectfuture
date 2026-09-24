@@ -80,4 +80,35 @@ internal object BrowserViewLogic {
             return true
         }
     }
+
+    // Plain ARGB ints (not android.graphics.Color references) so this stays usable from pure
+    // JUnit tests with no Robolectric - values match Color.DKGRAY/WHITE/LTGRAY/GRAY exactly.
+    const val DARK_MODE_EDIT_BACKGROUND = 0xFF444444.toInt() // Color.DKGRAY
+    const val DARK_MODE_EDIT_TEXT = 0xFFFFFFFF.toInt() // Color.WHITE
+    const val DARK_MODE_EDIT_HINT = 0xFFCCCCCC.toInt() // Color.LTGRAY
+    const val LIGHT_MODE_EDIT_HINT = 0xFF888888.toInt() // Color.GRAY
+
+    /** null [backgroundColor] means "use the default bordered drawable" (light mode uses
+     * android.R.drawable.edit_text, not a solid fill color) rather than an actual color. */
+    data class EditTextColorScheme(val backgroundColor: Int?, val textColor: Int, val hintColor: Int)
+
+    /**
+     * Which colors an overlay `EditText` (see [BrowserView.createEditTextFor]) should use, given
+     * whether dark mode is on and the field's own page-supplied text color.
+     *
+     * Real bug this backs the fix for: [BrowserView] used to compute these colors only once, in
+     * `createEditTextFor`, at the moment a field's overlay `EditText` was first created. Toggling
+     * dark mode afterwards - or any later `setContent()` call that reused an existing overlay
+     * view via `syncOverlayViews`'s `getOrPut` - never re-ran that logic, so a field created
+     * before the toggle kept showing its stale pre-toggle colors: e.g. a light background with
+     * dark text sitting on top of an otherwise dark-mode-inverted page (or vice versa toggling
+     * off). [BrowserView.setDarkMode] now recomputes and reapplies this for every live overlay
+     * field, not just future ones.
+     */
+    fun editTextColorScheme(darkMode: Boolean, originalTextColor: Int): EditTextColorScheme =
+        if (darkMode) {
+            EditTextColorScheme(DARK_MODE_EDIT_BACKGROUND, DARK_MODE_EDIT_TEXT, DARK_MODE_EDIT_HINT)
+        } else {
+            EditTextColorScheme(backgroundColor = null, textColor = originalTextColor, hintColor = LIGHT_MODE_EDIT_HINT)
+        }
 }
