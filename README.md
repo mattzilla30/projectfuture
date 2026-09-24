@@ -197,25 +197,6 @@ get a matching reading order; an `<img>` with no non-empty `alt` (missing
 or `alt=""`) is treated as decorative and left out entirely rather than
 exposed as an unlabeled node.
 
-## Roadmap items this codebase alone can't finish
-
-A few items on this project's roadmap aren't things a code change can
-complete, regardless of how much engineering time goes into them, and are
-listed here plainly rather than as "not attempted" with no explanation:
-
-- **Sync** needs a backend service to sync to - there is nothing to build
-  client-side against until one exists.
-- **An extensions marketplace and DevTools** are ongoing tooling
-  investments (an extension API/runtime plus a store, and a real
-  inspector/debugger protocol and UI), not one-off features - they need
-  sustained work, not a single implementation pass.
-- **WPT (Web Platform Tests) conformance testing** needs the actual W3C
-  test suite wired into this project's CI, not just spec-reading; without
-  that wiring, "conformance" is unverified by construction.
-- **A security response program** (a disclosure process, a triage/patch
-  SLA, a published policy) is an organizational process, not code - it
-  can't be "implemented" in a commit.
-
 ## Building
 
 Requires JDK 17 and the Android SDK (compileSdk/targetSdk 36, minSdk 24).
