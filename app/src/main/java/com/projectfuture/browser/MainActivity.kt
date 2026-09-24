@@ -273,26 +273,6 @@ class MainActivity : AppCompatActivity() {
                 binding.browserView.resetScroll()
                 refreshView()
                 updateNavButtons()
-                // Announces navigation to a screen reader on every page load, same as before.
-                //
-                // Beyond this: BrowserView now also exposes a virtual-view AccessibilityNodeProvider
-                // (see BrowserAccessibilityNodeProvider.kt) built from the DOM/layout tree - headings,
-                // links, form controls, images with alt text, and landmarks each become a real
-                // accessibility node with bounds taken from the page's own DisplayCommand layout, in
-                // document order, so TalkBack's swipe-to-navigate / double-tap-to-activate gestures
-                // should work against the rendered page, not just this one load announcement.
-                //
-                // IMPORTANT, read before treating this as "done": that provider has NOT been verified
-                // against real TalkBack on a device or emulator - none is available in this
-                // environment. It's implemented defensively (flat hierarchy, real overlaid EditText
-                // children preserved, every framework-facing entry point fails closed instead of
-                // crashing - see that class's doc) and the pure tree-building logic it's built on
-                // (AccessibilityTreeBuilder.kt) has JVM unit test coverage
-                // (AccessibilityTreeBuilderTest.kt), but "implemented and unit-tested" is the accurate
-                // claim, not "works" - end-to-end TalkBack behavior remains this feature's top open
-                // verification risk, for the same reason noted here previously: a wrong accessibility
-                // tree can hang or crash TalkBack for the exact users depending on it.
-                binding.browserView.announceForAccessibility(label)
                 offerAutofillIfAvailable(tab)
             }
             is TabState.Updated -> {
@@ -375,7 +355,7 @@ class MainActivity : AppCompatActivity() {
         container.addView(searchLabel, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = 32 })
         container.addView(searchInput)
 
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle(R.string.menu_settings)
             .setView(container)
             .setPositiveButton(R.string.action_save) { d, _ ->
@@ -682,7 +662,7 @@ class MainActivity : AppCompatActivity() {
         // run before the active tab could plausibly have a download triggered against it.
         tab.onDownloadRequested = { url, filename -> startDownload(url, filename) }
         tab.onLoginFormSubmitted = { origin, username, password -> offerSavePassword(origin, username, password) }
-        binding.browserView.setContent(tab.displayList, tab.contentHeight, tab.currentDoc)
+        binding.browserView.setContent(tab.displayList, tab.contentHeight)
     }
 
     /** Offers to fill in a saved login the first time a matching login form appears on a freshly loaded page - never re-prompted on every keystroke, since this only runs from TabState.Loaded. */
@@ -839,7 +819,7 @@ class MainActivity : AppCompatActivity() {
      * weakening validation anywhere else.
      */
     private fun showCertificateErrorDialog(tab: TabHandle, url: Url, message: String) {
-        AlertDialog.Builder(this)
+        MaterialAlertDialogBuilder(this)
             .setTitle(R.string.certificate_error_title)
             .setMessage(getString(R.string.certificate_error_message, url.host, message))
             .setPositiveButton(R.string.certificate_error_proceed) { d, _ ->
@@ -945,7 +925,7 @@ class MainActivity : AppCompatActivity() {
                     inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
                 }
             }
-            AlertDialog.Builder(this)
+            MaterialAlertDialogBuilder(this)
                 .setView(input)
                 .setPositiveButton(android.R.string.ok) { _, _ -> tab.setFieldValue(element, input.text.toString()) }
                 .setNegativeButton(android.R.string.cancel, null)
@@ -959,7 +939,7 @@ class MainActivity : AppCompatActivity() {
         tab.requestSelectOptions(element) { options ->
             if (options.isEmpty()) return@requestSelectOptions
             val labels = options.map { it.label }.toTypedArray()
-            AlertDialog.Builder(this)
+            MaterialAlertDialogBuilder(this)
                 .setItems(labels) { _, which -> tab.setSelectValue(element, options[which].node) }
                 .show()
         }

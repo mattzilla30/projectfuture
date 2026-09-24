@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- @mipmap/ic_launcher and @mipmap/ic_launcher_round, aliased onto the
+     flattened drawables - the resource form pre-API-26 devices resolve
+     when mipmap-anydpi-v26/ (the adaptive-icon definition) doesn't apply
+     to them. -->
+<resources>
+    <item name="ic_launcher" type="mipmap">@drawable/ic_launcher</item>
+    <item name="ic_launcher_round" type="mipmap">@drawable/ic_launcher_round</item>
+</resources>

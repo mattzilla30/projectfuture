@@ -128,32 +128,29 @@
             android:textColor="?attr/colorOnSurface"
             android:textSize="13sp" />
 
-        <ImageButton
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/buttonFindPrev"
+            style="?attr/materialIconButtonStyle"
             android:layout_width="40dp"
             android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="@string/find_previous"
-            android:src="@drawable/ic_arrow_back"
-            app:tint="?attr/colorOnSurface" />
+            app:icon="@drawable/ic_arrow_back" />
 
-        <ImageButton
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/buttonFindNext"
+            style="?attr/materialIconButtonStyle"
             android:layout_width="40dp"
             android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="@string/find_next"
-            android:src="@drawable/ic_arrow_forward"
-            app:tint="?attr/colorOnSurface" />
+            app:icon="@drawable/ic_arrow_forward" />
 
-        <ImageButton
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/buttonFindClose"
+            style="?attr/materialIconButtonStyle"
             android:layout_width="40dp"
             android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="@string/find_close"
-            android:src="@drawable/ic_close"
-            app:tint="?attr/colorOnSurface" />
+            app:icon="@drawable/ic_close" />
 
     </LinearLayout>
 

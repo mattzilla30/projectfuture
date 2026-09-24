@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Material 3 Expressive color roles - light scheme. Seeded from the brand blue
-         (#3B7DE0), with a warm amber tertiary for expressive contrast. -->
+    <!-- Material 3 Expressive color roles - light scheme. Seeded from the app icon's
+         navy (#10162B), with the icon's sunset orange (#F2A33A) as the tertiary accent. -->
     <color name="md_primary">#FF2F5FA8</color>
     <color name="md_on_primary">#FFFFFFFF</color>
     <color name="md_primary_container">#FFD6E3FF</color>

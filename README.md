@@ -254,59 +254,6 @@ real protocol stacks, not stubs, for everything except media:
   sections, no codecs, no RTP/SRTP. A from-scratch codec/RTP stack is its
   own multi-month project and was not attempted.
 
-## Accessibility
-
-Screen-reader support here is a from-scratch reimplementation, the same as
-everything else in this project - there's no `WebView` accessibility bridge
-to fall back on.
-
-**Implemented today:**
-
-- Overlaid form-control fields (`<input type=text/password>`, `<textarea>`)
-  are real platform `EditText` views, not Canvas-painted pixels, so TalkBack
-  already reads/edits them correctly for free - this comes from
-  `view/BrowserView.kt`'s design, not any accessibility-specific code.
-- A page-load announcement (`View.announceForAccessibility`) fires on every
-  navigation, per `MainActivity.onTabStateChanged`.
-- A virtual-view `AccessibilityNodeProvider`
-  (`view/BrowserAccessibilityNodeProvider.kt`) exposes the rendered page's
-  real structure - headings (with level), links, form controls, images with
-  non-empty `alt` text, and landmarks (`nav`/`main`/`header`/`footer`/
-  `aside`) - as accessibility nodes, built from the DOM plus the exact
-  layout bounds the rendering engine already computed
-  (`accessibility/AccessibilityTreeBuilder.kt`). This is meant to let
-  TalkBack's swipe gesture move focus between these nodes in document order
-  and double-tap activate the focused one (`ACTION_CLICK`, wired back to the
-  same element-tap handling a real touch uses).
-- The tree-building logic (`AccessibilityTreeBuilder.kt`) is pure Kotlin
-  with no Android dependency and has JVM unit test coverage
-  (`app/src/test/java/com/projectfuture/browser/accessibility/AccessibilityTreeBuilderTest.kt`)
-  asserting correct roles, labels, bounds (including bounds unioned across
-  descendant elements), and document-order traversal for representative
-  sample DOM/layout trees.
-
-**What this explicitly has NOT been verified to do:** work with real
-TalkBack on a device or emulator. Neither is available in this development
-environment. The provider is written defensively for exactly that reason -
-a flat (non-nested) virtual hierarchy, real overlaid `EditText` children
-preserved alongside the virtual nodes, and every entry point the
-accessibility framework calls into fails closed (logs and returns
-null/false) rather than risking a crash - but "implemented and unit-tested"
-is the honest claim, not "works". A malformed accessibility tree can hang
-or crash TalkBack for the exact users depending on it, which is why this
-was not shipped as a verified feature; whoever can test on-device should
-treat that as the single highest-priority verification task for this
-feature before relying on it. See the doc comments on
-`BrowserAccessibilityNodeProvider` and `AccessibilityTreeBuilder` for the
-detailed reasoning.
-
-**Known limitations even setting device verification aside:** traversal
-order is document order, not true visual-geometry order, so a page that
-uses CSS positioning/floats/flex `order` to visually reorder content won't
-get a matching reading order; an `<img>` with no non-empty `alt` (missing
-or `alt=""`) is treated as decorative and left out entirely rather than
-exposed as an unlabeled node.
-
 ## Building
 
 Requires JDK 17 and the Android SDK (compileSdk/targetSdk 36, minSdk 24).

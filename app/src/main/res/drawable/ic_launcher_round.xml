@@ -1,17 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Flattened (non-adaptive) launcher icon: used directly by pre-API-26
-     launchers via the mipmap alias in values/mipmap_aliases.xml, and by
-     MainActivity's "Add to Home Screen" shortcuts (Icon.createWithResource).
-     Same navy/cream/orange mark as ic_launcher_background.xml +
-     ic_launcher_foreground.xml, just composited into one drawable at full
-     (unscaled) size - there's no adaptive-icon safe zone to respect here,
-     and this project's manual layout follows the source logo image's own
-     proportions directly. -->
+<!-- Round variant of ic_launcher.xml, for pre-API-26 launchers that pick a
+     round icon by resource name rather than deriving one from the adaptive
+     icon (API 26+ launchers use mipmap-anydpi-v26/ic_launcher_round.xml and
+     never look at this file). Same mark, clipped to the inscribed circle. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
+    <clip-path android:pathData="M54,0A54,54 0,1 1,53.99 0z" />
     <path
         android:fillColor="#10162B"
         android:pathData="M0,0h108v108h-108z" />
