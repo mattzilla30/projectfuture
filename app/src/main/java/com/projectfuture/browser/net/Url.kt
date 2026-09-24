@@ -1,5 +1,10 @@
 package com.projectfuture.browser.net
 
+import com.projectfuture.browser.net.http2.Alpn
+import com.projectfuture.browser.net.http2.Http2Connection
+import com.projectfuture.browser.net.http2.Http2ConnectionClosedException
+import com.projectfuture.browser.net.http2.Http2ConnectionPool
+import com.projectfuture.browser.net.http2.HpackHeader
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -10,6 +15,7 @@ import java.security.SecureRandom
 import java.security.cert.X509Certificate
 import java.util.zip.GZIPInputStream
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLSocket
 import javax.net.ssl.SSLSocketFactory
 import javax.net.ssl.X509TrustManager
 
@@ -19,14 +25,22 @@ import javax.net.ssl.X509TrustManager
  * everything from the TCP handshake up is written for this project.
  *
  * Cookies are sent/stored via [sharedCookieJar] (see CookieJar.kt for what
- * it does and doesn't cover). `Accept-Encoding: gzip` is sent, and a gzip
+ * it does and doesn't cover). `Accept-Encoding: gzip, br` is sent; a gzip
  * `Content-Encoding` response is decompressed via the standard
  * `java.util.zip.GZIPInputStream` - a platform compression utility, the
  * same tier as `Inflater` (used for WOFF font decompression) elsewhere in
- * this project, not "browser engine" logic. Brotli isn't supported (no
- * standard-library equivalent, and writing a Brotli decoder is its own
- * substantial project - same reasoning as the WOFF2 gap in FontDecoder.kt),
- * so a server that only offers `br` encoding won't get it requested.
+ * this project, not "browser engine" logic - and a `br` (Brotli) response
+ * is decompressed via the vendored decoder in `org.brotli.dec` (see
+ * `BrotliDecoder.kt` for why that's vendored rather than hand-written here).
+ *
+ * For `https` URLs, ALPN is offered during the TLS handshake (see
+ * `http2.Alpn`) and, when a server negotiates `h2`, the request is sent
+ * over a real multiplexed HTTP/2 connection (`http2.Http2Connection`,
+ * pooled per host:port in `Http2ConnectionPool`) instead of this class's
+ * hand-rolled HTTP/1.1 request/response text format - see [fetchViaHttp2].
+ * A server that doesn't offer `h2` (including every plain `http` URL, and
+ * every device below API 29 where this project doesn't attempt ALPN at
+ * all - see `Alpn`'s doc for why) falls back to HTTP/1.1 exactly as before.
  */
 data class Url(
     val scheme: String,
@@ -129,7 +143,13 @@ data class Url(
         }
     }
 
-    /** Shared socket/request/response-header/body-bytes plumbing for [fetch] and [fetchBytes]. Follows redirects itself. */
+    /**
+     * Shared socket/request/response-header/body-bytes plumbing for [fetch] and [fetchBytes].
+     * Follows redirects itself. For `https`, this also drives the TLS handshake explicitly
+     * (rather than letting it happen lazily on first read/write) so [Alpn] can offer `h2`
+     * beforehand and the negotiated protocol can be inspected by the caller right after -
+     * ALPN has to be set before the handshake and read only once it's complete.
+     */
     private fun openSocket(): Socket = if (isHttps) {
         // A host the user has explicitly clicked through a certificate warning for (see
         // CertificateExceptions/the TabState.CertificateError interstitial) gets a non-validating
@@ -140,6 +160,10 @@ data class Url(
             it.connect(InetSocketAddress(host, port), 15000)
             // SNI + hostname verification happen automatically for SSLSocket
             // created against a host/port pair on modern Android.
+            if (it is SSLSocket) {
+                Alpn.offer(it)
+                it.startHandshake()
+            }
         }
     } else {
         Socket().also { it.connect(InetSocketAddress(host, port), 15000) }
@@ -168,7 +192,7 @@ data class Url(
             append("Connection: keep-alive\r\n")
             append("User-Agent: $userAgent\r\n")
             append("Accept: text/html,text/css,*/*\r\n")
-            append("Accept-Encoding: gzip\r\n")
+            append("Accept-Encoding: gzip, br\r\n")
             if (cookieHeader != null) append("Cookie: $cookieHeader\r\n")
             if (body != null) append("Content-Length: ${body.size}\r\n")
             for ((k, v) in extraHeaders) if (!k.equals("User-Agent", ignoreCase = true)) append("$k: $v\r\n")
@@ -201,9 +225,26 @@ data class Url(
         }
 
         val poolKey = "$scheme://$host:$port"
+
+        // An already-open, ALPN-negotiated HTTP/2 connection to this host:port is reused directly,
+        // multiplexing this request as a new stream on it rather than opening a fresh socket -
+        // see fetchViaHttp2's doc for what that path does differently from the HTTP/1.1 code below.
+        if (isHttps) {
+            Http2ConnectionPool.get(poolKey)?.let { connection ->
+                return fetchViaHttp2(connection, method, body, extraHeaders, redirectsLeft, allowCookies)
+            }
+        }
+
         var socket = ConnectionPool.borrow(poolKey)
         var reused = socket != null
-        if (socket == null) socket = openSocket()
+        if (socket == null) {
+            socket = openSocket()
+            if (isHttps && socket is SSLSocket && Alpn.negotiated(socket) == "h2") {
+                val connection = Http2Connection(socket)
+                Http2ConnectionPool.put(poolKey, connection)
+                return fetchViaHttp2(connection, method, body, extraHeaders, redirectsLeft, allowCookies)
+            }
+        }
         socket.soTimeout = 20000
 
         val requestHead = buildRequestHead(method, body, extraHeaders, allowCookies)
@@ -289,16 +330,91 @@ data class Url(
                 try { socket.close() } catch (_: Exception) {}
             }
 
-            val bodyBytes = if (headers["content-encoding"]?.contains("gzip") == true) {
-                try { GZIPInputStream(rawBody.inputStream()).use { it.readBytes() } } catch (_: Exception) { rawBody }
-            } else {
-                rawBody
-            }
-
-            return RawHttpResponse(statusCode, headers, bodyBytes, this)
+            return RawHttpResponse(statusCode, headers, decodeContentEncoding(headers, rawBody), this)
         } catch (e: Exception) {
             try { socket.close() } catch (_: Exception) {}
             throw e
+        }
+    }
+
+    /**
+     * Performs one request as an HTTP/2 stream on an already-connected, already-multiplexed
+     * [connection] instead of the hand-rolled HTTP/1.1 text format `fetchRaw` otherwise speaks.
+     * Cookies, HSTS recording, redirect-following and `Content-Encoding` handling all mirror the
+     * HTTP/1.1 path exactly (same cookie jar, same HSTS store, same decoders) - only the wire
+     * format and connection-reuse model differ, and callers of `fetch`/`fetchBytes` can't tell
+     * which path served a given request.
+     */
+    private fun fetchViaHttp2(connection: Http2Connection, method: String, body: ByteArray?, extraHeaders: Map<String, String>, redirectsLeft: Int, allowCookies: Boolean): RawHttpResponse {
+        val cookieHeader = if (allowCookies) sharedCookieJar?.cookieHeaderFor(this) else null
+        val userAgent = extraHeaders.entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }?.value
+            ?: "ProjectFutureBrowser/0.1 (Android; from-scratch)"
+        val authority = if (port == 443) host else "$host:$port"
+        // HTTP/2 has no start line: the same request-line information instead travels as
+        // ":"-prefixed pseudo-headers, which by RFC 7540 8.1.2.1 must come first in the block.
+        val requestHeaders = ArrayList<HpackHeader>().apply {
+            add(HpackHeader(":method", method.uppercase()))
+            add(HpackHeader(":scheme", "https"))
+            add(HpackHeader(":authority", authority))
+            add(HpackHeader(":path", path))
+            add(HpackHeader("user-agent", userAgent))
+            add(HpackHeader("accept", "text/html,text/css,*/*"))
+            add(HpackHeader("accept-encoding", "gzip, br"))
+            if (cookieHeader != null) add(HpackHeader("cookie", cookieHeader))
+            if (body != null) add(HpackHeader("content-length", body.size.toString()))
+            for ((key, value) in extraHeaders) {
+                val lower = key.lowercase()
+                // These are HTTP/1.1 connection-management headers (RFC 7540 8.1.2.2 forbids
+                // them in HTTP/2) or already covered by a pseudo-header/handled above.
+                if (lower in setOf("user-agent", "host", "connection", "keep-alive", "transfer-encoding", "upgrade")) continue
+                add(HpackHeader(lower, value))
+            }
+        }
+
+        val response = try {
+            connection.request(requestHeaders, body)
+        } catch (e: Http2ConnectionClosedException) {
+            // The pooled connection died between being handed to us and being used (e.g. the
+            // server sent GOAWAY concurrently) - the same situation the HTTP/1.1 path handles by
+            // retrying once on a fresh socket, so do the same: open a brand new connection.
+            return fetchRaw(method, body, extraHeaders, redirectsLeft, allowCookies)
+        }
+
+        val headers = LinkedHashMap<String, String>()
+        val setCookieHeaders = ArrayList<String>()
+        for ((key, value) in response.headers) {
+            if (key == "set-cookie") setCookieHeaders.add(value) else headers[key] = value
+        }
+        if (allowCookies && setCookieHeaders.isNotEmpty()) sharedCookieJar?.store(this, setCookieHeaders)
+        headers["strict-transport-security"]?.let { HstsStore.record(host, it) } // Always over TLS here.
+
+        if (response.statusCode in intArrayOf(301, 302, 303, 307, 308) && redirectsLeft > 0) {
+            val location = headers["location"]
+            if (location != null) {
+                val next = resolve(location)
+                val (nextMethod, nextBody) = if (response.statusCode == 303 || (response.statusCode in intArrayOf(301, 302) && method != "GET" && method != "HEAD")) {
+                    "GET" to null
+                } else {
+                    method to body
+                }
+                return next.fetchRaw(nextMethod, nextBody, extraHeaders, redirectsLeft - 1, allowCookies)
+            }
+        }
+
+        return RawHttpResponse(response.statusCode, headers, decodeContentEncoding(headers, response.body), this)
+    }
+
+    /** Shared `Content-Encoding` handling for both the HTTP/1.1 and HTTP/2 request paths. Unrecognized or absent encodings pass the body through unchanged. */
+    private fun decodeContentEncoding(headers: Map<String, String>, rawBody: ByteArray): ByteArray {
+        val encoding = headers["content-encoding"] ?: return rawBody
+        return try {
+            when {
+                encoding.contains("br") -> BrotliDecoder.decode(rawBody)
+                encoding.contains("gzip") -> GZIPInputStream(rawBody.inputStream()).use { it.readBytes() }
+                else -> rawBody
+            }
+        } catch (_: Exception) {
+            rawBody
         }
     }
 
