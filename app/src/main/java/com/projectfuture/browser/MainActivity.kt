@@ -14,9 +14,11 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.text.InputType
 import android.text.TextUtils
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.view.inputmethod.EditorInfo
@@ -35,6 +37,7 @@ import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
+import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.projectfuture.browser.browser.BookmarkStore
 import com.projectfuture.browser.browser.HistoryStore
 import com.projectfuture.browser.browser.LocalStorageStore
@@ -45,6 +48,8 @@ import com.projectfuture.browser.browser.TabManager
 import com.projectfuture.browser.browser.TabSessionStore
 import com.projectfuture.browser.browser.TabState
 import com.projectfuture.browser.layout.DrawText
+import com.projectfuture.browser.html.ElementNode
+import com.projectfuture.browser.html.TextNode
 import com.projectfuture.browser.net.CookieJar
 import com.projectfuture.browser.net.HttpCache
 import com.projectfuture.browser.net.TrackingProtection
@@ -85,7 +90,7 @@ class MainActivity : AppCompatActivity() {
             if (tabManager.activeTab?.onViewportSizeChanged(width, height) == true) refreshView()
         }
         binding.browserView.onLinkTapped = { href -> tabManager.activeTab?.followLink(href) }
-        binding.browserView.onElementTapped = { element -> tabManager.activeTab?.dispatchClick(element) }
+        binding.browserView.onElementTapped = { element -> handleElementTap(element) }
         binding.browserView.onFormInput = { element, value -> tabManager.activeTab?.dispatchInputEvent(element, value) }
         binding.browserView.onPinchZoomEnded = { factor ->
             tabManager.activeTab?.let { tab ->
@@ -435,7 +440,7 @@ class MainActivity : AppCompatActivity() {
 
                 val cell = FrameLayout(this@MainActivity)
                 val isActive = position == tabManager.activeIndex
-                cell.setBackgroundColor(if (isActive) Color.parseColor("#D0E4FF") else Color.parseColor("#EEEEEE"))
+                cell.setBackgroundColor(themeColor(if (isActive) com.google.android.material.R.attr.colorSecondaryContainer else com.google.android.material.R.attr.colorSurfaceContainerHigh))
                 cell.layoutParams = ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, thumbHeightPx + 80)
 
                 val thumbnail = ImageView(this@MainActivity).apply {
@@ -452,6 +457,7 @@ class MainActivity : AppCompatActivity() {
                     maxLines = 1
                     ellipsize = TextUtils.TruncateAt.END
                     textSize = 13f
+                    setTextColor(themeColor(com.google.android.material.R.attr.colorOnSurface))
                     setPadding(8, 4, 40, 4)
                     layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM).apply {
                         topMargin = thumbHeightPx + 8
@@ -478,7 +484,7 @@ class MainActivity : AppCompatActivity() {
                 return cell
             }
         }
-        dialog = AlertDialog.Builder(this)
+        dialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.tabs_dialog_title)
             .setView(gridView)
             .setPositiveButton(R.string.action_new_tab) { d, _ -> openNewTab(); d.dismiss() }
@@ -568,30 +574,11 @@ class MainActivity : AppCompatActivity() {
         popup.show()
     }
 
-    /** Shared row builder for the bookmarks/history dialogs: a label, tap to navigate, X to remove. */
-    private fun buildListRow(label: String, onTap: () -> Unit, onRemove: () -> Unit): View {
-        val row = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(32, 24, 16, 24)
-        }
-        row.addView(
-            TextView(this).apply {
-                text = label
-                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-                textSize = 16f
-                maxLines = 1
-                ellipsize = TextUtils.TruncateAt.END
-            }
-        )
-        row.addView(
-            ImageButton(this).apply {
-                setImageResource(R.drawable.ic_close)
-                background = null
-                contentDescription = getString(R.string.action_close)
-                setOnClickListener { onRemove() }
-            }
-        )
+    /** Shared row builder for the tabs/bookmarks/history dialogs: a label, tap to act, X to remove. */
+    private fun buildListRow(parent: ViewGroup, label: String, onTap: () -> Unit, onRemove: () -> Unit): View {
+        val row = LayoutInflater.from(this).inflate(R.layout.dialog_list_row, parent, false)
+        row.findViewById<TextView>(R.id.rowLabel).text = label
+        row.findViewById<ImageButton>(R.id.rowClose).setOnClickListener { onRemove() }
         row.setOnClickListener { onTap() }
         return row
     }
@@ -608,6 +595,7 @@ class MainActivity : AppCompatActivity() {
                 override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                     val bookmark = bookmarks[position]
                     return buildListRow(
+                        parent,
                         label = bookmark.title,
                         onTap = { tabManager.activeTab?.navigate(bookmark.url); dialog.dismiss() },
                         onRemove = { bookmarkStore.remove(bookmark.url); bind() }
@@ -616,7 +604,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         bind()
-        dialog = AlertDialog.Builder(this)
+        dialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.bookmarks_dialog_title)
             .setView(listView)
             .setNegativeButton(R.string.action_close, null)
@@ -636,6 +624,7 @@ class MainActivity : AppCompatActivity() {
                 override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
                     val entry = entries[position]
                     return buildListRow(
+                        parent,
                         label = entry.title,
                         onTap = { tabManager.activeTab?.navigate(entry.url); dialog.dismiss() },
                         onRemove = { historyStore.remove(entry.url); bind() }
@@ -644,7 +633,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
         bind()
-        dialog = AlertDialog.Builder(this)
+        dialog = MaterialAlertDialogBuilder(this)
             .setTitle(R.string.history_dialog_title)
             .setView(listView)
             .setPositiveButton(R.string.action_clear) { _, _ -> historyStore.clear(); dialog.dismiss() }
@@ -811,6 +800,58 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, getString(R.string.download_failed), Toast.LENGTH_SHORT).show()
         }
     }
+
+    /**
+     * Routes a tap that BrowserView hit-tested to a source element (see
+     * LayoutBox's form-control doc comment). A generic element still just
+     * bubbles through DOM click dispatch as before; a form control also
+     * gets its type-specific behavior - toggling a checkbox/radio in place,
+     * prompting for a new value via a dialog, or submitting the form.
+     */
+    private fun handleElementTap(element: ElementNode) {
+        val tab = tabManager.activeTab ?: return
+        when (element.tag) {
+            "select" -> promptForSelectValue(element, tab)
+            // Text fields normally never reach here (they're overlaid EditText views), but keep the dialog as a fallback.
+            "textarea" -> promptForFieldValue(element, tab)
+            "input" -> when ((element.attr("type") ?: "text").lowercase()) {
+                "hidden" -> {}
+                "checkbox", "radio", "submit", "button", "reset", "image", "file" -> tab.dispatchClick(element)
+                else -> promptForFieldValue(element, tab)
+            }
+            // dispatchClick handles JS click events, checkbox/radio toggling, submit buttons and links.
+            else -> tab.dispatchClick(element)
+        }
+    }
+
+    private fun promptForFieldValue(element: ElementNode, tab: Tab) {
+        val input = EditText(this).apply {
+            setText(tab.currentFieldValue(element))
+            setSelection(text.length)
+            if (element.tag == "input" && (element.attr("type") ?: "").lowercase() == "password") {
+                inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+            }
+        }
+        AlertDialog.Builder(this)
+            .setView(input)
+            .setPositiveButton(android.R.string.ok) { _, _ -> tab.setFieldValue(element, input.text.toString()) }
+            .setNegativeButton(android.R.string.cancel, null)
+            .show()
+    }
+
+    private fun promptForSelectValue(element: ElementNode, tab: Tab) {
+        val options = element.children.filterIsInstance<ElementNode>().filter { it.tag == "option" }
+        if (options.isEmpty()) return
+        val labels = options.map { opt ->
+            opt.children.filterIsInstance<TextNode>().joinToString("") { it.text }.trim().ifEmpty { opt.attr("value") ?: "" }
+        }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setItems(labels) { _, which -> tab.setSelectValue(element, options[which]) }
+            .show()
+    }
+
+    /** Resolves a Material theme color attribute against the current (light/dark) theme. */
+    private fun themeColor(attr: Int): Int = com.google.android.material.color.MaterialColors.getColor(this, attr, Color.GRAY)
 
     private fun updateNavButtons() {
         val tab = tabManager.activeTab

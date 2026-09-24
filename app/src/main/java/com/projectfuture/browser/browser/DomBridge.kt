@@ -315,7 +315,7 @@ class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObjec
         "getContext" -> NativeFunction("getContext", 1) { _, _, args ->
             if (toJsString(args.getOrElse(0) { JsUndefined }) == "2d") bridge.getOrCreateCanvasContext(node) else JsNull
         }
-        "value" -> JsString(node.attr("value") ?: "")
+        "value" -> JsString(if (node.tag == "textarea") collectText(node) else (node.attr("value") ?: ""))
         "checked" -> JsBoolean(node.attributes.containsKey("checked"))
         "type" -> JsString(node.attr("type") ?: if (node.tag == "textarea") "textarea" else "text")
         "name" -> JsString(node.attr("name") ?: "")
@@ -332,7 +332,12 @@ class DomElement(val node: ElementNode, private val bridge: DomBridge) : JsObjec
             "id" -> node.attributes["id"] = toJsString(value)
             "className" -> node.attributes["class"] = toJsString(value)
             "innerHTML" -> setInnerHtml(toJsString(value))
-            "value" -> node.attributes["value"] = toJsString(value)
+            "value" -> if (node.tag == "textarea") {
+                node.children.clear()
+                node.children.add(TextNode(toJsString(value), node))
+            } else {
+                node.attributes["value"] = toJsString(value)
+            }
             "checked" -> if (isTruthy(value)) node.attributes["checked"] = "checked" else node.attributes.remove("checked")
             "disabled" -> if (isTruthy(value)) node.attributes["disabled"] = "disabled" else node.attributes.remove("disabled")
             else -> super.set(name, value)

@@ -52,6 +52,7 @@ import com.projectfuture.browser.net.corsAllows
 import com.projectfuture.browser.net.isMixedContent
 import com.projectfuture.browser.net.isSameOrigin
 import java.io.File
+import java.net.URLEncoder
 import java.util.concurrent.Executors
 import javax.net.ssl.SSLException
 
@@ -398,7 +399,12 @@ class Tab(
         val bridge = currentDomBridge ?: return
         val doc = currentDoc ?: return
         val url = currentUrl ?: return
-        element.attributes["value"] = newValue
+        if (element.tag == "textarea") {
+            element.children.clear()
+            element.children.add(TextNode(newValue, element))
+        } else {
+            element.attributes["value"] = newValue
+        }
         try { bridge.dispatchEvent(element, "input", interpreter) } catch (_: Exception) {}
         computeStyles(doc, currentAuthorRules)
         relayout()
@@ -416,7 +422,7 @@ class Tab(
             "radio" -> {
                 val name = element.attr("name")
                 if (name != null) {
-                    val scope = nearestForm(element) ?: currentDoc
+                    val scope = findAncestorForm(element) ?: currentDoc
                     scope?.walkElements { el ->
                         if (el !== element && el.tag == "input" && el.attr("type")?.lowercase() == "radio" && el.attr("name") == name) {
                             el.attributes.remove("checked")
@@ -430,7 +436,99 @@ class Tab(
         }
     }
 
-    private fun nearestForm(element: ElementNode): ElementNode? {
+
+    /** Current text shown in a text-like `<input>`/`<textarea>`, used to pre-fill MainActivity's edit dialog. */
+    fun currentFieldValue(element: ElementNode): String =
+        if (element.tag == "textarea") element.children.filterIsInstance<TextNode>().joinToString("") { it.text }
+        else element.attr("value") ?: ""
+
+    fun toggleCheckbox(element: ElementNode) {
+        if (element.attr("checked") != null) element.attributes.remove("checked") else element.attributes["checked"] = "checked"
+        mutateAndRefresh()
+    }
+
+    /** Checks [element] and unchecks every other radio sharing its `name` within the same `<form>` (or the whole document if it's outside one). */
+    fun selectRadio(element: ElementNode) {
+        val name = element.attr("name")
+        val scope = findAncestorForm(element) ?: currentDoc
+        if (name != null) {
+            scope?.walkElements { el ->
+                if (el !== element && el.tag == "input" && (el.attr("type") ?: "").lowercase() == "radio" && el.attr("name") == name) {
+                    el.attributes.remove("checked")
+                }
+            }
+        }
+        element.attributes["checked"] = "checked"
+        mutateAndRefresh()
+    }
+
+    fun setFieldValue(element: ElementNode, value: String) {
+        if (element.tag == "textarea") {
+            element.children.clear()
+            element.children.add(TextNode(value, element))
+        } else {
+            element.attributes["value"] = value
+        }
+        mutateAndRefresh()
+    }
+
+    fun setSelectValue(select: ElementNode, chosenOption: ElementNode) {
+        select.children.filterIsInstance<ElementNode>().forEach { if (it.tag == "option") it.attributes.remove("selected") }
+        chosenOption.attributes["selected"] = "selected"
+        mutateAndRefresh()
+    }
+
+    /**
+     * Submits [trigger]'s nearest ancestor `<form>`: gathers every named
+     * control's current value (checkboxes/radios only when checked; a
+     * `<select>` contributes its selected `<option>`'s value), URL-encodes
+     * them, and navigates - as a `?query` string on the form's `action` for
+     * `method="get"` (the default), or as a request body for
+     * `method="post"`. `enctype="multipart/form-data"` (file uploads) isn't
+     * supported - `<input type=file>` never has a value to contribute here.
+     */
+    fun submitForm(trigger: ElementNode) {
+        val form = findAncestorForm(trigger) ?: return
+        val baseUrl = currentUrl ?: return
+        val action = form.attr("action")?.takeIf { it.isNotBlank() }?.let { baseUrl.resolve(it) } ?: baseUrl
+        val method = (form.attr("method") ?: "get").trim().lowercase()
+
+        val params = ArrayList<Pair<String, String>>()
+        form.walkElements { el ->
+            if (el === form) return@walkElements
+            val name = el.attr("name") ?: return@walkElements
+            if (el.attributes.containsKey("disabled")) return@walkElements
+            when (el.tag) {
+                "input" -> when ((el.attr("type") ?: "text").lowercase()) {
+                    "submit", "button", "reset", "image", "file" -> {}
+                    "checkbox", "radio" -> if (el.attr("checked") != null) params.add(name to (el.attr("value") ?: "on"))
+                    else -> params.add(name to (el.attr("value") ?: ""))
+                }
+                "textarea" -> params.add(name to currentFieldValue(el))
+                "select" -> {
+                    val options = el.children.filterIsInstance<ElementNode>().filter { it.tag == "option" }
+                    val chosen = options.firstOrNull { it.attr("selected") != null } ?: options.firstOrNull()
+                    if (chosen != null) {
+                        val value = chosen.attr("value") ?: chosen.children.filterIsInstance<TextNode>().joinToString("") { it.text }
+                        params.add(name to value)
+                    }
+                }
+            }
+        }
+        val encoded = params.joinToString("&") { (k, v) -> "${urlEncode(k)}=${urlEncode(v)}" }
+
+        if (method == "post") {
+            load(action, HistoryAction.PUSH, method = "POST", body = encoded.toByteArray(Charsets.UTF_8))
+        } else {
+            val basePath = action.path.substringBefore('?')
+            val query = if (encoded.isEmpty()) "" else "?$encoded"
+            load(action.copy(path = basePath + query), HistoryAction.PUSH)
+        }
+    }
+
+    private fun urlEncode(s: String) = URLEncoder.encode(s, "UTF-8")
+
+    private fun findAncestorForm(element: ElementNode): ElementNode? {
         var current: ElementNode? = element
         while (current != null) {
             if (current.tag == "form") return current
@@ -456,47 +554,16 @@ class Tab(
             else -> false
         }
         if (!isSubmit) return null
-        return nearestForm(element)
+        return findAncestorForm(element)
     }
 
-    /**
-     * A basic GET/POST form submission: collects every named, enabled,
-     * non-button input/textarea's current value (checkboxes/radios only if
-     * checked) and either appends them as a query string (GET, or no
-     * explicit `method`) or sends them as an
-     * `application/x-www-form-urlencoded` POST body. No `<select>`, no file
-     * inputs, no multipart encoding - a script that wants more than this
-     * should call `preventDefault()` in a `submit` listener and handle it
-     * itself via `fetch()`.
-     */
-    private fun submitForm(form: ElementNode) {
-        val base = currentUrl ?: return
-        val action = form.attr("action")
-        val target = if (action.isNullOrBlank()) base else base.resolve(action)
-        val isPost = form.attr("method")?.lowercase() == "post"
-        val params = ArrayList<Pair<String, String>>()
-        form.walkElements { el ->
-            if (el === form) return@walkElements
-            if (el.tag != "input" && el.tag != "textarea") return@walkElements
-            if (el.attributes.containsKey("disabled")) return@walkElements
-            val name = el.attr("name") ?: return@walkElements
-            val type = if (el.tag == "input") el.attr("type")?.lowercase() else null
-            when (type) {
-                "submit", "button", "reset" -> {}
-                "checkbox", "radio" -> if (el.attributes.containsKey("checked")) params.add(name to (el.attr("value") ?: "on"))
-                else -> params.add(name to (el.attr("value") ?: ""))
-            }
-        }
-        val query = params.joinToString("&") { (k, v) ->
-            java.net.URLEncoder.encode(k, "UTF-8") + "=" + java.net.URLEncoder.encode(v, "UTF-8")
-        }
-        if (isPost) {
-            load(target, HistoryAction.PUSH, method = "POST", body = query.toByteArray(Charsets.UTF_8))
-        } else {
-            val separator = if (target.path.contains("?")) "&" else "?"
-            val finalUrl = if (query.isEmpty()) target else target.copy(path = target.path + separator + query)
-            load(finalUrl, HistoryAction.PUSH)
-        }
+    /** Shared by every form-control mutation above: re-cascade/re-layout and report Updated, same as dispatchClick's DOM-mutation path. */
+    private fun mutateAndRefresh() {
+        val doc = currentDoc ?: return
+        val url = currentUrl ?: return
+        computeStyles(doc, currentAuthorRules)
+        relayout()
+        onStateChanged(TabState.Updated(url, extractTitle(doc)))
     }
 
     /** Called by the view when its size changes; re-runs layout without re-fetching. */

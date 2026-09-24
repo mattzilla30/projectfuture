@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Material 3 Expressive color roles - dark scheme. -->
+    <color name="md_primary">#FFAAC7FF</color>
+    <color name="md_on_primary">#FF003060</color>
+    <color name="md_primary_container">#FF1E4677</color>
+    <color name="md_on_primary_container">#FFD6E3FF</color>
+    <color name="md_primary_inverse">#FF2F5FA8</color>
+
+    <color name="md_secondary">#FFBDC7DC</color>
+    <color name="md_on_secondary">#FF273240</color>
+    <color name="md_secondary_container">#FF3C4858</color>
+    <color name="md_on_secondary_container">#FFD9E3F8</color>
+
+    <color name="md_tertiary">#FFFFB871</color>
+    <color name="md_on_tertiary">#FF482A00</color>
+    <color name="md_tertiary_container">#FF683F00</color>
+    <color name="md_on_tertiary_container">#FFFFDDB3</color>
+
+    <color name="md_error">#FFFFB4AB</color>
+    <color name="md_on_error">#FF690005</color>
+    <color name="md_error_container">#FF93000A</color>
+    <color name="md_on_error_container">#FFFFDAD6</color>
+
+    <color name="md_background">#FF111318</color>
+    <color name="md_on_background">#FFE2E2E9</color>
+
+    <color name="md_surface">#FF111318</color>
+    <color name="md_on_surface">#FFE2E2E9</color>
+    <color name="md_surface_variant">#FF43474E</color>
+    <color name="md_on_surface_variant">#FFC3C7CF</color>
+    <color name="md_surface_inverse">#FFE2E2E9</color>
+    <color name="md_on_surface_inverse">#FF2F3036</color>
+
+    <color name="md_surface_container_lowest">#FF0C0E13</color>
+    <color name="md_surface_container_low">#FF1A1B20</color>
+    <color name="md_surface_container">#FF1E2025</color>
+    <color name="md_surface_container_high">#FF282A2F</color>
+    <color name="md_surface_container_highest">#FF33353A</color>
+
+    <color name="md_outline">#FF8D9199</color>
+    <color name="md_outline_variant">#FF43474E</color>
+    <color name="md_scrim">#FF000000</color>
+</resources>

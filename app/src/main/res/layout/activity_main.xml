@@ -10,49 +10,47 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
-        android:background="@color/chrome_background"
+        android:background="?attr/colorSurfaceContainer"
         android:gravity="center_vertical"
-        android:paddingHorizontal="4dp"
-        android:paddingVertical="6dp">
+        android:paddingHorizontal="8dp"
+        android:paddingVertical="8dp">
 
-        <ImageButton
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/buttonBack"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
+            style="?attr/materialIconButtonStyle"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
             android:contentDescription="@string/action_back"
-            android:src="@drawable/ic_arrow_back"
-            app:tint="@color/text_color" />
+            app:icon="@drawable/ic_arrow_back" />
 
-        <ImageButton
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/buttonForward"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
+            style="?attr/materialIconButtonStyle"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
             android:contentDescription="@string/action_forward"
-            android:src="@drawable/ic_arrow_forward"
-            app:tint="@color/text_color" />
+            app:icon="@drawable/ic_arrow_forward" />
 
-        <ImageButton
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/buttonReload"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
+            style="?attr/materialIconButtonStyle"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
             android:contentDescription="@string/action_reload"
-            android:src="@drawable/ic_reload"
-            app:tint="@color/text_color" />
+            app:icon="@drawable/ic_reload" />
 
         <EditText
             android:id="@+id/editAddress"
             android:layout_width="0dp"
-            android:layout_height="40dp"
+            android:layout_height="56dp"
             android:layout_weight="1"
             android:layout_marginHorizontal="4dp"
             android:background="@drawable/bg_address_bar"
-            android:textColor="@color/text_color"
-            android:textColorHint="#FF757575"
-            android:paddingHorizontal="12dp"
+            android:paddingHorizontal="20dp"
             android:hint="@string/address_hint"
+            android:textColor="?attr/colorOnSurface"
+            android:textColorHint="?attr/colorOnSurfaceVariant"
+            android:textSize="16sp"
             android:imeOptions="actionGo"
             android:inputType="textUri"
             android:maxLines="1"
@@ -71,35 +69,34 @@
             android:contentDescription="@string/action_tabs"
             android:gravity="center"
             android:text="1"
-            android:textColor="@color/text_color"
-            android:textSize="14sp"
-            android:textStyle="bold" />
+            android:textColor="?attr/colorOnSecondaryContainer"
+            android:textAppearance="?attr/textAppearanceLabelLarge" />
 
-        <ImageButton
+        <com.google.android.material.button.MaterialButton
             android:id="@+id/buttonMenu"
-            android:layout_width="40dp"
-            android:layout_height="40dp"
-            android:background="?attr/selectableItemBackgroundBorderless"
+            style="?attr/materialIconButtonStyle"
+            android:layout_width="48dp"
+            android:layout_height="48dp"
+            android:layout_marginStart="4dp"
             android:contentDescription="@string/action_menu"
-            android:src="@drawable/ic_more_vert"
-            app:tint="@color/text_color" />
+            app:icon="@drawable/ic_more_vert" />
 
     </LinearLayout>
 
-    <ProgressBar
+    <com.google.android.material.progressindicator.LinearProgressIndicator
         android:id="@+id/progressBar"
-        style="?android:attr/progressBarStyleHorizontal"
+        style="@style/Widget.Material3Expressive.LinearProgressIndicator.Wavy"
         android:layout_width="match_parent"
-        android:layout_height="2dp"
-        android:max="100"
-        android:visibility="gone" />
+        android:layout_height="wrap_content"
+        android:visibility="gone"
+        android:indeterminate="true" />
 
     <LinearLayout
         android:id="@+id/findBar"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="horizontal"
-        android:background="@color/chrome_background"
+        android:background="?attr/colorSurfaceContainer"
         android:gravity="center_vertical"
         android:paddingHorizontal="4dp"
         android:paddingVertical="6dp"
@@ -112,8 +109,8 @@
             android:layout_weight="1"
             android:layout_marginEnd="4dp"
             android:background="@drawable/bg_address_bar"
-            android:textColor="@color/text_color"
-            android:textColorHint="#FF757575"
+            android:textColor="?attr/colorOnSurface"
+            android:textColorHint="?attr/colorOnSurfaceVariant"
             android:paddingHorizontal="12dp"
             android:hint="@string/find_in_page_hint"
             android:imeOptions="actionSearch"
@@ -128,7 +125,7 @@
             android:minWidth="48dp"
             android:gravity="center"
             android:text="0/0"
-            android:textColor="@color/text_color"
+            android:textColor="?attr/colorOnSurface"
             android:textSize="13sp" />
 
         <ImageButton
@@ -138,7 +135,7 @@
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="@string/find_previous"
             android:src="@drawable/ic_arrow_back"
-            app:tint="@color/text_color" />
+            app:tint="?attr/colorOnSurface" />
 
         <ImageButton
             android:id="@+id/buttonFindNext"
@@ -147,7 +144,7 @@
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="@string/find_next"
             android:src="@drawable/ic_arrow_forward"
-            app:tint="@color/text_color" />
+            app:tint="?attr/colorOnSurface" />
 
         <ImageButton
             android:id="@+id/buttonFindClose"
@@ -156,7 +153,7 @@
             android:background="?attr/selectableItemBackgroundBorderless"
             android:contentDescription="@string/find_close"
             android:src="@drawable/ic_close"
-            app:tint="@color/text_color" />
+            app:tint="?attr/colorOnSurface" />
 
     </LinearLayout>
 
@@ -165,6 +162,6 @@
         android:layout_width="match_parent"
         android:layout_height="0dp"
         android:layout_weight="1"
-        android:background="@color/page_background" />
+        android:background="?attr/colorSurface" />
 
 </LinearLayout>
