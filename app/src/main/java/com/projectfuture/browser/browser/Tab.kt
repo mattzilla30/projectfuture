@@ -800,7 +800,15 @@ class Tab(
                     if (TrackingProtection.isBlocked(baseUrl, imgUrl)) return@walkElements
                     try {
                         val bytes = imgUrl.fetchBytes(allowCookies = !isPrivate).body
-                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { result[el] = it }
+                        // Decode bounds first (no pixel buffer allocated yet), then decode for
+                        // real with an inSampleSize chosen to bound the allocation - see
+                        // computeInSampleSize's doc for the OOM this avoids on a huge image.
+                        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+                        val options = BitmapFactory.Options().apply {
+                            inSampleSize = computeInSampleSize(bounds.outWidth, bounds.outHeight)
+                        }
+                        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)?.let { result[el] = it }
                     } catch (_: Exception) {
                         // Broken/unreachable image: skip it rather than failing the whole page load.
                     }

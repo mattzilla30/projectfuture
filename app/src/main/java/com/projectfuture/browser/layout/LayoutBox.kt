@@ -179,6 +179,41 @@ internal fun resolveImageSize(cssWidth: Float?, cssHeight: Float?, intrinsicW: F
     }
 
 /**
+ * Full `<img>` width/height resolution, extracted from [BlockLayout.addImage]
+ * so it's testable without a real Bitmap/ElementNode: combines the CSS
+ * `width`/`height` with the HTML `width`/`height` *attributes* (CSS wins,
+ * matching the real cascade where a presentational attribute behaves like a
+ * low-priority UA-stylesheet declaration), then resolves aspect ratio the
+ * same way [resolveImageSize] does.
+ *
+ * Real bug this fixes: [BlockLayout.addImage] only ever looked at
+ * `node.style["width"]`/`["height"]` (the *CSS* cascade - inline `style=`
+ * plus matched stylesheet rules). It never looked at the `<img width=200
+ * height=100>` HTML attributes at all, even though every real browser sizes
+ * an image from those when no CSS width/height is set - the single most
+ * common way pages avoid image layout shift, and `<canvas>`/`<svg>`
+ * elsewhere in this same layout code already do read their own `width`/
+ * `height` attributes ([DomBridge]'s canvas sizing, [SvgRenderer]). Without
+ * this, `<img width="300" height="200" src="...">` with no CSS at all fell
+ * through to intrinsic sizing and was rendered at the *decoded bitmap's*
+ * pixel size instead of the page-authored size.
+ */
+internal fun resolveImageBoxSize(
+    styleWidth: String?,
+    attrWidth: String?,
+    styleHeight: String?,
+    attrHeight: String?,
+    containingWidth: Float,
+    fontSizePx: Float,
+    intrinsicW: Float,
+    intrinsicH: Float
+): Pair<Float, Float> {
+    val cssWidth = (styleWidth ?: attrWidth)?.let { lengthValue(it, containingWidth, fontSizePx) }
+    val cssHeight = resolveCssImageHeight(styleHeight ?: attrHeight, fontSizePx)
+    return resolveImageSize(cssWidth, cssHeight, intrinsicW, intrinsicH)
+}
+
+/**
  * Resolves an `<img>`'s CSS `height` for [resolveImageSize]. A percentage
  * has no definite containing height to resolve against in this single-pass
  * layout, so it must come back null (unresolved, falls back to intrinsic/
@@ -1055,11 +1090,13 @@ class BlockLayout(
      */
     private fun addImage(bitmap: Bitmap, node: ElementNode) {
         val fontSizePx = parsePx(node.style["font-size"]) ?: 16f
-        val cssWidth = node.style["width"]?.let { lengthValue(it, width, fontSizePx) }
-        val cssHeight = resolveCssImageHeight(node.style["height"], fontSizePx)
         val intrinsicW = bitmap.width.toFloat().coerceAtLeast(1f)
         val intrinsicH = bitmap.height.toFloat().coerceAtLeast(1f)
-        val (imgW, imgH) = resolveImageSize(cssWidth, cssHeight, intrinsicW, intrinsicH)
+        val (imgW, imgH) = resolveImageBoxSize(
+            node.style["width"], node.attr("width"),
+            node.style["height"], node.attr("height"),
+            width, fontSizePx, intrinsicW, intrinsicH
+        )
         addFragment(ImageFragment(bitmap, imgW, imgH, node), imgW)
     }
 

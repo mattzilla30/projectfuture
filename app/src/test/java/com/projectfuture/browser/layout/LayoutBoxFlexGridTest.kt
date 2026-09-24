@@ -157,4 +157,60 @@ class LayoutBoxFlexGridTest {
         assertEquals(200f, w, 0.01f)
         assertEquals(300f, h, 0.01f)
     }
+
+    // ---- <img width=".."> / height=".."> HTML attributes used to be ignored entirely ----
+
+    @Test
+    fun htmlWidthAndHeightAttributesSizeTheImageWhenNoCssIsSet() {
+        // The core bug: an <img width="300" height="200"> with no CSS at all fell through
+        // to intrinsic (decoded-bitmap-pixel) sizing instead of honoring the attributes -
+        // unlike <canvas>/<svg> elsewhere in this codebase, which already read their own
+        // width/height attributes.
+        val (w, h) = resolveImageBoxSize(
+            styleWidth = null, attrWidth = "300",
+            styleHeight = null, attrHeight = "200",
+            containingWidth = 1000f, fontSizePx = 16f,
+            intrinsicW = 50f, intrinsicH = 50f
+        )
+        assertEquals(300f, w, 0.01f)
+        assertEquals(200f, h, 0.01f)
+    }
+
+    @Test
+    fun cssWidthHeightWinOverHtmlAttributes() {
+        val (w, h) = resolveImageBoxSize(
+            styleWidth = "150px", attrWidth = "300",
+            styleHeight = "100px", attrHeight = "200",
+            containingWidth = 1000f, fontSizePx = 16f,
+            intrinsicW = 50f, intrinsicH = 50f
+        )
+        assertEquals(150f, w, 0.01f)
+        assertEquals(100f, h, 0.01f)
+    }
+
+    @Test
+    fun onlyWidthAttributeSetPreservesAspectRatio() {
+        // Only the width attribute is set (a common real-world pattern); height must scale
+        // to preserve the intrinsic aspect ratio, not default to the raw intrinsic height.
+        val (w, h) = resolveImageBoxSize(
+            styleWidth = null, attrWidth = "400",
+            styleHeight = null, attrHeight = null,
+            containingWidth = 1000f, fontSizePx = 16f,
+            intrinsicW = 200f, intrinsicH = 100f
+        )
+        assertEquals(400f, w, 0.01f)
+        assertEquals(200f, h, 0.01f)
+    }
+
+    @Test
+    fun noCssOrAttributesFallsBackToIntrinsicSize() {
+        val (w, h) = resolveImageBoxSize(
+            styleWidth = null, attrWidth = null,
+            styleHeight = null, attrHeight = null,
+            containingWidth = 1000f, fontSizePx = 16f,
+            intrinsicW = 640f, intrinsicH = 480f
+        )
+        assertEquals(640f, w, 0.01f)
+        assertEquals(480f, h, 0.01f)
+    }
 }
