@@ -75,31 +75,54 @@ data class Url(
         return "$scheme://$host$portPart$path"
     }
 
-    /** Resolve a possibly-relative URL found in this page against this URL. */
+    /**
+     * Resolves a possibly-relative reference found in this page against this URL (RFC 3986 5.2).
+     * Throws for a reference with a scheme this client can't fetch (`data:`, `blob:`, `mailto:`,
+     * `javascript:`...); callers that walk page content use [resolveOrNull] instead.
+     */
     fun resolve(other: String): Url {
-        val trimmed = other.trim()
-        if (trimmed.contains("://")) return parse(trimmed)
-        if (trimmed.startsWith("//")) return parse("$scheme:$trimmed")
-        if (trimmed.startsWith("#")) return copy() // same-document fragment; treated as same page
-        if (trimmed.startsWith("/")) return copy(path = trimmed)
-
-        // Relative path: resolve against the directory of the current path.
-        val dir = if (path.endsWith("/")) path else path.substringBeforeLast('/', "") + "/"
-        val combined = normalizePath(dir + trimmed)
-        return copy(path = combined)
+        val ref = other.trim()
+        // Only a real scheme prefix makes a reference absolute. A "://" inside a query string
+        // (`/redirect?to=https://...`) is part of a relative reference.
+        if (SCHEME_PREFIX.containsMatchIn(ref)) return parse(ref)
+        if (ref.startsWith("//")) return parse("$scheme:$ref")
+        val basePath = path.substringBefore('#')
+        val baseDirectoryPath = basePath.substringBefore('?')
+        if (ref.isEmpty()) return copy(path = basePath)
+        if (ref.startsWith("#")) return copy(path = basePath + ref)
+        if (ref.startsWith("?")) return copy(path = baseDirectoryPath + ref)
+        val split = ref.indexOfFirst { it == '?' || it == '#' }
+        val refPath = if (split == -1) ref else ref.substring(0, split)
+        val refRest = if (split == -1) "" else ref.substring(split)
+        val merged = if (refPath.startsWith("/")) refPath else baseDirectoryPath.substringBeforeLast('/', "") + "/" + refPath
+        return copy(path = removeDotSegments(merged) + refRest)
     }
 
-    private fun normalizePath(rawPath: String): String {
-        val segments = ArrayList<String>()
-        for (segment in rawPath.split("/")) {
+    /** [resolve], or null for a reference that can't be fetched - so one odd `src`/`href` skips that resource instead of failing the whole page. */
+    fun resolveOrNull(other: String): Url? = try { resolve(other) } catch (_: Exception) { null }
+
+    /** RFC 3986 5.2.4 on the path only (never the query). Keeps a trailing slash, so relative links on `/docs/` still resolve inside `/docs/`. */
+    private fun removeDotSegments(rawPath: String): String {
+        val segments = rawPath.split("/")
+        val out = ArrayList<String>()
+        out.add("")
+        for ((i, segment) in segments.withIndex()) {
+            if (i == 0) continue
+            val last = i == segments.lastIndex
             when (segment) {
-                "", "." -> {}
-                ".." -> if (segments.isNotEmpty()) segments.removeAt(segments.size - 1)
-                else -> segments.add(segment)
+                "." -> if (last) out.add("")
+                ".." -> {
+                    if (out.size > 1) out.removeAt(out.size - 1)
+                    if (last) out.add("")
+                }
+                else -> out.add(segment)
             }
         }
-        return "/" + segments.joinToString("/")
+        return if (out.size == 1) "/" else out.joinToString("/")
     }
+
+    /** The request-target sent on the wire: the fragment is client-side only and never goes to the server (RFC 7230 5.3.1). */
+    private val requestTarget: String get() = path.substringBefore('#')
 
     /**
      * Performs a blocking request over a raw TCP (or TLS) socket, hand-rolling
@@ -228,7 +251,7 @@ data class Url(
         val userAgent = extraHeaders.entries.firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }?.value
             ?: DEFAULT_USER_AGENT
         return buildString {
-            append("${method.uppercase()} $path HTTP/1.1\r\n")
+            append("${method.uppercase()} $requestTarget HTTP/1.1\r\n")
             append("Host: $host\r\n")
             append("Connection: keep-alive\r\n")
             append("User-Agent: $userAgent\r\n")
@@ -404,7 +427,7 @@ data class Url(
             add(HpackHeader(":method", method.uppercase()))
             add(HpackHeader(":scheme", "https"))
             add(HpackHeader(":authority", authority))
-            add(HpackHeader(":path", path))
+            add(HpackHeader(":path", requestTarget))
             add(HpackHeader("user-agent", userAgent))
             add(HpackHeader("accept", "text/html,text/css,*/*"))
             add(HpackHeader("accept-encoding", "gzip, br"))
@@ -550,12 +573,19 @@ data class Url(
     }
 
     companion object {
+        private val SCHEME_PREFIX = Regex("^[a-zA-Z][a-zA-Z0-9+.-]*:")
+
         fun parse(raw: String): Url {
             var url = raw.trim()
             val scheme: String
-            if (url.contains("://")) {
-                scheme = url.substringBefore("://")
-                url = url.substringAfter("://")
+            val schemeMatch = SCHEME_PREFIX.find(url)
+            if (schemeMatch != null && url.startsWith(schemeMatch.value + "//")) {
+                scheme = schemeMatch.value.dropLast(1).lowercase()
+                url = url.substring(schemeMatch.value.length + 2)
+            } else if (schemeMatch != null && !url.substring(schemeMatch.value.length).let { it.isNotEmpty() && it[0].isDigit() }) {
+                // `data:`, `mailto:`, `javascript:`... - a scheme with no authority. (`host:8080`
+                // is excluded above: a digit right after the colon is a port, not a scheme.)
+                throw IllegalArgumentException("Unsupported scheme: ${schemeMatch.value.dropLast(1)}")
             } else {
                 scheme = "http"
             }
@@ -564,9 +594,13 @@ data class Url(
             // WebSocketClient does its own raw-socket handshake and never calls fetch() on one of these.
             require(scheme in setOf("http", "https", "ws", "wss")) { "Unsupported scheme: $scheme" }
 
-            if (!url.contains("/")) url += "/"
-            val host = url.substringBefore("/")
-            var path = "/" + url.substringAfter("/")
+            // The authority ends at the first '/', '?' or '#': `example.com?q=1` has host
+            // `example.com`, not `example.com?q=1`.
+            val authorityEnd = url.indexOfFirst { it == '/' || it == '?' || it == '#' }.let { if (it == -1) url.length else it }
+            val host = url.substring(0, authorityEnd).substringAfterLast('@')
+            var path = url.substring(authorityEnd)
+            if (!path.startsWith("/")) path = "/$path"
+            require(host.isNotEmpty()) { "Missing host in $raw" }
 
             var hostname = host
             var port = if (scheme == "https" || scheme == "wss") 443 else 80

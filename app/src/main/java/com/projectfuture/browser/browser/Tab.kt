@@ -71,7 +71,12 @@ sealed class TabState {
     data class CertificateError(val url: Url, val message: String) : TabState()
 }
 
-private enum class HistoryAction { PUSH, NONE }
+private enum class HistoryAction { PUSH, NONE, REPLACE }
+
+private val JAVASCRIPT_TYPES = setOf(
+    "text/javascript", "application/javascript", "application/x-javascript", "text/ecmascript",
+    "application/ecmascript", "text/jscript", "module"
+)
 
 // A real, mainstream-looking User-Agent, not this project's own name. Many real-world sites
 // (news publishers, retailers, anything behind Akamai/Cloudflare/PerimeterX-style bot
@@ -123,6 +128,9 @@ class Tab(
      */
     private val historyGenerations = ArrayList<Int>()
     private var documentGeneration = 0
+    // Bumped by every load(). Deferred navigations (a script's `location.replace`, a meta refresh)
+    // capture it and run only if no newer navigation has started since.
+    @Volatile private var navigationSeq = 0
     private var historyIndex = -1
     // A custom, large-stack thread factory rather than the default ~1MB thread stack: page load
     // runs HTML parsing, this hand-written tree-walking JS interpreter, style computation, and
@@ -433,7 +441,9 @@ class Tab(
 
     fun followLink(href: String) {
         val base = currentUrl ?: return
-        load(base.resolve(href), HistoryAction.PUSH)
+        // `javascript:`, `mailto:`, `tel:` and other non-fetchable links resolve to null and are ignored.
+        val target = base.resolveOrNull(href) ?: return
+        load(target, HistoryAction.PUSH)
     }
 
     /**
@@ -472,7 +482,7 @@ class Tab(
                 val href = anchor.attr("href") ?: return@let
                 if (anchor.attributes.containsKey("download")) {
                     val suggestedName = anchor.attr("download")?.takeIf { it.isNotBlank() }
-                    onDownloadRequested?.invoke(url.resolve(href).toString(), suggestedName)
+                    url.resolveOrNull(href)?.let { onDownloadRequested?.invoke(it.toString(), suggestedName) }
                 } else {
                     followLink(href)
                 }
@@ -607,7 +617,7 @@ class Tab(
     fun submitForm(trigger: ElementNode) {
         val form = findAncestorForm(trigger) ?: return
         val baseUrl = currentUrl ?: return
-        val action = form.attr("action")?.takeIf { it.isNotBlank() }?.let { baseUrl.resolve(it) } ?: baseUrl
+        val action = form.attr("action")?.takeIf { it.isNotBlank() }?.let { baseUrl.resolveOrNull(it) } ?: baseUrl
         val method = (form.attr("method") ?: "get").trim().lowercase()
 
         LoginFormDetector.findLoginForm(form)?.let { fields ->
@@ -622,7 +632,7 @@ class Tab(
         if (method == "post") {
             load(action, HistoryAction.PUSH, method = "POST", body = encoded.toByteArray(Charsets.UTF_8))
         } else {
-            val basePath = action.path.substringBefore('?')
+            val basePath = action.path.substringBefore('#').substringBefore('?')
             val query = if (encoded.isEmpty()) "" else "?$encoded"
             load(action.copy(path = basePath + query), HistoryAction.PUSH)
         }
@@ -676,6 +686,7 @@ class Tab(
     }
 
     private fun load(url: Url, action: HistoryAction, method: String = "GET", body: ByteArray? = null) {
+        val navigation = ++navigationSeq
         onStateChanged(TabState.Loading(url))
         // Read on the main thread (load() is always called from one) before
         // handing off to the background executor, rather than reading the
@@ -714,7 +725,8 @@ class Tab(
                 val root = HtmlParser(response.body).parse()
                 warmPreconnectHints(root, response.url)
                 // Scripts may mutate the DOM, so this runs before CSS/images/fonts are collected below.
-                val (interpreter, bridge) = runScripts(root, response.url, csp)
+                val (interpreter, bridge) = runScripts(root, response.url, csp, navigation)
+                val metaRefresh = findMetaRefresh(root)
                 val authorCss = collectAuthorCss(root, response.url, mediaViewportWidth, csp)
                 computeStyles(root, authorCss.rules)
                 val title = extractTitle(root)
@@ -741,6 +753,14 @@ class Tab(
                             historyGenerations.add(documentGeneration)
                             historyIndex = history.size - 1
                         }
+                        HistoryAction.REPLACE -> if (history.isEmpty()) {
+                            history.add(response.url)
+                            historyGenerations.add(documentGeneration)
+                            historyIndex = 0
+                        } else {
+                            history[historyIndex] = response.url
+                            historyGenerations[historyIndex] = documentGeneration
+                        }
                         HistoryAction.NONE -> if (history.isEmpty()) {
                             history.add(response.url)
                             historyGenerations.add(documentGeneration)
@@ -753,6 +773,7 @@ class Tab(
                     }
                     relayout()
                     onStateChanged(TabState.Loaded(response.url, title))
+                    scheduleMetaRefresh(metaRefresh, response.url)
                 }
             } catch (e: Throwable) {
                 // Throwable, not Exception: a StackOverflowError from deeply recursive real-world
@@ -823,7 +844,7 @@ class Tab(
             if (el.tag == "img") {
                 val src = el.attr("src")
                 if (!src.isNullOrBlank()) {
-                    val imgUrl = baseUrl.resolve(src)
+                    val imgUrl = baseUrl.resolveOrNull(src) ?: return@walkElements
                     if (isMixedContent(baseUrl, imgUrl)) return@walkElements
                     if (!csp.allowsImgSrc(baseUrl, imgUrl)) return@walkElements
                     if (TrackingProtection.isBlocked(baseUrl, imgUrl)) return@walkElements
@@ -885,21 +906,39 @@ class Tab(
      * class doc for what the script<->DOM/window bridge does and doesn't
      * cover yet (no real event dispatch from taps, no setTimeout/fetch).
      */
+    /**
+     * `<meta http-equiv="refresh" content="N; url=...">`: after N seconds, replace this page with the
+     * target, as long as nothing else has navigated first. A refresh with no URL (a periodic
+     * self-reload) is ignored.
+     */
+    private fun scheduleMetaRefresh(refresh: MetaRefresh?, pageUrl: Url) {
+        val href = refresh?.url ?: return
+        val target = pageUrl.resolveOrNull(href) ?: return
+        val navigation = navigationSeq
+        postMainDelayed((refresh.delaySeconds * 1000).toLong()) {
+            if (navigationSeq == navigation) load(target, HistoryAction.REPLACE)
+        }
+    }
+
     /** Returns the Interpreter/DomBridge pair so Tab can keep them alive for later click dispatch (see dispatchClick). */
-    private fun runScripts(root: ElementNode, baseUrl: Url, csp: ContentSecurityPolicy): Pair<Interpreter, DomBridge> {
+    private fun runScripts(root: ElementNode, baseUrl: Url, csp: ContentSecurityPolicy, navigation: Int): Pair<Interpreter, DomBridge> {
         val interpreter = Interpreter()
         val bridge = DomBridge(root)
         bridge.install(interpreter.globalEnv)
-        installBrowserRuntime(interpreter, root, baseUrl, csp)
+        installBrowserRuntime(interpreter, root, baseUrl, csp, navigation)
 
         val scripts = ArrayList<ElementNode>()
         root.walkElements { if (it.tag == "script") scripts.add(it) }
 
         for (scriptEl in scripts) {
+            // Only JavaScript types run. `application/ld+json` metadata, `text/template` markup and
+            // the like are data blocks, and real browsers never execute them.
+            val type = scriptEl.attr("type")?.substringBefore(';')?.trim()?.lowercase()
+            if (!type.isNullOrEmpty() && type !in JAVASCRIPT_TYPES) continue
             val src = scriptEl.attr("src")
             val code = if (!src.isNullOrBlank()) {
-                val scriptUrl = baseUrl.resolve(src)
-                if (isMixedContent(baseUrl, scriptUrl) || !csp.allowsScriptSrc(baseUrl, scriptUrl) || TrackingProtection.isBlocked(baseUrl, scriptUrl)) null
+                val scriptUrl = baseUrl.resolveOrNull(src)
+                if (scriptUrl == null || isMixedContent(baseUrl, scriptUrl) || !csp.allowsScriptSrc(baseUrl, scriptUrl) || TrackingProtection.isBlocked(baseUrl, scriptUrl)) null
                 else try { scriptUrl.fetch(allowCookies = !isPrivate).body } catch (_: Exception) { null }
             } else if (csp.allowsInlineScript()) {
                 scriptEl.children.filterIsInstance<TextNode>().joinToString("") { it.text }
@@ -939,7 +978,7 @@ class Tab(
      * floors its delay at 16ms (~60fps) as a throttle against a
      * pathological `setInterval(fn, 0)`.
      */
-    private fun installBrowserRuntime(interpreter: Interpreter, pageRoot: ElementNode, baseUrl: Url, csp: ContentSecurityPolicy) {
+    private fun installBrowserRuntime(interpreter: Interpreter, pageRoot: ElementNode, baseUrl: Url, csp: ContentSecurityPolicy, navigation: Int) {
         fun afterAsyncWork() {
             if (currentDoc !== pageRoot) return
             computeStyles(pageRoot, currentAuthorRules)
@@ -971,10 +1010,27 @@ class Tab(
             JsUndefined
         })
         interpreter.globalEnv.declare("history", historyObj)
+        // A script's navigation only counts while its page is still the tab's latest navigation:
+        // a timer from a page the user already left must not yank them somewhere else.
+        val location = JsLocation(
+            currentUrl = { (if (currentDoc === pageRoot) currentUrl else null) ?: baseUrl },
+            navigate = { target, replace ->
+                postMain { if (navigationSeq == navigation) load(target, if (replace) HistoryAction.REPLACE else HistoryAction.PUSH) }
+            },
+            reload = { postMain { if (navigationSeq == navigation) reload() } }
+        )
+        interpreter.globalEnv.declare("location", location)
+        (interpreter.globalEnv.get("document") as? JsObject)?.set("location", location)
         (interpreter.globalEnv.get("window") as? JsObject)?.let { window ->
             window.set("localStorage", localStorageObj)
             window.set("sessionStorage", sessionStorageObj)
             window.set("history", historyObj)
+            window.set("location", location)
+            // Single-frame engine: this window is its own top, parent and self.
+            for (name in listOf("self", "top", "parent", "frames")) {
+                window.set(name, window)
+                interpreter.globalEnv.declare(name, window)
+            }
         }
 
         interpreter.globalEnv.declare("fetch", NativeFunction("fetch", 2) { _, _, args ->
@@ -1801,8 +1857,8 @@ class Tab(
                 el.tag == "link" && el.attr("rel")?.lowercase()?.contains("stylesheet") == true -> {
                     val href = el.attr("href")
                     if (href != null) {
-                        val styleSheetUrl = baseUrl.resolve(href)
-                        if (!isMixedContent(baseUrl, styleSheetUrl) && csp.allowsStyleSrc(baseUrl, styleSheetUrl) && !TrackingProtection.isBlocked(baseUrl, styleSheetUrl)) {
+                        val styleSheetUrl = baseUrl.resolveOrNull(href)
+                        if (styleSheetUrl != null && !isMixedContent(baseUrl, styleSheetUrl) && csp.allowsStyleSrc(baseUrl, styleSheetUrl) && !TrackingProtection.isBlocked(baseUrl, styleSheetUrl)) {
                             val future = subresourceExecutor.submit(Callable {
                                 try { styleSheetUrl.fetch(allowCookies = !isPrivate).body } catch (_: Exception) { null }
                             })
@@ -1840,8 +1896,8 @@ class Tab(
      */
     private fun loadFontFaces(entries: List<Pair<FontFaceRule, Url>>, pageUrl: Url, csp: ContentSecurityPolicy): Map<String, Typeface> {
         val pending = entries.map { (rule, styleSheetBase) ->
-            val fontUrl = styleSheetBase.resolve(rule.srcUrl)
-            val future = if (isMixedContent(pageUrl, fontUrl) || !csp.allowsFontSrc(pageUrl, fontUrl) || TrackingProtection.isBlocked(pageUrl, fontUrl)) {
+            val fontUrl = styleSheetBase.resolveOrNull(rule.srcUrl)
+            val future = if (fontUrl == null || isMixedContent(pageUrl, fontUrl) || !csp.allowsFontSrc(pageUrl, fontUrl) || TrackingProtection.isBlocked(pageUrl, fontUrl)) {
                 null
             } else {
                 subresourceExecutor.submit(Callable {

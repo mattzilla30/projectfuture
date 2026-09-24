@@ -211,7 +211,12 @@ fun toJsString(v: JsValue): String = when (v) {
     // Real JS throws on implicit Symbol->string coercion; simplified here to a plain description string,
     // consistent with this interpreter's general preference for a usable result over a spec-accurate throw.
     is JsSymbol -> v.toString()
-    is JsObject -> "[object Object]"
+    is JsObject -> if (v is JsStringConvertible) v.jsString() else "[object Object]"
+}
+
+/** A host object with its own string form, the way `String(location)` gives the URL instead of "[object Object]". */
+interface JsStringConvertible {
+    fun jsString(): String
 }
 
 fun isTruthy(v: JsValue): Boolean = when (v) {
