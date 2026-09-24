@@ -61,11 +61,30 @@ class JsPromise : JsObject() {
         "then" -> NativeFunction("then", 2) { interpreter, _, args -> then(interpreter, args.getOrNull(0) as? JsFunction, args.getOrNull(1) as? JsFunction) }
         "catch" -> NativeFunction("catch", 1) { interpreter, _, args -> then(interpreter, null, args.getOrNull(0) as? JsFunction) }
         "finally" -> NativeFunction("finally", 1) { interpreter, _, args ->
+            // Per spec, `.finally()`'s callback runs regardless of fulfill/reject and doesn't alter the
+            // value/reason passed through - UNLESS the callback itself throws, in which case that
+            // exception becomes the returned promise's rejection reason, overriding the original
+            // settlement (e.g. `p.finally(() => { throw e }).catch(...)` must reach the `catch`, even if
+            // `p` fulfilled). The callback's exception must propagate here, not be swallowed.
             val fn = args.getOrNull(0) as? JsFunction
             val next = JsPromise()
             subscribe(
-                fulfilled = { v -> runCatching { fn?.call(interpreter, JsUndefined, emptyList()) }; next.resolve(v) },
-                rejected = { v -> runCatching { fn?.call(interpreter, JsUndefined, emptyList()) }; next.reject(v) }
+                fulfilled = { v ->
+                    try {
+                        fn?.call(interpreter, JsUndefined, emptyList())
+                        next.resolve(v)
+                    } catch (e: JsException) {
+                        next.reject(e.value)
+                    }
+                },
+                rejected = { v ->
+                    try {
+                        fn?.call(interpreter, JsUndefined, emptyList())
+                        next.reject(v)
+                    } catch (e: JsException) {
+                        next.reject(e.value)
+                    }
+                }
             )
             next
         }

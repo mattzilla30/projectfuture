@@ -23,6 +23,11 @@ fun installGlobals(env: Environment, interpreter: Interpreter) {
     env.declare("Proxy", makeProxyCtor())
     env.declare("Reflect", makeReflectObj())
     env.declare("ArrayBuffer", makeArrayBufferCtor())
+    env.declare("Error", ERROR_CTOR)
+    env.declare("TypeError", TYPE_ERROR_CTOR)
+    env.declare("RangeError", RANGE_ERROR_CTOR)
+    env.declare("SyntaxError", SYNTAX_ERROR_CTOR)
+    env.declare("ReferenceError", REFERENCE_ERROR_CTOR)
     for (kind in TypedArrayKind.values()) env.declare(kind.label, makeTypedArrayCtor(kind))
 
     env.declare("parseInt", NativeFunction("parseInt", 2) { _, _, args ->
@@ -101,7 +106,7 @@ private fun jsonStringify(v: JsValue, seen: MutableSet<JsObject>): String = when
     is JsString -> "\"" + v.value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""
     is JsFunction -> "null"
     is JsArray -> {
-        if (!seen.add(v)) throw jsError("Converting circular structure to JSON")
+        if (!seen.add(v)) throw jsError("Converting circular structure to JSON", "TypeError")
         try {
             "[" + v.elements.joinToString(",") { jsonStringify(it, seen) } + "]"
         } finally {
@@ -109,7 +114,7 @@ private fun jsonStringify(v: JsValue, seen: MutableSet<JsObject>): String = when
         }
     }
     is JsObject -> {
-        if (!seen.add(v)) throw jsError("Converting circular structure to JSON")
+        if (!seen.add(v)) throw jsError("Converting circular structure to JSON", "TypeError")
         try {
             // Per spec, undefined/function-valued object properties are omitted entirely (unlike array
             // elements, which become "null" - see the JsArray branch above), so a straight per-key map
@@ -131,7 +136,7 @@ private fun makeJson(): JsObject {
         try {
             parseJsonToJsValue(toJsString(arg(args, 0)))
         } catch (_: Exception) {
-            throw jsError("Unexpected token in JSON")
+            throw jsError("Unexpected token in JSON", "SyntaxError")
         }
     })
     return obj
@@ -317,7 +322,7 @@ private fun arrayMethod(interpreter: Interpreter, arr: JsArray, key: String, arg
             acc = args[1]
             startIdx = 0
         } else {
-            if (arr.elements.isEmpty()) throw jsError("Reduce of empty array with no initial value")
+            if (arr.elements.isEmpty()) throw jsError("Reduce of empty array with no initial value", "TypeError")
             acc = arr.elements[0]
             startIdx = 1
         }
@@ -373,7 +378,7 @@ private fun arrayMethod(interpreter: Interpreter, arr: JsArray, key: String, arg
             acc = args[1]
             startIdx = arr.elements.size - 1
         } else {
-            if (arr.elements.isEmpty()) throw jsError("Reduce of empty array with no initial value")
+            if (arr.elements.isEmpty()) throw jsError("Reduce of empty array with no initial value", "TypeError")
             acc = arr.elements.last()
             startIdx = arr.elements.size - 2
         }
