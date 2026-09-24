@@ -288,6 +288,11 @@ class Interpreter {
         is Logical -> evalLogical(expr, env)
         is Assign -> evalAssign(expr, env)
         is Conditional -> if (isTruthy(evalExpr(expr.test, env))) evalExpr(expr.consequent, env) else evalExpr(expr.alternate, env)
+        is Sequence -> {
+            var result: JsValue = JsUndefined
+            for (e in expr.expressions) result = evalExpr(e, env)
+            result
+        }
         is Call -> evalCall(expr, env)
         is New -> evalNew(expr, env)
         is Member -> memberKey(expr, env).let { getProperty(evalExpr(expr.obj, env), it) }

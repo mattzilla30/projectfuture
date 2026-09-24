@@ -21,6 +21,8 @@ data class Binary(val op: String, val left: Expr, val right: Expr) : Expr()
 data class Logical(val op: String, val left: Expr, val right: Expr) : Expr() // && || ??
 data class Assign(val op: String, val target: Expr, val value: Expr) : Expr()
 data class Conditional(val test: Expr, val consequent: Expr, val alternate: Expr) : Expr()
+/** The comma operator: `a(), b()` evaluates each in order and yields the last value. */
+data class Sequence(val expressions: List<Expr>) : Expr()
 data class Call(val callee: Expr, val args: List<Expr>) : Expr()
 data class New(val callee: Expr, val args: List<Expr>) : Expr()
 data class Member(val obj: Expr, val property: Expr, val computed: Boolean) : Expr()

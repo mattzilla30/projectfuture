@@ -357,7 +357,13 @@ class Parser(private val tokens: List<Token>) {
 
     // ---- expressions (precedence climbing, low to high) ----
 
-    private fun parseExpression(): Expr = parseAssignment()
+    private fun parseExpression(): Expr {
+        val first = parseAssignment()
+        if (!checkPunct(",")) return first
+        val expressions = arrayListOf(first)
+        while (matchPunct(",")) expressions.add(parseAssignment())
+        return Sequence(expressions)
+    }
 
     // Matches Lexer.kt's `multiCharPuncts`: every compound-assignment punctuator the lexer tokenizes
     // as a single token must be recognized here too, or valid JS using it fails to parse.
