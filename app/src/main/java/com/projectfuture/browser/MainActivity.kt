@@ -39,6 +39,10 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.projectfuture.browser.browser.BookmarkStore
+import com.projectfuture.browser.browser.CredentialStore
+import com.projectfuture.browser.browser.LoginFormFields
+import com.projectfuture.browser.browser.SavedCredential
+import com.projectfuture.browser.browser.credentialOrigin
 import com.projectfuture.browser.browser.HistoryStore
 import com.projectfuture.browser.browser.LocalStorageStore
 import com.projectfuture.browser.browser.sharedLocalStorage
@@ -65,7 +69,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var historyStore: HistoryStore
     private lateinit var settings: Settings
     private lateinit var tabSessionStore: TabSessionStore
+    private lateinit var credentialStore: CredentialStore
     private val tabTitles = HashMap<Tab, String>()
+    /** Origins the user picked "never for this site" on, for this process lifetime - suppresses repeat save-password prompts without persisting an explicit blocklist. */
+    private val neverSaveOrigins = HashSet<String>()
     private var lastViewportWidth = 0f
     private var lastViewportHeight = 0f
     private var darkModeEnabled = false
@@ -80,6 +87,7 @@ class MainActivity : AppCompatActivity() {
         historyStore = HistoryStore(this)
         settings = Settings(this)
         tabSessionStore = TabSessionStore(this)
+        credentialStore = CredentialStore(this)
         TrackingProtection.enabled = settings.trackingProtectionEnabled
         if (sharedCookieJar == null) sharedCookieJar = CookieJar(applicationContext)
         if (sharedLocalStorage == null) sharedLocalStorage = LocalStorageStore(applicationContext)
@@ -272,6 +280,7 @@ class MainActivity : AppCompatActivity() {
                 // this gap - they're real platform widgets, so TalkBack already reads/operates them
                 // correctly for free (see BrowserView's Autofill-hints work for the same point).
                 binding.browserView.announceForAccessibility(label)
+                offerAutofillIfAvailable(tab)
             }
             is TabState.Updated -> {
                 state.title?.let { tabTitles[tab] = it; applyWindowTitle(tab, it) }
@@ -528,6 +537,8 @@ class MainActivity : AppCompatActivity() {
         }
         popup.menu.add(0, 12, 11, R.string.menu_new_private_tab)
         popup.menu.add(0, 13, 12, R.string.menu_add_to_home_screen).isEnabled = currentUrl != null
+        popup.menu.add(0, 14, 13, R.string.menu_passwords)
+        popup.menu.add(0, 15, 14, R.string.menu_sandboxed_tab)
         popup.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> {
@@ -568,6 +579,8 @@ class MainActivity : AppCompatActivity() {
                 }
                 12 -> { openNewTab(private = true); true }
                 13 -> { addToHomeScreen(); true }
+                14 -> { showPasswordsDialog(); true }
+                15 -> { startActivity(Intent(this, SandboxedTabActivity::class.java)); true }
                 else -> false
             }
         }
@@ -648,7 +661,78 @@ class MainActivity : AppCompatActivity() {
         // instances come and go (new tabs, tab-switching) and this is the one place guaranteed to
         // run before the active tab could plausibly have a download triggered against it.
         tab.onDownloadRequested = { url, filename -> startDownload(url, filename) }
+        tab.onLoginFormSubmitted = { origin, username, password -> offerSavePassword(origin, username, password) }
         binding.browserView.setContent(tab.displayList, tab.contentHeight)
+    }
+
+    /** Offers to fill in a saved login the first time a matching login form appears on a freshly loaded page - never re-prompted on every keystroke, since this only runs from TabState.Loaded. */
+    private fun offerAutofillIfAvailable(tab: Tab) {
+        val origin = tab.currentOrigin() ?: return
+        val fields = tab.detectLoginForm() ?: return
+        val saved = credentialStore.credentialsForOrigin(origin).firstOrNull() ?: return
+        // Don't re-offer if the form's already been filled in (e.g. the page itself pre-filled it).
+        if (fields.usernameField.attr("value")?.isNotEmpty() == true) return
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.autofill_login_title)
+            .setMessage(getString(R.string.autofill_login_message, saved.username, origin))
+            .setPositiveButton(R.string.autofill_login_fill) { _, _ ->
+                if (tabManager.activeTab === tab) {
+                    tab.autofillLoginForm(fields, saved.username, saved.password)
+                }
+            }
+            .setNegativeButton(R.string.action_close, null)
+            .show()
+    }
+
+    /** Offers to save a just-submitted login (see Tab.onLoginFormSubmitted / LoginFormDetector) into the encrypted CredentialStore. Skips silently if that exact origin+username is already saved, or the user previously said "never" for this origin this session. */
+    private fun offerSavePassword(origin: String, username: String, password: String) {
+        if (origin in neverSaveOrigins) return
+        val existing = credentialStore.credentialsForOrigin(origin).firstOrNull { it.username == username }
+        if (existing?.password == password) return
+        MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.save_password_title)
+            .setMessage(getString(R.string.save_password_message, origin))
+            .setPositiveButton(R.string.save_password_save) { _, _ -> credentialStore.save(origin, username, password) }
+            .setNegativeButton(R.string.save_password_never) { _, _ -> neverSaveOrigins.add(origin) }
+            .show()
+    }
+
+    /** Lists every saved login (username + masked origin, never the plaintext password) with per-entry delete - the one settings surface onto CredentialStore. */
+    private fun showPasswordsDialog() {
+        lateinit var dialog: AlertDialog
+        val listView = ListView(this)
+        fun bind() {
+            val entries = credentialStore.allCredentials()
+            if (entries.isEmpty()) {
+                listView.adapter = null
+                Toast.makeText(this, R.string.passwords_empty, Toast.LENGTH_SHORT).show()
+            }
+            listView.adapter = object : BaseAdapter() {
+                override fun getCount() = entries.size
+                override fun getItem(position: Int) = entries[position]
+                override fun getItemId(position: Int) = position.toLong()
+                override fun getView(position: Int, convertView: View?, parent: ViewGroup): View {
+                    val entry: SavedCredential = entries[position]
+                    return buildListRow(
+                        parent,
+                        label = "${entry.username} - ${entry.origin}",
+                        onTap = {},
+                        onRemove = {
+                            credentialStore.delete(entry.origin, entry.username)
+                            Toast.makeText(this@MainActivity, R.string.password_deleted, Toast.LENGTH_SHORT).show()
+                            bind()
+                        }
+                    )
+                }
+            }
+        }
+        bind()
+        dialog = MaterialAlertDialogBuilder(this)
+            .setTitle(R.string.passwords_dialog_title)
+            .setView(listView)
+            .setNegativeButton(R.string.action_close, null)
+            .create()
+        dialog.show()
     }
 
     /**

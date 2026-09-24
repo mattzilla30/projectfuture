@@ -30,6 +30,21 @@
                 <data android:scheme="https" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".SandboxedTabActivity"
+            android:exported="false"
+            android:label="@string/menu_sandboxed_tab"
+            android:windowSoftInputMode="adjustResize" />
+
+        <!-- A fixed pool of separate OS processes for sandboxed tab engines - see
+             TabEngineServiceBase's class doc (in ipc/TabEngineServiceBase.kt) for why
+             a static pool rather than one process per tab, and what process isolation
+             actually buys/costs here. -->
+        <service android:name=".ipc.TabEngineService0" android:exported="false" android:process=":tabengine0" />
+        <service android:name=".ipc.TabEngineService1" android:exported="false" android:process=":tabengine1" />
+        <service android:name=".ipc.TabEngineService2" android:exported="false" android:process=":tabengine2" />
+        <service android:name=".ipc.TabEngineService3" android:exported="false" android:process=":tabengine3" />
     </application>
 
 </manifest>

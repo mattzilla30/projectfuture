@@ -49,4 +49,17 @@
     <string name="certificate_error_proceed">Proceed anyway</string>
     <string name="menu_add_to_home_screen">Add to Home screen</string>
     <string name="add_to_home_screen_unsupported">Add to Home screen isn\'t supported on this version of Android</string>
+    <string name="save_password_title">Save password?</string>
+    <string name="save_password_message">Save this password for %1$s in ProjectFuture Browser\'s encrypted password manager?</string>
+    <string name="save_password_save">Save</string>
+    <string name="save_password_never">Never for this site</string>
+    <string name="autofill_login_title">Sign in?</string>
+    <string name="autofill_login_message">Fill in your saved %1$s login for %2$s?</string>
+    <string name="autofill_login_fill">Fill in</string>
+    <string name="menu_passwords">Saved passwords</string>
+    <string name="passwords_dialog_title">Saved passwords</string>
+    <string name="passwords_empty">No saved passwords yet</string>
+    <string name="password_deleted">Password removed</string>
+    <string name="menu_sandboxed_tab">Sandboxed tab (experimental)</string>
+    <string name="sandboxed_tab_hint">This page\'s JS/DOM/layout run in a separate process</string>
 </resources>

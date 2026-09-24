@@ -56,6 +56,36 @@ correctness) - see commit history for the detailed limitations of each:
 - Forms: `<input>`/`<textarea>`/`<select>`/`<button>` render as real
   controls (tap to edit/toggle/pick), and submit via GET or POST
 - Cookies, gzip response decoding, multiple tabs, bookmarks/history
+- An in-browser encrypted password manager (`browser/CredentialStore.kt`,
+  `browser/CredentialCipher.kt`, `browser/LoginFormDetector.kt`): detects a
+  login form (a `<form>` with a password field and a preceding username-
+  like field) on submit, offers to save it, and offers to autofill it the
+  next time a matching form appears on the same origin. Credentials are
+  encrypted at rest with AES-256/GCM under a key generated inside
+  `AndroidKeyStore` and never exported - see `CredentialStore`'s class doc
+  for the exact threat model this defends (disk/backup-level, not
+  intra-app) and what it doesn't.
+- A real, working per-tab process sandbox for one demonstration entry
+  point (menu -> "Sandboxed tab (experimental)", `SandboxedTabActivity`):
+  a tab's whole engine - fetch/parse/JS/DOM/layout, the actual `Tab` class
+  - runs in one of 4 pooled separate OS processes (`ipc/
+  TabEngineServiceBase.kt`), reachable only over Messenger/Binder in
+  `ipc/TabEngineProtocol.kt`'s vocabulary; the display list crosses back
+  as a flat, reference-free wire format (`ipc/WireDisplayCommand.kt`,
+  round-trip tested in `DisplayListCodecTest`). This is **not** wired into
+  the default multi-tab browsing flow - see `TabEngineClient`'s class doc
+  for exactly why (most of `Tab`'s ~40-method surface isn't proxied) and
+  what would still be needed to make it the default.
+- Two independently GPU-composited hardware layers in `BrowserView`
+  (`ScrollingContentLayer`/`FixedContentLayer`) instead of one CPU-painted
+  Canvas: scrolling only invalidates the scrolling layer, so `position:
+  fixed` content's cached texture is left untouched on every scroll frame
+  instead of being re-rasterized every time, and dark mode is a GPU-
+  composited `ColorMatrixColorFilter` on each layer (`View.setLayerPaint`)
+  rather than a per-frame CPU `Canvas.saveLayer`. See `BrowserView`'s class
+  doc for the honest limits (no tiling, so the scrolling layer's visible
+  slice still repaints every scroll tick; no on-device timing numbers -
+  no emulator/device was available in the environment this was built in).
 
 Not yet implemented: CSS transitions/animations, `transform: scale()`/
 `rotate()`/`skew()`, `multipart/form-data` file uploads, and a real text
