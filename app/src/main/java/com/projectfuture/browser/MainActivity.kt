@@ -261,16 +261,25 @@ class MainActivity : AppCompatActivity() {
                 binding.browserView.resetScroll()
                 refreshView()
                 updateNavButtons()
-                // The one accessibility improvement made here: announcing navigation to a screen
-                // reader. Real per-element screen-reader navigation of the rendered page (reading
-                // individual paragraphs/links/form fields, matching ARIA semantics) isn't attempted -
-                // it would need a virtual-view AccessibilityNodeProvider over the Canvas-painted
-                // content, real complexity with correctness invariants (consistent bounds, no id/
-                // cycle bugs) that's genuinely risky to ship unverified: a broken accessibility tree
-                // can hang or crash TalkBack for the exact users depending on it, a worse outcome
-                // than the current gap. The overlaid form-control EditText fields are unaffected by
-                // this gap - they're real platform widgets, so TalkBack already reads/operates them
-                // correctly for free (see BrowserView's Autofill-hints work for the same point).
+                // Announces navigation to a screen reader on every page load, same as before.
+                //
+                // Beyond this: BrowserView now also exposes a virtual-view AccessibilityNodeProvider
+                // (see BrowserAccessibilityNodeProvider.kt) built from the DOM/layout tree - headings,
+                // links, form controls, images with alt text, and landmarks each become a real
+                // accessibility node with bounds taken from the page's own DisplayCommand layout, in
+                // document order, so TalkBack's swipe-to-navigate / double-tap-to-activate gestures
+                // should work against the rendered page, not just this one load announcement.
+                //
+                // IMPORTANT, read before treating this as "done": that provider has NOT been verified
+                // against real TalkBack on a device or emulator - none is available in this
+                // environment. It's implemented defensively (flat hierarchy, real overlaid EditText
+                // children preserved, every framework-facing entry point fails closed instead of
+                // crashing - see that class's doc) and the pure tree-building logic it's built on
+                // (AccessibilityTreeBuilder.kt) has JVM unit test coverage
+                // (AccessibilityTreeBuilderTest.kt), but "implemented and unit-tested" is the accurate
+                // claim, not "works" - end-to-end TalkBack behavior remains this feature's top open
+                // verification risk, for the same reason noted here previously: a wrong accessibility
+                // tree can hang or crash TalkBack for the exact users depending on it.
                 binding.browserView.announceForAccessibility(label)
             }
             is TabState.Updated -> {
@@ -648,7 +657,7 @@ class MainActivity : AppCompatActivity() {
         // instances come and go (new tabs, tab-switching) and this is the one place guaranteed to
         // run before the active tab could plausibly have a download triggered against it.
         tab.onDownloadRequested = { url, filename -> startDownload(url, filename) }
-        binding.browserView.setContent(tab.displayList, tab.contentHeight)
+        binding.browserView.setContent(tab.displayList, tab.contentHeight, tab.currentDoc)
     }
 
     /**

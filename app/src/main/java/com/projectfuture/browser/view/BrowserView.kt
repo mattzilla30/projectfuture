@@ -18,8 +18,12 @@ import android.view.GestureDetector
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
+import android.view.accessibility.AccessibilityEvent
+import android.view.accessibility.AccessibilityNodeProvider
 import android.widget.EditText
 import android.widget.FrameLayout
+import com.projectfuture.browser.accessibility.AccessibilityTree
+import com.projectfuture.browser.accessibility.buildAccessibilityTree
 import com.projectfuture.browser.html.ElementNode
 import com.projectfuture.browser.layout.DisplayCommand
 import com.projectfuture.browser.layout.DrawFormControl
@@ -93,8 +97,32 @@ class BrowserView @JvmOverloads constructor(
     /** Live overlaid text-entry widgets, keyed by their DOM element. Text/password/textarea only. */
     private val textFieldViews = HashMap<ElementNode, EditText>()
 
+    /**
+     * The virtual-view accessibility hierarchy exposed to TalkBack - see
+     * BrowserAccessibilityNodeProvider's class doc for what this does, why
+     * it's shaped the way it is, and the explicit note that it has not been
+     * verified against real TalkBack (no device/emulator available here).
+     */
+    private val accessibilityNodeProvider = BrowserAccessibilityNodeProvider(this).apply {
+        scrollYProvider = { scrollYPx }
+    }
+
     init {
         setWillNotDraw(false)
+    }
+
+    override fun getAccessibilityNodeProvider(): AccessibilityNodeProvider = accessibilityNodeProvider
+
+    /**
+     * Runs the same element-tap dispatch a real touch would (see
+     * [onElementTapped]) - the activation half of TalkBack's "double-tap to
+     * activate" gesture on a focused virtual accessibility node, wired
+     * through BrowserAccessibilityNodeProvider.performAction(ACTION_CLICK).
+     */
+    internal fun activateAccessibilityNode(element: ElementNode): Boolean {
+        val callback = onElementTapped ?: return false
+        callback(element)
+        return true
     }
 
     private val gestureDetector = GestureDetector(context, object : GestureDetector.SimpleOnGestureListener() {
@@ -174,14 +202,39 @@ class BrowserView @JvmOverloads constructor(
         return true
     }
 
-    fun setContent(commands: List<DisplayCommand>, height: Float) {
+    /**
+     * [domRoot] is optional (defaults to null, keeping this source-compatible
+     * for any other caller) - when supplied, it's used to rebuild the
+     * accessibility tree this View exposes to TalkBack via
+     * [accessibilityNodeProvider]. See BrowserAccessibilityNodeProvider's
+     * class doc for the verification caveat.
+     */
+    fun setContent(commands: List<DisplayCommand>, height: Float, domRoot: ElementNode? = null) {
         val (fixed, normal) = commands.partition { it.fixed }
         normalCommands = normal
         fixedCommands = fixed
         contentHeight = height
         scrollYPx = scrollYPx.coerceIn(0f, maxScroll())
         syncOverlayViews((normal + fixed).filterIsInstance<DrawFormControl>())
+        updateAccessibilityTree(domRoot, commands)
         invalidate()
+    }
+
+    private fun updateAccessibilityTree(domRoot: ElementNode?, commands: List<DisplayCommand>) {
+        val tree = try {
+            if (domRoot != null) buildAccessibilityTree(domRoot, commands) else AccessibilityTree(emptyList())
+        } catch (t: Throwable) {
+            // Building the tree is pure Kotlin (see AccessibilityTreeBuilder's doc) and unit-tested,
+            // but this call site still must never let a bug here break page rendering/navigation.
+            AccessibilityTree(emptyList())
+        }
+        accessibilityNodeProvider.updateTree(tree)
+        // Lets TalkBack know the virtual hierarchy changed (new page). Guarded the same way: this
+        // is a "nice to have" notification, never something allowed to crash a page load.
+        try {
+            parent?.notifySubtreeAccessibilityStateChanged(this, this, AccessibilityEvent.CONTENT_CHANGE_TYPE_SUBTREE)
+        } catch (_: Throwable) {
+        }
     }
 
     fun resetScroll() {
