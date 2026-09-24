@@ -640,7 +640,7 @@ class MainActivity : AppCompatActivity() {
                         parent,
                         label = entry.title,
                         onTap = { tabManager.activeTab?.navigate(entry.url); dialog.dismiss() },
-                        onRemove = { historyStore.remove(entry.url); bind() }
+                        onRemove = { historyStore.remove(entry); bind() }
                     )
                 }
             }

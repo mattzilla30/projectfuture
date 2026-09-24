@@ -32,7 +32,13 @@ class HistoryStore(context: Context) {
         }
     }
 
-    fun remove(url: String) = save(load().filterNot { it.url == url })
+    /**
+     * Removes exactly [entry] (matched by full identity, including its
+     * timestamp) rather than every entry that shares its URL - history keeps
+     * one row per page load, so repeat visits to the same URL show up as
+     * separate rows and deleting one must not delete the others.
+     */
+    fun remove(entry: HistoryEntry) = save(load().filterNot { it == entry })
 
     fun clear() = prefs.edit().remove(KEY).apply()
 
