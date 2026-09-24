@@ -461,9 +461,14 @@ data class Url(
 
     private fun charsetFromContentType(contentType: String?): Charset {
         if (contentType == null) return Charsets.UTF_8
-        val idx = contentType.indexOf("charset=")
+        val idx = contentType.indexOf("charset=", ignoreCase = true)
         if (idx == -1) return Charsets.UTF_8
-        val name = contentType.substring(idx + 8).trim().trim('"', '\'')
+        // The charset value only runs up to the next ";"-separated parameter (e.g. a `boundary=`
+        // or other Content-Type parameter after it) - real servers send `charset=` in any
+        // parameter position, not only last, so without this the whole remainder of the header
+        // (every later parameter too) was being handed to Charset.forName() and silently
+        // rejected, falling back to UTF-8 even when the declared charset was perfectly valid.
+        val name = contentType.substring(idx + 8).substringBefore(';').trim().trim('"', '\'')
         return try { Charset.forName(name) } catch (_: Exception) { Charsets.UTF_8 }
     }
 

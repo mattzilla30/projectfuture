@@ -34,6 +34,21 @@ class CookieJarTest {
         assertNull(parseSetCookie("=novalue", "example.com"))
     }
 
+    @Test fun cookieWithNoDomainAttributeIsHostOnly() {
+        // No `Domain` attribute at all (the common case - session=abc123 with nothing else, as
+        // real servers like Wikipedia actually send for e.g. WMF-Last-Access) must produce a
+        // host-only cookie per RFC 6265 6.1, not one that also matches subdomains.
+        val c = parseSetCookie("session=abc123", "example.com")!!
+        assertTrue(c.hostOnly)
+    }
+
+    @Test fun cookieWithExplicitDomainAttributeIsNotHostOnly() {
+        val withDot = parseSetCookie("id=42; Domain=.example.com", "example.com")!!
+        assertTrue(!withDot.hostOnly)
+        val withoutDot = parseSetCookie("id=42; Domain=example.com", "example.com")!!
+        assertTrue(!withoutDot.hostOnly)
+    }
+
     @Test fun domainMatchExactAndSubdomain() {
         assertTrue(domainMatches("example.com", "example.com"))
         assertTrue(domainMatches("example.com", "www.example.com"))

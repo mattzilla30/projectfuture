@@ -133,7 +133,17 @@ class WebSocketClient(private val url: Url) {
             when (opcode) {
                 0x1, 0x2 -> onMessage?.invoke(String(payload, Charsets.UTF_8)) // text, and binary-as-text - see class doc
                 0x8 -> {
-                    handleClose(1000, "Closed by server")
+                    // RFC 6455 5.5.1: a close frame's payload, when present, is a 2-byte big-endian
+                    // status code followed by an optional UTF-8 reason - not always 1000 (Normal
+                    // Closure). A server closing for e.g. "going away" (1001) or a policy violation
+                    // (1008) needs that real code delivered, not a hardcoded "1000" that hides it.
+                    val code = if (payload.size >= 2) {
+                        ((payload[0].toInt() and 0xFF) shl 8) or (payload[1].toInt() and 0xFF)
+                    } else {
+                        1005 // "No Status Rcvd" - the close frame carried no status code at all.
+                    }
+                    val reason = if (payload.size > 2) String(payload, 2, payload.size - 2, Charsets.UTF_8) else ""
+                    handleClose(code, reason)
                     return
                 }
                 0x9 -> writeFrame(sock, 0xA, payload) // ping -> pong
