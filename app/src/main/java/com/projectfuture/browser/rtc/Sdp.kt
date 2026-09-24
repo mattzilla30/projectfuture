@@ -3,9 +3,10 @@ package com.projectfuture.browser.rtc
 import java.security.SecureRandom
 
 /**
- * A single ICE host candidate, in this engine's data-channel-only subset:
- * always `typ host` (no STUN server reflexive candidates, no TURN relay
- * candidates - see RTCPeerConnection.kt's class doc for why), always UDP.
+ * A single ICE candidate, in this engine's data-channel-only subset:
+ * `typ host` or `typ srflx` (real server-reflexive candidates, gathered by
+ * [IceAgent] via genuine STUN binding requests - see its class doc), never
+ * `typ relay` (no TURN - also IceAgent's class doc for why), always UDP.
  */
 data class IceCandidate(
     val foundation: String,
@@ -57,9 +58,9 @@ data class SdpSession(
     val sessionId: String,
     val iceUfrag: String,
     val icePwd: String,
-    /** `sha-256` fingerprint hex string. Cosmetic only in this engine - see RTCPeerConnection.kt's class doc: nothing here actually performs a DTLS handshake or checks this value against a peer certificate, since no DTLS is implemented. It's included so the SDP is shaped like a real offer/answer and a real WebRTC stack reading it wouldn't immediately reject it as malformed. */
+    /** `sha-256` fingerprint hex string (colon-separated), real - the actual SHA-256 digest of this endpoint's [SelfSignedCert] (RFC 8122). [DtlsTransport.handshake] compares the peer's real DTLS certificate against the fingerprint carried here and refuses the connection on a mismatch - WebRTC's actual DTLS-SRTP authentication model (RFC 8827), not a cosmetic field. */
     val fingerprint: String,
-    /** "actpass" (offer) or "active"/"passive" (answer) - RFC 8842 DTLS role negotiation. Not acted on beyond being echoed, for the same reason as [fingerprint]. */
+    /** "actpass" (offer) or "active"/"passive" (answer) - RFC 8842/5763 DTLS role negotiation. Real: [PeerConnectionCore] uses the negotiated setup roles to decide which side is the DTLS client (and, per RFC 8841, the SCTP association initiator). */
     val setup: String,
     val sctpPort: Int,
     val candidates: List<IceCandidate>,
@@ -120,6 +121,3 @@ fun randomIceToken(length: Int): String {
     val chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
     return (1..length).map { chars[random.nextInt(chars.length)] }.joinToString("")
 }
-
-fun randomFingerprint(): String =
-    (1..32).map { "%02X".format(random.nextInt(256)) }.joinToString(":")
