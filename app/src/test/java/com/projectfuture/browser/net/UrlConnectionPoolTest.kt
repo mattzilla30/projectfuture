@@ -1,6 +1,7 @@
 package com.projectfuture.browser.net
 
 import java.io.BufferedReader
+import java.io.IOException
 import java.io.InputStreamReader
 import java.net.ServerSocket
 import java.util.concurrent.atomic.AtomicInteger
@@ -129,6 +130,47 @@ class UrlConnectionPoolTest {
             val port = server.localPort
             val response = Url.parse("http://127.0.0.1:$port/x").fetch()
             assertEquals("héx", response.body)
+        } finally {
+            server.close()
+        }
+    }
+
+    /**
+     * A response can declare `Content-Length: N` but the connection can close (or hang, timing
+     * out) after fewer than N bytes actually arrive - a dropped connection, a misbehaving proxy, a
+     * server crash mid-response. Before the fix, `readExactly` treated hitting EOF early as just
+     * "done" and silently returned the partial bytes as if they were the whole body, with no error
+     * - handing the caller truncated content with no signal anything went wrong. Worse, `fetchRaw`
+     * still saw a "determinate-length" body and pooled the socket for reuse, even though the
+     * server had already closed it: a later request reusing it would find it dead.
+     */
+    @Test fun truncatedContentLengthBodyThrowsRatherThanSilentlyReturningPartialContent() {
+        val server = ServerSocket(0)
+        Thread {
+            try {
+                val socket = server.accept()
+                val input = BufferedReader(InputStreamReader(socket.getInputStream()))
+                var line = input.readLine()
+                while (line != null && line.isNotEmpty()) line = input.readLine()
+                // Promises a 100-byte body but sends only 10, then closes the connection - the
+                // server-crashed-mid-response case.
+                val head = "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: keep-alive\r\n\r\n"
+                val output = socket.getOutputStream()
+                output.write(head.toByteArray(Charsets.US_ASCII))
+                output.write(ByteArray(10) { 'x'.code.toByte() })
+                output.flush()
+                socket.close()
+            } catch (_: Exception) {
+            }
+        }.apply { isDaemon = true }.start()
+        try {
+            val port = server.localPort
+            try {
+                Url.parse("http://127.0.0.1:$port/x").fetch()
+                org.junit.Assert.fail("expected an IOException for a response body shorter than its declared Content-Length")
+            } catch (_: IOException) {
+                // Expected: truncation must surface as an error, not a silently short body.
+            }
         } finally {
             server.close()
         }

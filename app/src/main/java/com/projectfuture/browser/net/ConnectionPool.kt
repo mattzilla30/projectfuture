@@ -22,13 +22,24 @@ import java.util.ArrayDeque
  */
 object ConnectionPool {
     private const val MAX_IDLE_PER_KEY = 4
-    private val idle = HashMap<String, ArrayDeque<Socket>>()
+    // Bounds the TOTAL idle sockets kept open across every host, not just per key. Per-key alone
+    // doesn't stop unbounded growth: browsing many different sites in one session (or across
+    // several Tabs) adds a distinct key per host, and with no global cap the pool would keep
+    // accumulating idle sockets (heap + file descriptors) for hosts long since navigated away
+    // from - a real resource leak on a memory-constrained mobile device that a per-key limit alone
+    // can't catch.
+    private const val MAX_IDLE_TOTAL = 20
+    // LinkedHashMap so key iteration order is insertion order, which [release] uses to evict the
+    // globally-oldest idle socket first when the total cap is hit.
+    private val idle = LinkedHashMap<String, ArrayDeque<Socket>>()
+    private var totalIdle = 0
 
     fun borrow(key: String): Socket? {
         synchronized(idle) {
             val deque = idle[key] ?: return null
             while (deque.isNotEmpty()) {
                 val socket = deque.removeFirst()
+                totalIdle--
                 if (socket.isConnected && !socket.isClosed) return socket
                 try { socket.close() } catch (_: Exception) {}
             }
@@ -42,9 +53,18 @@ object ConnectionPool {
             val deque = idle.getOrPut(key) { ArrayDeque() }
             if (deque.size >= MAX_IDLE_PER_KEY) {
                 try { socket.close() } catch (_: Exception) {}
-            } else {
-                deque.addLast(socket)
+                return
             }
+            if (totalIdle >= MAX_IDLE_TOTAL) {
+                val oldestKey = idle.entries.firstOrNull { it.value.isNotEmpty() }?.key
+                if (oldestKey != null) {
+                    val evicted = idle.getValue(oldestKey).removeFirst()
+                    totalIdle--
+                    try { evicted.close() } catch (_: Exception) {}
+                }
+            }
+            deque.addLast(socket)
+            totalIdle++
         }
     }
 }
