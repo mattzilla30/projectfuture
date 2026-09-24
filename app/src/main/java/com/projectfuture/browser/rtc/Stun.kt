@@ -166,7 +166,35 @@ class StunMessage(
                 if (pad > 0) buf.position(buf.position() + pad)
                 remaining -= 4 + attrLen + pad
             }
-            return StunMessage(type, txId, attrs)
+            val message = StunMessage(type, txId, attrs)
+            // RFC 5389 section 15.5: an agent that adds FINGERPRINT to messages it sends (this one
+            // always does, see encode()) uses it to discard bit-corrupted/tampered traffic on
+            // receipt too - a message whose FINGERPRINT is present but doesn't match its own
+            // covered bytes is not real STUN traffic that survived the wire intact and must not be
+            // trusted just because it happens to decode structurally.
+            if (!verifyFingerprint(message, data, length)) return null
+            return message
+        }
+
+        /** Verifies a decoded message's FINGERPRINT attribute against [rawPacket], per RFC 5389 section 15.5. A message with no FINGERPRINT attribute at all passes (not every STUN message is required to carry one) - only a *present but wrong* FINGERPRINT is rejected. */
+        fun verifyFingerprint(message: StunMessage, rawPacket: ByteArray, rawLength: Int): Boolean {
+            val fp = message.attribute(ATTR_FINGERPRINT) ?: return true
+            if (fp.size != 4) return false
+            val fpOffset = indexOfAttribute(rawPacket, rawLength, ATTR_FINGERPRINT) ?: return false
+            // Recompute over the header+attributes as they were when the fingerprint was computed:
+            // the raw bytes up to (not including) the FINGERPRINT attribute's TLV, with the length
+            // field patched to what it was at computation time (this attribute present, nothing
+            // after it - FINGERPRINT is always the last attribute per encode()).
+            val forCrc = rawPacket.copyOf(fpOffset)
+            val lengthAtComputation = (fpOffset - 20) + 8
+            forCrc[2] = (lengthAtComputation shr 8).toByte()
+            forCrc[3] = (lengthAtComputation and 0xFF).toByte()
+            val crc = CRC32()
+            crc.update(forCrc)
+            val expected = crc.value.toInt() xor FINGERPRINT_XOR
+            val actual = ((fp[0].toInt() and 0xFF) shl 24) or ((fp[1].toInt() and 0xFF) shl 16) or
+                ((fp[2].toInt() and 0xFF) shl 8) or (fp[3].toInt() and 0xFF)
+            return expected == actual
         }
 
         /** Verifies a decoded message's MESSAGE-INTEGRITY attribute against [rawPacket] and [key], per RFC 5389 section 15.4. */

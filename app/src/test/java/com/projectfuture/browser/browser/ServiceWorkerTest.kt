@@ -146,6 +146,24 @@ class ServiceWorkerTest {
         assertEquals("1", cacheStore.match(origin, "v1", "/install-count")?.body)
     }
 
+    @Test fun aScriptThatFailsToParseIsNeverMarkedInstalled() {
+        val registry = ServiceWorkerRegistry(InMemoryStorageBacking())
+        registry.register(origin, "/", "https://example.com/sw.js")
+        // Syntactically invalid JS - ServiceWorkerHost.prepare() must fail to parse/run this, so
+        // install/activate never actually dispatch to anything.
+        val brokenScript = "self.addEventListener('install', function(event) { {{{ not valid js"
+        val host = ServiceWorkerHost(brokenScript, origin, "/", registry, CacheStorageStore(InMemoryStorageBacking()))
+
+        // handleFetch (like a real fetch event) triggers ensureInstalledAndActivated() internally.
+        host.handleFetch("https://example.com/index.html", "GET")
+
+        assertTrue(
+            "a service worker whose script never even parsed must not be marked installed - " +
+                "it never ran its install/activate listeners at all",
+            registry.all(origin).single().installed.not()
+        )
+    }
+
     @Test fun fetchEventWithNoRespondWithFallsThroughToNetwork() {
         val registry = ServiceWorkerRegistry(InMemoryStorageBacking())
         registry.register(origin, "/", "https://example.com/sw.js")

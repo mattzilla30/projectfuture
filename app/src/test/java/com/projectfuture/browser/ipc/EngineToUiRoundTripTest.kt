@@ -99,6 +99,56 @@ class EngineToUiRoundTripTest {
         assertNull(uiCommands.single().sourceElement)
     }
 
+    @Test fun navigatingToAFreshDocumentDoesNotMisattributeARecycledElementIdsMetadata() {
+        // Simulates two full navigations in the same long-lived engine process/UI-client pair
+        // (TabEngineServiceBase/TabEngineClient each keep their converter alive across many page
+        // loads - see their class docs) - exactly what TabEngineServiceBase.onTabStateChanged's
+        // TabState.Loaded branch and TabEngineClient's MSG_STATE_LOADED handler now do on every
+        // real navigation (MSG_LOAD_URL, a followed link, reload, back/forward onto a different
+        // document).
+        val elementIds = ElementIdRegistry()
+        val engineConverter = EngineToUiConverter(elementIds)
+        val uiConverter = UiDisplayListConverter()
+
+        // Document 1: a single password field. It gets elementId 1, and the UI side learns it's a
+        // password input.
+        val passwordField = ElementNode(tag = "input").apply { attributes["type"] = "password" }
+        val (wire1, _, meta1) = engineConverter.convert(listOf(DrawRect(0f, 0f, 10f, 10f, 0, false, passwordField)))
+        assertEquals(1, meta1.size)
+        assertEquals(1, meta1[0].elementId)
+        uiConverter.onElementMetaReceived(meta1)
+        val shadow1 = uiConverter.convert(DisplayListCodec.decode(DisplayListCodec.encode(wire1))).single().sourceElement!!
+        assertEquals("password", shadow1.attr("type"))
+
+        // Navigate to document 2 (a fresh document - TabState.Loaded) and reset exactly as
+        // TabEngineServiceBase/TabEngineClient now do, in the same order (engine side resets before
+        // converting document 2's display list; the UI side resets on MSG_STATE_LOADED, which now
+        // arrives before document 2's MSG_ELEMENT_META/MSG_DISPLAY_LIST - see both classes' docs).
+        elementIds.reset()
+        engineConverter.reset()
+        uiConverter.reset()
+
+        // Document 2's first element is an ordinary link, not a password field - but since ids
+        // restart at 1 (ElementIdRegistry.reset()), it is *also* assigned elementId 1.
+        val linkElement = ElementNode(tag = "a")
+        val (wire2, _, meta2) = engineConverter.convert(listOf(DrawRect(0f, 0f, 10f, 10f, 0, false, linkElement)))
+        assertEquals(1, wire2.single().elementId)
+
+        // Without EngineToUiConverter.reset() clearing metaSent, this assertion fails: the engine
+        // would think elementId 1's metadata was "already sent" (from document 1's password field)
+        // and never send WireElementMeta for document 2's link at all.
+        assertEquals("elementId 1's metadata for the NEW document must be (re-)sent, not skipped as already-sent", 1, meta2.size)
+        assertEquals("a", meta2[0].tag)
+
+        uiConverter.onElementMetaReceived(meta2)
+        val shadow2 = uiConverter.convert(DisplayListCodec.decode(DisplayListCodec.encode(wire2))).single().sourceElement!!
+
+        // Without UiDisplayListConverter.reset() clearing shadowElements/metaByElementId, this
+        // would still be the stale password-field shadow built for document 1's elementId 1.
+        assertEquals("elementId 1 must resolve to document 2's actual element (a link), not a stale shadow left over from document 1's element at the same recycled id", "a", shadow2.tag)
+        assertNull("a shadow rebuilt for the new document must not carry over the old document's type attribute", shadow2.attr("type"))
+    }
+
     @Test fun selectOptionsMetadataFlowMirrorsTheDisplayListOne() {
         // Simulates MSG_REQUEST_SELECT_OPTIONS / MSG_SELECT_OPTIONS - the select's own options never
         // appear in a display list (only the closed <select> box itself does), so their metadata is

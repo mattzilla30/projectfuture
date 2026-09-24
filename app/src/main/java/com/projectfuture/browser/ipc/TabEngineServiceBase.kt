@@ -93,7 +93,6 @@ abstract class TabEngineServiceBase : Service() {
                 TabEngineProtocol.MSG_LOAD_URL -> {
                     val url = msg.data.getString(TabEngineProtocol.KEY_URL) ?: return
                     val template = msg.data.getString(TabEngineProtocol.KEY_SEARCH_TEMPLATE) ?: Settings.DEFAULT_SEARCH_TEMPLATE
-                    elementIds.reset()
                     ensureTab().navigate(url, template)
                 }
                 TabEngineProtocol.MSG_DISPATCH_TAP -> withElement(msg) { tab?.dispatchClick(it) }
@@ -185,12 +184,33 @@ abstract class TabEngineServiceBase : Service() {
     }
 
     private fun onTabStateChanged(state: TabState) {
+        if (state is TabState.Loaded) {
+            // A genuinely fresh document (not a same-document update - see TabState's own doc/
+            // Tab.load()'s documentGeneration bump) is the one and only point every code path that
+            // can load a new document - MSG_LOAD_URL, a followed link, reload, and a goBack/
+            // goForward that lands on a different document generation - actually goes through, so
+            // this is the single correct place to invalidate the previous document's element ids
+            // and per-document conversion caches (see ElementIdRegistry's/EngineToUiConverter.reset's
+            // class docs: "a stale id from a discarded document must never be confused with an id
+            // in the new one"). Resetting per-IPC-message-type instead (as this used to for
+            // elementIds, and never at all for the converter's metaSent/imageIds caches) missed
+            // followLink/reload/back/forward entirely and let a recycled id silently resolve to a
+            // *previous* document's element tag/type on the UI side.
+            //
+            // The state message is sent *before* sendDisplayList() (the reverse of every other
+            // branch below) specifically so TabEngineClient can reset its own UiDisplayListConverter
+            // on receipt, before this document's MSG_ELEMENT_META/MSG_DISPLAY_LIST arrive - see
+            // TabEngineClient's MSG_STATE_LOADED handling and UiDisplayListConverter.reset's doc.
+            elementIds.reset()
+            converter.reset()
+            send(stateMessage(TabEngineProtocol.MSG_STATE_LOADED, state.url.toString(), state.title))
+            sendDisplayList()
+            sendTabInfo()
+            return
+        }
         val message = when (state) {
             is TabState.Loading -> stateMessage(TabEngineProtocol.MSG_STATE_LOADING, state.url.toString())
-            is TabState.Loaded -> {
-                sendDisplayList()
-                stateMessage(TabEngineProtocol.MSG_STATE_LOADED, state.url.toString(), state.title)
-            }
+            is TabState.Loaded -> return // handled above
             is TabState.Updated -> {
                 sendDisplayList()
                 stateMessage(TabEngineProtocol.MSG_STATE_UPDATED, state.url.toString(), state.title)
