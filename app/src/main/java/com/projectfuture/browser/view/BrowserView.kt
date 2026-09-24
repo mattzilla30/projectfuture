@@ -123,18 +123,21 @@ class BrowserView @JvmOverloads constructor(
     private val textFieldOriginalColor = HashMap<ElementNode, Int>()
 
     /**
-     * A GPU-composited layer painting only [normalCommands] (and non-fixed
-     * find-match highlights), translated by the live scroll offset. Its
+     * The view painting only [normalCommands] (and non-fixed find-match
+     * highlights), translated by the live scroll offset. Its
      * own bounds always match the viewport; content further down the page
      * than [scrollOffset] + height is clipped by [drawCommands]'s
      * viewTop/viewBottom check exactly as before the layer split - this
-     * class only changes *which View's hardware layer* gets invalidated on
-     * a scroll tick, not what's visible.
+     * class only changes *which View* gets invalidated on a scroll tick,
+     * not what's visible.
      */
     private inner class ScrollingContentLayer(context: Context) : View(context) {
         var scrollOffset: Float = 0f
 
-        init { setLayerType(LAYER_TYPE_HARDWARE, null) }
+        // No hardware layer by default: every scroll frame invalidates this view, so a cached
+        // layer texture would be re-rendered offscreen each frame and then composited, twice the
+        // GPU work of drawing straight to the screen. setDarkMode adds one, since the inversion
+        // filter is a layer paint.
 
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
@@ -486,7 +489,7 @@ class BrowserView @JvmOverloads constructor(
     fun setDarkMode(enabled: Boolean) {
         darkModeEnabled = enabled
         val paint = if (enabled) invertLayerPaint else null
-        scrollingContentLayer.setLayerPaint(paint)
+        scrollingContentLayer.setLayerType(if (enabled) LAYER_TYPE_HARDWARE else LAYER_TYPE_NONE, paint)
         fixedContentLayer.setLayerPaint(paint)
         // Real bug fixed here: overlay EditText fields used to only get dark-mode-aware colors
         // at the moment they were first created (in createEditTextFor), so toggling dark mode

@@ -108,16 +108,22 @@ private val subresourceExecutor: java.util.concurrent.ExecutorService =
     Executors.newFixedThreadPool(6) { r -> Thread(r, "subresource-fetch").apply { isDaemon = true } }
 
 /**
- * Owns one page's lifecycle: fetch -> parse -> style -> layout, all off the
- * main thread except the final layout/paint handoff, plus back/forward
- * history. This is the only place that talks to the network and DOM/CSS/
+ * Owns one page's lifecycle: fetch -> parse -> style -> layout, plus
+ * back/forward history. Fetching, parsing, scripts and styling run on the
+ * load thread; layout, timers and events run on [looper] (an engine thread
+ * for in-process tabs, never the UI thread). This is the only place that talks to the network and DOM/CSS/
  * layout modules together.
  */
 class Tab(
     private val context: Context,
     private val onStateChanged: (TabState) -> Unit,
     /** A private/incognito tab: no cookies sent or stored (real isolation, not just skipped history - see Url.fetch's allowCookies), no HTTP cache reuse. History recording is skipped by MainActivity checking this flag. */
-    val isPrivate: Boolean = false
+    val isPrivate: Boolean = false,
+    /**
+     * The thread that runs this tab's JavaScript, timers and layout. An in-process tab gets its
+     * own engine thread (see LocalTabHandle) so a long layout or script never blocks drawing.
+     */
+    looper: Looper = Looper.getMainLooper()
 ) {
 
     private val history = ArrayList<Url>()
@@ -149,7 +155,7 @@ class Tab(
     private val executor = Executors.newSingleThreadExecutor { r ->
         Thread(null, r, "tab-load", 32L * 1024 * 1024).apply { isDaemon = true }
     }
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private val mainHandler = Handler(looper)
     /**
      * Set by [destroy]. Background work (network fetches, timers, the Service
      * Worker/WebSocket/WebRTC callbacks below) is all dispatched back to the
@@ -186,6 +192,7 @@ class Tab(
     private var viewportWidth: Float = 0f
     private var viewportHeight: Float = 0f
     private var currentImages: Map<ElementNode, Bitmap> = emptyMap()
+    private var currentFonts: Map<String, Typeface> = emptyMap()
     /** SFNT bytes of the current document's web fonts by lowercased family, for the UI process (see TabEngineServiceBase.sendFonts). */
     var currentFontData: Map<String, ByteArray> = emptyMap()
         private set
@@ -246,6 +253,8 @@ class Tab(
         displayList = emptyList()
         contentHeight = 0f
         currentImages = emptyMap()
+        currentFonts = emptyMap()
+        currentFontData = emptyMap()
         currentInterpreter = null
         currentDomBridge = null
         currentAuthorRules = emptyList()
@@ -760,7 +769,7 @@ class Tab(
                     currentUrl = response.url
                     currentDoc = root
                     currentImages = images
-                    customFonts = fonts.typefaces
+                    currentFonts = fonts.typefaces
                     currentFontData = fonts.sfnt
                     currentInterpreter = interpreter
                     currentDomBridge = bridge
@@ -831,11 +840,10 @@ class Tab(
     private fun relayout() {
         val doc = currentDoc ?: return
         if (viewportWidth <= 0f || viewportHeight <= 0f) return
-        // textScaleFactor is a module-level var (see its doc), so it's set from this tab's own
-        // state on every relayout - not just when setTextScale() is called - since a different
-        // tab's relayout (e.g. from a rotation) could otherwise run against a stale value another
-        // tab left behind.
+        // The layout inputs below are per-thread globals (see their docs). Several tabs can share
+        // a thread (tabs in one sandbox process), so each relayout installs this tab's own values.
         textScaleFactor = textScale
+        customFonts = currentFonts
         val docLayout = DocumentLayout(doc)
         displayList = docLayout.layout(viewportWidth, viewportHeight, currentImages)
         contentHeight = docLayout.height

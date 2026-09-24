@@ -18,7 +18,9 @@ data class TextStyle(
     val strikethrough: Boolean,
     val linkHref: String?,
     /** First non-generic font-family name (e.g. from `@font-face`), or null. See [customFonts]. */
-    val fontFamilyName: String? = null
+    val fontFamilyName: String? = null,
+    /** The web font for [fontFamilyName], resolved when the style is built, so drawing never looks fonts up by name. */
+    val typeface: Typeface? = null
 )
 
 private val GENERIC_FONT_FAMILIES = setOf("sans-serif", "serif", "monospace", "cursive", "fantasy", "system-ui")
@@ -44,29 +46,20 @@ fun textStyleForElement(node: ElementNode, linkHref: String?): TextStyle {
         underline = decoration.contains("underline"),
         strikethrough = decoration.contains("line-through"),
         linkHref = linkHref,
-        fontFamilyName = customFamilyName
+        fontFamilyName = customFamilyName,
+        typeface = customFamilyName?.let { customFonts[it.lowercase()] }
     )
 }
 
 /**
- * Fonts loaded from `@font-face` for the current document, keyed by
- * lowercased family name. Set once per page load by Tab; see
- * [currentImages] for why a module-level var (rather than threading a
- * parameter through every call site) is safe here.
+ * Fonts loaded from `@font-face` for the document being laid out, keyed by lowercased family
+ * name. Tab sets it before each layout. It is per thread because each in-process tab lays out on
+ * its own engine thread, and the UI thread must not see another tab's value mid-draw.
  */
-var customFonts: Map<String, Typeface> = emptyMap()
-    set(value) {
-        field = value
-        // A Paint cached under a family name holds whichever Typeface that name meant at the time.
-        FontCache.clear()
-    }
-
-/**
- * Web fonts the UI process received from tab engine processes, keyed by the unique names
- * `UiDisplayListConverter` gives them. Several tabs share the UI process, and two pages may both
- * use a family called "Roboto" with different files, so the page's own family name can't be the key.
- */
-val remoteFonts = java.util.concurrent.ConcurrentHashMap<String, Typeface>()
+private val customFontsLocal = ThreadLocal<Map<String, Typeface>>()
+var customFonts: Map<String, Typeface>
+    get() = customFontsLocal.get() ?: emptyMap()
+    set(value) = customFontsLocal.set(value)
 
 /** Builds a Typeface from SFNT bytes through a temp file (Typeface.createFromFile works on every supported API level). */
 fun typefaceFromSfnt(sfnt: ByteArray, cacheDir: java.io.File): Typeface? {
@@ -88,23 +81,34 @@ fun typefaceFromSfnt(sfnt: ByteArray, cacheDir: java.io.File): Typeface? {
  * than applying a live Canvas scale transform). Applied once, in
  * [textStyleForElement], so it automatically affects line-breaking,
  * element sizing, and everything downstream of a resolved font size -
- * same module-level-var pattern as [customFonts] and `currentImages`.
+ * per thread like [customFonts].
  */
-var textScaleFactor: Float = 1f
+private val textScaleLocal = ThreadLocal<Float>()
+var textScaleFactor: Float
+    get() = textScaleLocal.get() ?: 1f
+    set(value) = textScaleLocal.set(value)
 
-/** Caches Paint objects by their resolved style so we're not allocating one per glyph run. */
+/**
+ * Caches Paint objects by resolved style so layout and drawing don't allocate one per text run.
+ * Each thread gets its own cache: Paint isn't thread-safe, and engine threads measure text while
+ * the UI thread draws. The cache is bounded because the key includes the Typeface's identity and
+ * each page load brings new Typefaces.
+ */
 object FontCache {
-    private val cache = HashMap<String, Paint>()
-
-    fun clear() = cache.clear()
+    private const val MAX_ENTRIES = 256
+    private val cache = ThreadLocal.withInitial {
+        object : LinkedHashMap<String, Paint>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Paint>?) = size > MAX_ENTRIES
+        }
+    }
 
     fun paintFor(style: TextStyle): Paint {
-        val key = "${style.sizePx}-${style.bold}-${style.italic}-${style.monospace}-${style.fontFamilyName}"
-        return cache.getOrPut(key) {
+        val face = style.typeface
+        val key = "${style.sizePx}-${style.bold}-${style.italic}-${style.monospace}-${face?.let { System.identityHashCode(it) }}"
+        return cache.get().getOrPut(key) {
             Paint(Paint.ANTI_ALIAS_FLAG).apply {
                 textSize = style.sizePx
-                val customBase = style.fontFamilyName?.let { customFonts[it.lowercase()] ?: remoteFonts[it] }
-                val base = customBase ?: if (style.monospace) Typeface.MONOSPACE else Typeface.DEFAULT
+                val base = face ?: if (style.monospace) Typeface.MONOSPACE else Typeface.DEFAULT
                 var flags = 0
                 if (style.bold) flags = flags or Typeface.BOLD
                 if (style.italic) flags = flags or Typeface.ITALIC

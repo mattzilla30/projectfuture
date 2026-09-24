@@ -158,7 +158,11 @@ data class FloatBox(val left: Float, val right: Float, val top: Float, val botto
  * safe here because layout always runs as one synchronous pass on a
  * single thread - there's no concurrent or reentrant layout to race with.
  */
-private var currentImages: Map<ElementNode, Bitmap> = emptyMap()
+// Per thread: in-process tabs lay out concurrently on their own engine threads.
+private val currentImagesLocal = ThreadLocal<Map<ElementNode, Bitmap>>()
+private var currentImages: Map<ElementNode, Bitmap>
+    get() = currentImagesLocal.get() ?: emptyMap()
+    set(value) = currentImagesLocal.set(value)
 
 /**
  * Pure sizing math for `<img>`/`<svg>`/`<canvas>` (extracted from
