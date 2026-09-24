@@ -133,7 +133,7 @@ class CssParser(private val source: String, private val viewportWidth: Float = 3
             val colon = decl.indexOf(':')
             if (colon == -1) continue
             val key = decl.substring(0, colon).trim().lowercase()
-            val value = decl.substring(colon + 1).trim()
+            val value = stripImportant(decl.substring(colon + 1).trim())
             if (key.isNotEmpty() && value.isNotEmpty()) props[key] = value
         }
         return props
@@ -143,9 +143,17 @@ class CssParser(private val source: String, private val viewportWidth: Float = 3
     fun parseSingleSelector(text: String): Selector? = parseSelectorChain(text.trim())
 
     private fun parseSelectorChain(text: String): Selector? {
-        val tokens = text.split(Regex("\\s+"))
-            .filter { it.isNotEmpty() && it != ">" && it != "+" && it != "~" }
+        val tokens = text.split(Regex("\\s+")).filter { it.isNotEmpty() }
         if (tokens.isEmpty()) return null
+        // This engine only implements the descendant combinator (plain whitespace) - see the
+        // class doc. `>` (child), `+` (adjacent sibling) and `~` (general sibling) aren't
+        // implemented, and dropping them from the token list (as this used to do) silently
+        // reinterpreted e.g. `div > li` as the much broader `div li` descendant selector -
+        // matching grandchildren, great-grandchildren etc. an author explicitly scoped to direct
+        // children only. Per this file's NeverMatchSelector precedent for unsupported
+        // pseudo-classes, the safe behavior for an unsupported combinator is "never matches", not
+        // silently widening the selector.
+        if (tokens.any { it == ">" || it == "+" || it == "~" }) return NeverMatchSelector
         var acc = parseToken(tokens[0]) ?: return null
         for (t in tokens.drop(1)) {
             val next = parseToken(t) ?: continue
@@ -219,10 +227,23 @@ class CssParser(private val source: String, private val viewportWidth: Float = 3
                 val colon = decl.indexOf(':')
                 if (colon == -1) continue
                 val key = decl.substring(0, colon).trim().lowercase()
-                val value = decl.substring(colon + 1).trim()
+                val value = stripImportant(decl.substring(colon + 1).trim())
                 if (key.isNotEmpty() && value.isNotEmpty()) props[key] = value
             }
             return props
         }
+
+        /**
+         * Strips a trailing `!important` annotation (with or without a space before `!`, any
+         * casing/internal whitespace, per the CSS grammar) from a declaration's value text. This
+         * engine's cascade doesn't track importance for override purposes (see the class doc's
+         * "approximate specificity-based cascade" framing) - but leaving the literal
+         * `"!important"` text stuck onto the value corrupts it for every downstream parser
+         * (parseCssColor, lengthValue, resolveFontSize, keyword matches, ...), which none of them
+         * expect and none of them ignore, so the whole declaration would silently fail to apply
+         * instead of just losing its (already out-of-scope) elevated priority.
+         */
+        private val IMPORTANT_SUFFIX = Regex("!\\s*important\\s*$", RegexOption.IGNORE_CASE)
+        private fun stripImportant(value: String): String = value.replace(IMPORTANT_SUFFIX, "").trim()
     }
 }
