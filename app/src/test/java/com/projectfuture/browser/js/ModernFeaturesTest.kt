@@ -556,4 +556,96 @@ class ModernFeaturesTest {
             """.trimIndent()
         )
     }
+
+    // ---- class construction/inheritance edge cases ----
+
+    /** Per spec, a `class`'s constructor can only be invoked via `new` - calling it as a plain function
+     * must throw a TypeError, unlike an ordinary `function` constructor. */
+    @Test fun classConstructorCalledWithoutNewThrowsTypeError() {
+        assertEquals(
+            "true",
+            str(
+                """
+                class Foo { constructor() { this.x = 1; } }
+                var threw = false;
+                try { Foo(); } catch (e) { threw = (e instanceof TypeError); }
+                var result = String(threw);
+                """.trimIndent()
+            )
+        )
+    }
+
+    /** `new Foo(...)` and a derived class's `super(...)` call must still work after the above check is
+     * added - both go through the same `ClassConstructor.call`, just with different `thisArg`s. */
+    @Test fun newAndSuperCallStillConstructInstancesCorrectly() {
+        assertEquals(
+            "3,3",
+            str(
+                """
+                class Base { constructor(x) { this.x = x; } }
+                class Derived extends Base { constructor(x) { super(x); } }
+                var result = String(new Base(3).x) + ',' + String(new Derived(3).x);
+                """.trimIndent()
+            )
+        )
+    }
+
+    /** A subclass that overrides a same-named accessor with a plain method must fully replace it -
+     * the property should be a callable method, not still invoke the base class's leftover getter. */
+    @Test fun subclassPlainMethodOverridesBaseClassAccessorOfTheSameName() {
+        assertEquals(
+            "derived-method",
+            str(
+                """
+                class Base { get x() { return 'base-getter'; } }
+                class Derived extends Base { x() { return 'derived-method'; } }
+                var d = new Derived();
+                var result = typeof d.x === 'function' ? d.x() : d.x;
+                """.trimIndent()
+            )
+        )
+    }
+
+    /** A subclass that redefines only the getter for a name must not go on invoking the base class's
+     * setter for that name - real JS replaces the whole property descriptor per class, it doesn't
+     * layer a new getter onto an inherited setter. */
+    @Test fun subclassGetterOnlyOverrideDropsTheInheritedSetter() {
+        assertEquals(
+            "2,undefined",
+            str(
+                """
+                class Base {
+                    get x() { return 1; }
+                    set x(v) { this._x = 'base-set:' + v; }
+                }
+                class Derived extends Base {
+                    get x() { return 2; }
+                }
+                var d = new Derived();
+                d.x = 99;
+                var result = String(d.x) + ',' + String(d._x);
+                """.trimIndent()
+            )
+        )
+    }
+
+    /** Static methods/getters a subclass doesn't itself redefine must still be reachable through plain
+     * `Derived.member` access (not just via an explicit `super.member()` call from an overriding
+     * static method), matching real JS's static-member inheritance through the constructor's own
+     * prototype chain. */
+    @Test fun staticMembersAreInheritedWithoutRedefinitionOrSuper() {
+        assertEquals(
+            "base-static,base-getter",
+            str(
+                """
+                class Base {
+                    static bar() { return 'base-static'; }
+                    static get g() { return 'base-getter'; }
+                }
+                class Derived extends Base {}
+                var result = Derived.bar() + ',' + Derived.g;
+                """.trimIndent()
+            )
+        )
+    }
 }
