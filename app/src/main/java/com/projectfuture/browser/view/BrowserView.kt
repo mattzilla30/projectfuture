@@ -135,10 +135,7 @@ class BrowserView @JvmOverloads constructor(
             canvas.save()
             canvas.translate(0f, -scrollOffset)
             drawCommands(canvas, normalCommands, scrollOffset, scrollOffset + height)
-            for ((i, cmd) in findMatches.withIndex()) {
-                if (cmd.fixed) continue
-                canvas.drawRect(cmd.left, cmd.top, cmd.right, cmd.bottom, if (i == findCurrentIndex) findCurrentMatchPaint else findMatchPaint)
-            }
+            drawFindHighlights(canvas, wantFixed = false)
             canvas.restore()
         }
     }
@@ -157,6 +154,17 @@ class BrowserView @JvmOverloads constructor(
         override fun onDraw(canvas: Canvas) {
             super.onDraw(canvas)
             drawCommands(canvas, fixedCommands, 0f, height.toFloat())
+            // Fixed content is never translated, so its find-match highlights (if any hit fell
+            // inside a `position: fixed` header/nav) are drawn here in the same unscrolled
+            // coordinates, never in ScrollingContentLayer - see BrowserViewLogic.findMatchesForLayer.
+            drawFindHighlights(canvas, wantFixed = true)
+        }
+    }
+
+    /** Shared by both layers - see [com.projectfuture.browser.view.BrowserViewLogic.findMatchesForLayer]. */
+    private fun drawFindHighlights(canvas: Canvas, wantFixed: Boolean) {
+        for ((i, cmd) in BrowserViewLogic.findMatchesForLayer(findMatches, wantFixed)) {
+            canvas.drawRect(cmd.left, cmd.top, cmd.right, cmd.bottom, if (i == findCurrentIndex) findCurrentMatchPaint else findMatchPaint)
         }
     }
 
@@ -187,13 +195,16 @@ class BrowserView @JvmOverloads constructor(
         }
 
         override fun onSingleTapUp(e: MotionEvent): Boolean {
-            // lastOrNull, not firstOrNull: commands are in paint order (back to front), so the
-            // last one under the tap is the topmost one visually and should win the hit test.
-            val fixedHit = fixedCommands.lastOrNull { e.x in it.left..it.right && e.y in it.top..it.bottom }
+            // Fixed content is checked first, in unscrolled viewport coordinates (it's painted
+            // that way, never translated by scroll) - see BrowserViewLogic.hitTest's doc for why
+            // the *last* match wins.
+            val fixedHit = BrowserViewLogic.hitTest(fixedCommands, e.x, e.y, { it.left }, { it.right }, { it.top }, { it.bottom })
             if (fixedHit != null) return dispatchHit(fixedHit)
 
+            // Normal content is painted in page space, so the tap's viewport-space y must be
+            // converted into page space by adding the current scroll offset before hit-testing.
             val py = e.y + scrollYPx
-            val hit = normalCommands.lastOrNull { e.x in it.left..it.right && py in it.top..it.bottom }
+            val hit = BrowserViewLogic.hitTest(normalCommands, e.x, py, { it.left }, { it.right }, { it.top }, { it.bottom })
             if (hit != null) return dispatchHit(hit)
             return true
         }
@@ -245,11 +256,17 @@ class BrowserView @JvmOverloads constructor(
         }
     })
 
+    private val pinchTapGate = BrowserViewLogic.PinchTapGate(MotionEvent.ACTION_DOWN)
+
     override fun onTouchEvent(event: MotionEvent): Boolean {
         scaleGestureDetector.onTouchEvent(event)
         // A pinch (2+ fingers) shouldn't also register as a scroll/tap - GestureDetector only ever
         // sees single-pointer semantics, so gate it on the scale detector not currently mid-gesture.
-        if (!scaleGestureDetector.isInProgress) gestureDetector.onTouchEvent(event)
+        // Withholding events only while isInProgress is true isn't enough on its own though: see
+        // BrowserViewLogic.PinchTapGate's doc for the spurious-tap-through this closes.
+        if (pinchTapGate.shouldForwardToTapDetector(event.actionMasked, scaleGestureDetector.isInProgress)) {
+            gestureDetector.onTouchEvent(event)
+        }
         return true
     }
 
@@ -304,7 +321,7 @@ class BrowserView @JvmOverloads constructor(
         scrollingContentLayer.invalidate()
     }
 
-    private fun maxScroll(): Float = (contentHeight - height).coerceAtLeast(0f)
+    private fun maxScroll(): Float = BrowserViewLogic.maxScroll(contentHeight, height.toFloat())
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
         super.onSizeChanged(w, h, oldw, oldh)
