@@ -330,7 +330,29 @@ class Interpreter {
         }
         is JsObject -> {
             val getter = obj.getters?.get(key)
-            if (getter != null) getter.call(this, obj, emptyList()) else obj.get(key)
+            if (getter != null) {
+                getter.call(this, obj, emptyList())
+            } else if (obj is ClassConstructor && !obj.has(key)) {
+                // Static members (methods, fields, get/set) live as ordinary properties directly on the
+                // `class`'s own JsObject (see ClassConstructor/execClassDecl) rather than through any
+                // prototype-chain delegation, so unlike instance methods - which get (re-)bound flat onto
+                // every instance, inherited or not, by ClassConstructor.call's bindOwnMethods - a subclass
+                // that doesn't itself redefine a static member has no copy of it at all. Real JS inherits
+                // static members through the constructor function's own prototype chain (`Derived.__proto__
+                // === Base`), so walk `superClassFn` here to find one, same as `findSuperStaticMethod` does
+                // for an explicit `super.staticMethod()` call, but for plain `Derived.bar` access too.
+                var cur = obj.superClassFn
+                var found: JsValue = JsUndefined
+                while (cur is ClassConstructor) {
+                    val superGetter = cur.getters?.get(key)
+                    if (superGetter != null) { found = superGetter.call(this, obj, emptyList()); break }
+                    if (cur.has(key)) { found = cur.get(key); break }
+                    cur = cur.superClassFn
+                }
+                found
+            } else {
+                obj.get(key)
+            }
         }
         else -> JsUndefined
     }
@@ -718,9 +740,33 @@ class ClassConstructor(
     val declEnv: Environment
 ) : JsFunction(name) {
     override fun call(interpreter: Interpreter, thisArg: JsValue, args: List<JsValue>): JsValue {
-        val instance = thisArg as? JsObject ?: JsObject()
+        // Per spec, a class constructor can only be invoked via `new` (or as a `super(...)` call from
+        // a derived class, which passes the instance-under-construction as `thisArg`) - calling it as a
+        // plain function (`Foo()`) is a TypeError. `new`/`super(...)` always pass a JsObject `thisArg`
+        // (see evalNew and the ClassConstructor `super(...)` call site above); a bare call passes
+        // JsUndefined, which is what this distinguishes.
+        if (thisArg !is JsObject) throw jsError("Class constructor $name cannot be invoked without 'new'", "TypeError")
+        val instance = thisArg
         if (this !in instance.classChain) instance.classChain = instance.classChain + this
         fun bindOwnMethods() {
+            // Real JS replaces a property's *entire* descriptor per class body: a subclass that
+            // redefines `name` (with a plain method, or with only one of get/set) fully overrides
+            // whatever descriptor an ancestor class installed for it, rather than layering onto it.
+            // Without this, an inherited getter/setter map entry from a superclass call earlier in
+            // this same construction (or an ancestor's own instance-method binding) would linger
+            // and incorrectly keep taking priority - e.g. a subclass's plain `x() {}` masked by a
+            // base class's leftover `get x()`, or `d.x = v` silently still calling a base `set x()`
+            // that the subclass's own `get x()`-only override was meant to replace.
+            for (name in instanceMethods.map { it.name }.toSet()) {
+                val ownKinds = instanceMethods.filter { it.name == name }.map { it.kind }.toSet()
+                if (MethodKind.NORMAL in ownKinds) {
+                    instance.getters?.remove(name)
+                    instance.setters?.remove(name)
+                } else {
+                    if (MethodKind.GET !in ownKinds) instance.getters?.remove(name)
+                    if (MethodKind.SET !in ownKinds) instance.setters?.remove(name)
+                }
+            }
             for (m in instanceMethods) {
                 val fn = Closure(m.name, m.params, m.body, declEnv, isArrow = false, isGenerator = m.isGenerator, isAsync = m.isAsync)
                 when (m.kind) {
